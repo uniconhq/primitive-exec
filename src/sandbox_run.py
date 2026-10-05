@@ -46,7 +46,19 @@ from typing import BinaryIO
 SCHEMA_VERSION = 4
 OUTPUT_LIMIT = 32 * 1024 * 1024
 POLL_SECONDS = 0.005
-STRAY_SECONDS = 5.0
+TOTAL_SPACING = 4.0
+"""How long to wait before reading a run's total memory again, as a multiple
+of how long the last reading took. A reading walks every page the run holds,
+about 25 microseconds a megabyte where it was measured, so at 4 this
+program spends at most a fifth of its time on it however much memory the run
+holds, and the run, which shares the container's one CPU with it, keeps the
+rest.
+"""
+STRAY_SECONDS = 1.0
+"""How long a stopped run's helper has to report before its whole group is
+killed."""
+REAP_SECONDS = 5.0
+OOM_EVENTS = Path("/sys/fs/cgroup/memory.events")
 JAVA_OUT_OF_MEMORY = 3
 RUN_PATH = "/usr/local/bin:/usr/bin:/bin"
 HELPER = "/usr/local/bin/sandbox-exec"
@@ -190,6 +202,48 @@ class Run:
     memory_kb: int
     output_bytes: int
     stopped: str | None
+    out_of_memory: bool = False
+
+
+@dataclass
+class RunMemory:
+    """The memory of one run's processes, read while the run goes on.
+
+    `peak_kb` is the highest of two readings, in kilobytes. One is the peak
+    resident memory of each process alone, which the kernel keeps itself
+    (`VmHWM`), so no process's own peak between two readings is missed. The
+    other is the resident memory of all the run's processes added up, with
+    each page several of them share divided among them (`Pss`): a child
+    forked from the binary shares its parent's pages until it changes them,
+    so it is charged only for the pages it changes, while two processes that
+    each fill memory of their own are charged for both. The kernel keeps no
+    peak of that total, so processes that together go over for less than the
+    time between two readings are not seen; the container's own memory limit
+    holds them.
+
+    Reading the total walks every page the run holds, so it is read only
+    when it could raise the peak, that is when the processes' resident memory
+    added up, which the total never exceeds, is above the peak: never for a
+    run of one process. It is read again only once `TOTAL_SPACING` times as
+    long as the last reading took has passed.
+    """
+
+    peak_kb: int = 0
+    total_due: float = 0.0
+
+    def read(self, processes: set[int]) -> None:
+        """Read the memory of the run's processes and raise the peak."""
+        resident: dict[int, int] = {}
+        for pid in processes:
+            highest, resident[pid] = resident_memory(pid)
+            self.peak_kb = max(self.peak_kb, highest)
+        started = time.monotonic()
+        if sum(resident.values()) <= self.peak_kb or started < self.total_due:
+            return
+        total = sum(proportional_memory(pid, kb) for pid, kb in resident.items())
+        self.peak_kb = max(self.peak_kb, total)
+        ended = time.monotonic()
+        self.total_due = ended + TOTAL_SPACING * (ended - started)
 
 
 def main(argv: list[str]) -> int:
@@ -401,10 +455,14 @@ def execute(
     The binary is started through `sandbox-exec`, which forks it and reports
     its process id and, once it ends, its exit status, CPU time and peak
     memory. Every few milliseconds every process of the run is read: their
-    CPU time together, the highest peak resident memory of any one of them,
-    the wall-clock time and the output size, and the binary is killed as soon
-    as one is over its limit. Resource limits set before the start back this
-    up: CPU time, file size, stack, and no core dumps.
+    CPU time together, their memory (see `RunMemory`), the wall-clock time
+    and the output size, and the binary is killed as soon as one is over its
+    limit. Resource limits set before the start back this up: CPU time, file
+    size, stack, and no core dumps.
+
+    The memory reported is the higher of the binary's own peak, as
+    `sandbox-exec` saw it, and the highest this program read while the run
+    went on.
 
     The CPU time reported is the binary's own, as `sandbox-exec` saw it, plus
     that of every process the run left behind, which this program reaps, so a
@@ -444,7 +502,8 @@ def execute(
     pid = 0
     stopped: str | None = None
     stopped_at = 0.0
-    peak_kb = 0
+    memory = RunMemory()
+    killed_before = oom_kills()
     cpu = 0.0
     me = os.getpid()
     while True:
@@ -453,19 +512,24 @@ def execute(
         done, status, _ = os.wait4(helper.pid, os.WNOHANG)
         if done:
             break
-        cpu, memory_kb = sample(me, helper.pid)
-        peak_kb = max(peak_kb, memory_kb)
+        cpu, processes = sample(me, helper.pid)
+        memory.read(processes)
         now = time.monotonic()
         if stopped is None:
             if cpu > item.time_limit or now - started > item.wall_limit:
                 stopped = "time"
-            elif memory_kb > item.memory_limit_kb:
+            elif memory.peak_kb > item.memory_limit_kb:
                 stopped = "memory"
             elif os.fstat(stdout.fileno()).st_size > OUTPUT_LIMIT:
                 stopped = "output"
             if stopped:
                 stopped_at = now
                 kill(pid or -helper.pid)
+                # The run may have stopped `sandbox-exec` with SIGSTOP where
+                # Landlock does not scope signals, and a stopped helper never
+                # reaps the binary; woken, it reports at once, and whatever
+                # is left goes after STRAY_SECONDS.
+                wake(helper.pid)
         elif now - stopped_at > STRAY_SECONDS:
             kill(-helper.pid)
         time.sleep(POLL_SECONDS)
@@ -500,9 +564,10 @@ def execute(
         returncode=returncode,
         cpu_seconds=max(reported + strays, cpu),
         wall_seconds=wall,
-        memory_kb=max(maxrss_kb, peak_kb),
+        memory_kb=max(maxrss_kb, memory.peak_kb),
         output_bytes=os.fstat(stdout.fileno()).st_size,
         stopped=stopped,
+        out_of_memory=returncode == -signal.SIGKILL and oom_kills() > killed_before,
     )
 
 
@@ -575,7 +640,10 @@ def judge(run: Run, item: Item, kind: str) -> str:
     The limit the run was stopped for comes first. Otherwise the output limit,
     the time limits and the memory limit are checked in that order against
     what was measured and how the run ended, and any other failure is a
-    runtime error. A jar that ran out of Java heap exits with code 3.
+    runtime error. A jar that ran out of Java heap exits with code 3, and a
+    run the kernel killed for the container's memory is over the memory
+    limit too: memory a run keeps where no process's share counts it, in
+    files under its own `/tmp`, is still charged to the container.
     """
     if run.stopped:
         return {"time": "time_limit", "memory": "memory_limit"}.get(
@@ -589,8 +657,10 @@ def judge(run: Run, item: Item, kind: str) -> str:
         or run.wall_seconds > item.wall_limit
     ):
         return "time_limit"
-    if run.memory_kb > item.memory_limit_kb or (
-        kind == "java" and run.returncode == JAVA_OUT_OF_MEMORY
+    if (
+        run.memory_kb > item.memory_limit_kb
+        or run.out_of_memory
+        or (kind == "java" and run.returncode == JAVA_OUT_OF_MEMORY)
     ):
         return "memory_limit"
     if run.returncode != 0:
@@ -598,15 +668,13 @@ def judge(run: Run, item: Item, kind: str) -> str:
     return "accepted"
 
 
-def sample(me: int, helper: int) -> tuple[float, int]:
-    """The run's CPU seconds so far and its peak resident memory in kilobytes.
+def sample(me: int, helper: int) -> tuple[float, set[int]]:
+    """The run's CPU seconds so far and the process ids of the run.
 
     The run is every process descended from this program but `sandbox-exec`:
     the binary, whatever it started, and whatever it left behind, which comes
     back to this program as the subreaper. Their CPU time is added up, with
-    what each has reaped of its own children; the memory is the highest peak
-    of any one of them, since forked processes share pages and a sum would
-    count those twice. The container's own memory limit holds the total.
+    what each has reaped of its own children.
     """
     parents: dict[int, int] = {}
     ticks: dict[int, int] = {}
@@ -622,7 +690,7 @@ def sample(me: int, helper: int) -> tuple[float, int]:
         ticks[int(entry)] = sum(int(field) for field in fields[11:15])
     run = descendants(me, parents) - {helper}
     cpu = sum(ticks[pid] for pid in run) / os.sysconf("SC_CLK_TCK")
-    return cpu, max((peak_memory(pid) for pid in run), default=0)
+    return cpu, run
 
 
 def descendants(root: int, parents: dict[int, int]) -> set[int]:
@@ -640,16 +708,64 @@ def descendants(root: int, parents: dict[int, int]) -> set[int]:
     return found
 
 
-def peak_memory(pid: int) -> int:
-    """A process's peak resident memory in kilobytes, 0 when it has none."""
+def resident_memory(pid: int) -> tuple[int, int]:
+    """A process's peak and present resident memory in kilobytes, 0 and 0 when
+    it has none.
+    """
     try:
         status = Path(f"/proc/{pid}/status").read_text()
     except OSError:
-        return 0
+        return 0, 0
+    found = {"VmHWM": 0, "VmRSS": 0}
     for line in status.splitlines():
-        if line.startswith("VmHWM:"):
+        name, _, value = line.partition(":")
+        if name in found:
+            found[name] = int(value.split()[0])
+    return found["VmHWM"], found["VmRSS"]
+
+
+def proportional_memory(pid: int, resident_kb: int) -> int:
+    """A process's resident memory in kilobytes with each page it shares
+    divided among the processes that share it (`Pss`), 0 once it has ended.
+
+    A process whose pages this program may not read, one that made itself not
+    dumpable, is counted at `resident_kb`, its whole resident memory, so it
+    cannot hide what it holds from the total.
+    """
+    try:
+        rollup = Path(f"/proc/{pid}/smaps_rollup").read_text()
+    except PermissionError:
+        return resident_kb
+    except OSError:
+        return 0
+    for line in rollup.splitlines():
+        if line.startswith("Pss:"):
             return int(line.split()[1])
     return 0
+
+
+def oom_kills() -> int:
+    """How many processes the kernel has killed in this container for want
+    of memory, from its cgroup's `memory.events`, readable even where the
+    cgroup is not writable; 0 where there is no such file.
+    """
+    try:
+        events = OOM_EVENTS.read_text()
+    except OSError:
+        return 0
+    for line in events.splitlines():
+        name, _, count = line.partition(" ")
+        if name == "oom_kill":
+            return int(count)
+    return 0
+
+
+def wake(pid: int) -> None:
+    """Continue a process that may have been stopped."""
+    try:
+        os.kill(pid, signal.SIGCONT)
+    except ProcessLookupError, PermissionError:
+        pass
 
 
 def kill(pid: int) -> None:
@@ -666,7 +782,7 @@ def reap_strays() -> None:
     This program is the subreaper of everything it starts, so a process that
     outlived the run, even one that left its session, is one of its children.
     """
-    deadline = time.monotonic() + STRAY_SECONDS
+    deadline = time.monotonic() + REAP_SECONDS
     while time.monotonic() < deadline:
         for pid in child_pids():
             try:
