@@ -43,6 +43,7 @@ import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from stat import S_IMODE, S_ISDIR, S_ISLNK
 from typing import BinaryIO
 
 SCHEMA_VERSION = 5
@@ -60,6 +61,9 @@ STRAY_SECONDS = 1.0
 """How long a stopped run's helper has to report before its whole group is
 killed."""
 REAP_SECONDS = 5.0
+OWNER_FOLDER = 0o700
+OWNER_FILE = 0o600
+OWNER_PROGRAM = 0o700
 OOM_EVENTS = Path("/sys/fs/cgroup/memory.events")
 CGROUP = Path("/sys/fs/cgroup")
 NO_CGROUP = (
@@ -192,6 +196,13 @@ class Program:
         if self.kind == "python":
             return [self.path, Path(sys.base_prefix)]
         return [self.path]
+
+    @property
+    def mode(self) -> int:
+        """The access its file's owner needs: running it too, for a native
+        binary the kernel starts itself.
+        """
+        return OWNER_PROGRAM if self.kind == "native" else OWNER_FILE
 
     def command(self, item: Item) -> list[str]:
         """The command line that runs this binary for one item, the item's
@@ -435,6 +446,7 @@ def run_all(root: Path, items: list[Item]) -> list[dict[str, object]]:
             outputs = run_item(root, item, programs[item.binary], abi)
             results.append({"test": item.test, "outputs": outputs})
     finally:
+        give_back_tree(root)
         shutil.rmtree(scratch, ignore_errors=True)
     return results
 
@@ -486,6 +498,9 @@ def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, ob
     run that could not start, a `runtime_error`, like a binary the kernel
     will not run.
     """
+    give_back_along(root, root / "out")
+    give_back_along(root, item.input)
+    give_back_along(root, program.path, program.mode)
     out = root / "out" / str(item.number)
     out.mkdir(parents=True, exist_ok=True)
     output = out / "output"
@@ -501,7 +516,9 @@ def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, ob
                 run = execute(program, cwd, stdin, stdout, item, abi)
     finally:
         reap_strays()
+        give_back_tree(cwd)
         shutil.rmtree(cwd, ignore_errors=True)
+        give_back_along(root, output)
     if run.output_bytes > OUTPUT_LIMIT:
         os.truncate(output, OUTPUT_LIMIT)
     outcome = judge(run, item, program.kind)
@@ -916,6 +933,68 @@ def reap_strays() -> None:
             return
         time.sleep(POLL_SECONDS)
     raise PrimitiveError("processes left behind by a run could not be stopped")
+
+
+def give_back(path: Path, needed: int | None = None) -> None:
+    """Give this program's user back what it needs of `path`, should a run
+    have taken it away: reading and writing a file (or `needed`), and also
+    searching a folder.
+
+    A run is this program's user, so it may change the mode of anything that
+    user owns, which Landlock does not stop: its own output, `out/`, the
+    folders it can name under the working directory and, where the harness
+    lays them out as that user, `in/` and its files. Nothing here takes a
+    mode away, so a path no run touched keeps its own. A link, a path
+    another user owns and a path no longer there are left as they are.
+    """
+    try:
+        status = os.lstat(path)
+    except FileNotFoundError:
+        return
+    mode = status.st_mode
+    if S_ISLNK(mode) or status.st_uid != os.geteuid():
+        return
+    if needed is None:
+        needed = OWNER_FOLDER if S_ISDIR(mode) else OWNER_FILE
+    if mode & needed != needed:
+        path.chmod(S_IMODE(mode) | needed)
+
+
+def give_back_along(root: Path, path: Path, needed: int | None = None) -> None:
+    """Give back each folder from `root` down to `path`, then `path` itself,
+    so it can be reached as well as used.
+    """
+    try:
+        inside = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        inside = None
+    if inside is not None:
+        folder = root
+        for part in inside.parts[:-1]:
+            give_back(folder)
+            folder = folder / part
+        give_back(folder)
+    give_back(path, needed)
+
+
+def give_back_tree(top: Path) -> None:
+    """Give back `top` and everything under it, each folder before what is in
+    it, so the harness can read every output and remove the working
+    directory, and a run's own directory can be removed.
+    """
+    folders = [top]
+    while folders:
+        folder = folders.pop()
+        give_back(folder)
+        try:
+            entries = list(os.scandir(folder))
+        except NotADirectoryError, FileNotFoundError, PermissionError:
+            continue
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                folders.append(Path(entry.path))
+            else:
+                give_back(Path(entry.path))
 
 
 def child_pids() -> list[int]:

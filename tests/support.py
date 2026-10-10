@@ -210,6 +210,16 @@ elif case == "linger":
         time.sleep(60)
         os._exit(0)
     print("left one behind")
+elif case == "chmod":
+    work = sys.stdin.readline().strip()
+    print("changed")
+    sys.stdout.flush()
+    for path in (work + "/out/1", work + "/out", work + "/in/3/input", work):
+        try:
+            os.chmod(path, 0)
+        except OSError:
+            pass
+    os.fchmod(1, 0)
 elif case == "census":
     print(len([p for p in os.listdir("/proc") if p.isdigit()]))
 elif case == "parricide":

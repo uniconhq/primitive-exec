@@ -199,6 +199,22 @@ def test_runs_are_kept_apart(tmp_path: Path, run_image: RunImage) -> None:
     assert printed(work, outputs["main/census"]) == "3\n"
 
 
+def test_a_run_that_takes_away_its_files_modes_faults_nothing(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """A run may change the modes of the files and folders its user owns, its
+    own output and `out/` among them; each is given back after it, so the next
+    run and the harness still read and write them.
+    """
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [("main/chmod", "chmod\n/work\n"), ("main/next", "double\n21\n")]
+    outputs = run_batch(run_image, work, binary, items)
+    assert outcomes(outputs) == {"main/chmod": "accepted", "main/next": "accepted"}
+    assert printed(work, outputs["main/chmod"]) == "changed\n"
+    assert printed(work, outputs["main/next"]) == "42\n"
+
+
 def test_a_run_reads_nothing_another_run_left(
     tmp_path: Path, run_image: RunImage
 ) -> None:
