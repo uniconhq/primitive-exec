@@ -845,7 +845,8 @@ def proportional_memory(pid: int, resident_kb: int) -> int:
 def own_cgroup() -> Path | None:
     """The cgroup that holds this program and its runs and nothing else: the
     step container's, which sees its own cgroup as the root of its cgroup
-    namespace (the socket filter refuses a step any other), with cgroup v2's
+    namespace (the harness asks for a private one, and the socket filter
+    refuses the host's), with cgroup v2's
     memory accounting. None anywhere else, such as a test run on a machine,
     whose cgroup holds other processes too.
     """
