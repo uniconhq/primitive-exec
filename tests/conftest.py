@@ -80,9 +80,12 @@ def run_image(image: str) -> RunImage:
         work: Path,
         limits: dict[str, int] | None = None,
         seconds: list[float] | None = None,
+        owned: bool = False,
     ) -> dict[str, Any]:
         """Run the batch in `work`; `seconds`, when given, gets how long the
-        sandboxed container took, from `docker run` to its exit."""
+        sandboxed container took, from `docker run` to its exit. `owned`
+        hands the whole working directory to the step's user, as the harness
+        lays it out, rather than opening it to every user."""
         limits = limits or declaration()["limits"]
         open_up(work)
         volume = f"{NAME}-test-{secrets.token_hex(4)}"
@@ -103,6 +106,19 @@ def run_image(image: str) -> RunImage:
                     "a+rwX",
                     "/work",
                 )
+                if owned:
+                    docker(
+                        "run",
+                        "--rm",
+                        "--user=0:0",
+                        "--entrypoint=chown",
+                        "--volume",
+                        f"{volume}:/work",
+                        image,
+                        "-R",
+                        "65532:65532",
+                        "/work",
+                    )
                 command = ["docker", "run", "--rm", *sandbox_flags(limits)]
                 command += ["--volume", f"{volume}:/work", image]
                 started = time.monotonic()
