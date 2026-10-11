@@ -195,6 +195,8 @@ What a run can still learn of the tests before it is none of their files'
 contents: that a file it can name exists, and its size, mode and times,
 which Landlock does not confine and which a run can change on a file of its
 own user it can name; the time on the clock; and the free space of `/work`.
+A mode a run takes away from a file or folder of that user is given back
+after it, so the next run and the harness still read and write them.
 
 The container itself is the harness's: no network, a read-only root
 filesystem, every capability dropped, `no-new-privileges`, Docker's built-in
