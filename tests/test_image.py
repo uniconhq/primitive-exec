@@ -90,11 +90,12 @@ def run_batch(
     time_limit: float = 1.0,
     memory_limit: float = 64,
     args: dict[str, str] | None = None,
+    owned: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Run one batch under the container limits the declaration gives it."""
     batch_inputs(work, binary, items, time_limit, memory_limit, args)
     limits = container_limits(time_limit, memory_limit, len(items))
-    return by_test(run_image(work, limits))
+    return by_test(run_image(work, limits, owned=owned))
 
 
 def outcomes(outputs: dict[str, dict[str, Any]]) -> dict[str, object]:
@@ -202,16 +203,30 @@ def test_runs_are_kept_apart(tmp_path: Path, run_image: RunImage) -> None:
 def test_a_run_that_takes_away_its_files_modes_faults_nothing(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """A run may change the modes of the files and folders its user owns, its
-    own output and `out/` among them; each is given back after it, so the next
-    run and the harness still read and write them.
+    """A run may change the modes of the files and folders its user owns, as
+    the harness lays them out: the working directory, `in/` and the next
+    run's input, `out/` and its own output among them; each is given back
+    after it, so the next run and the harness still read and write them.
     """
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     items = [("main/chmod", "chmod\n/work\n"), ("main/next", "double\n21\n")]
-    outputs = run_batch(run_image, work, binary, items)
+    outputs = run_batch(run_image, work, binary, items, owned=True)
     assert outcomes(outputs) == {"main/chmod": "accepted", "main/next": "accepted"}
     assert printed(work, outputs["main/chmod"]) == "changed\n"
+    assert printed(work, outputs["main/next"]) == "42\n"
+
+
+def test_a_run_that_leaves_a_path_past_path_max_faults_nothing(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """A run may build folders deeper than any path can name; what it left is
+    cleared as far as it can be, and the next run is judged as ever."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [("main/deep", "deep\n"), ("main/next", "double\n21\n")]
+    outputs = run_batch(run_image, work, binary, items)
+    assert outcomes(outputs) == {"main/deep": "accepted", "main/next": "accepted"}
     assert printed(work, outputs["main/next"]) == "42\n"
 
 

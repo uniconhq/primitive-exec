@@ -946,19 +946,21 @@ def give_back(path: Path, needed: int | None = None) -> None:
     folders it can name under the working directory and, where the harness
     lays them out as that user, `in/` and its files. Nothing here takes a
     mode away, so a path no run touched keeps its own. A link, a path
-    another user owns and a path no longer there are left as they are.
+    another user owns and a path no longer there are left as they are, and
+    so is one that cannot be named, such as one a run built past PATH_MAX:
+    a run's paths never stop this program.
     """
     try:
         status = os.lstat(path)
-    except FileNotFoundError:
+        mode = status.st_mode
+        if S_ISLNK(mode) or status.st_uid != os.geteuid():
+            return
+        if needed is None:
+            needed = OWNER_FOLDER if S_ISDIR(mode) else OWNER_FILE
+        if mode & needed != needed:
+            path.chmod(S_IMODE(mode) | needed)
+    except OSError:
         return
-    mode = status.st_mode
-    if S_ISLNK(mode) or status.st_uid != os.geteuid():
-        return
-    if needed is None:
-        needed = OWNER_FOLDER if S_ISDIR(mode) else OWNER_FILE
-    if mode & needed != needed:
-        path.chmod(S_IMODE(mode) | needed)
 
 
 def give_back_along(root: Path, path: Path, needed: int | None = None) -> None:
@@ -989,7 +991,7 @@ def give_back_tree(top: Path) -> None:
         give_back(folder)
         try:
             entries = list(os.scandir(folder))
-        except NotADirectoryError, FileNotFoundError, PermissionError:
+        except OSError:
             continue
         for entry in entries:
             if entry.is_dir(follow_symlinks=False):

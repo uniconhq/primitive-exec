@@ -220,6 +220,11 @@ elif case == "chmod":
         except OSError:
             pass
     os.fchmod(1, 0)
+elif case == "deep":
+    for _ in range(17):
+        os.mkdir("a" * 255)
+        os.chdir("a" * 255)
+    print("deep")
 elif case == "census":
     print(len([p for p in os.listdir("/proc") if p.isdigit()]))
 elif case == "parricide":
