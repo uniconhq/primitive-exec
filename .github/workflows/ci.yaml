@@ -14,7 +14,7 @@ permissions:
 # from it.
 jobs:
   ci:
-    uses: uniconhq/runner/.github/workflows/primitive-ci.yaml@v0.8.0
+    uses: uniconhq/runner/.github/workflows/primitive-ci.yaml@v0.9.0
     with:
-      runner-ref: v0.8.0
+      runner-ref: v0.9.0
       compile-image: true

@@ -1,7 +1,10 @@
 """What the tests share: the declaration, the sandbox flags and test inputs."""
 
+import ast
+import inspect
 import json
 import math
+import textwrap
 import zipapp
 from collections.abc import Callable
 from pathlib import Path
@@ -24,6 +27,46 @@ def declaration() -> dict[str, Any]:
     """This repo's primitive.yaml."""
     document: dict[str, Any] = yaml.safe_load((ROOT / "primitive.yaml").read_text())
     return document
+
+
+def returned_outcomes(function: Callable[..., object]) -> set[str]:
+    """Every outcome `function` can give, read from its source rather than
+    from runs: each word a `return` gives, or, where it returns a mapping,
+    the word under its "outcome", a lookup's keys left out. So a new way to
+    an outcome is found though no test takes it.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        value: ast.expr | None = node.value
+        if isinstance(value, ast.Dict):
+            value = next(
+                (
+                    word
+                    for key, word in zip(value.keys, value.values, strict=True)
+                    if isinstance(key, ast.Constant) and key.value == "outcome"
+                ),
+                None,
+            )
+        if value is None:
+            continue
+        keys = {
+            id(key)
+            for part in ast.walk(value)
+            if isinstance(part, ast.Dict)
+            for key in part.keys
+            if key is not None
+        }
+        found |= {
+            part.value
+            for part in ast.walk(value)
+            if isinstance(part, ast.Constant)
+            and isinstance(part.value, str)
+            and id(part) not in keys
+        }
+    return found
 
 
 def container_limits(
