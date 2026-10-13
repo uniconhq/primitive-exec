@@ -38,4 +38,10 @@ outputs:
     description: The most memory the program used, in kilobytes.
   outcome:
     type: outcome
-    description: Accepted, or the limit the program went over, or a runtime error.
+    description: How the program's run ended.
+    outcomes:
+      accepted: the program finishes within its limits
+      time_limit: it runs out of time
+      memory_limit: it uses more memory than allowed
+      output_limit: it prints more than allowed
+      runtime_error: it crashes or exits with an error

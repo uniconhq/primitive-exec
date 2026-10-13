@@ -22,10 +22,12 @@ from support import (
     PROGRAM,
     batch_inputs,
     by_test,
+    declaration,
     peek_input,
     peeked,
     printed,
     python_binary,
+    returned_outcomes,
 )
 
 
@@ -89,31 +91,64 @@ def test_the_time_limit_in_milliseconds_is_rounded_up(limit: float, ms: int) -> 
     assert item.time_limit_ms == ms
 
 
-@pytest.mark.parametrize(
-    ("changes", "kind", "outcome"),
-    [
-        ({}, "native", "accepted"),
-        ({"stopped": "time"}, "native", "time_limit"),
-        ({"stopped": "memory", "returncode": -9}, "native", "memory_limit"),
-        ({"stopped": "output", "returncode": -9}, "native", "output_limit"),
-        ({"returncode": -signal.SIGXFSZ}, "native", "output_limit"),
-        (
-            {"output_bytes": sandbox_run.OUTPUT_LIMIT + 1, "returncode": 1},
-            "python",
-            "output_limit",
-        ),
-        ({"cpu_seconds": 1.01}, "native", "time_limit"),
-        ({"wall_seconds": 3.5}, "native", "time_limit"),
-        ({"returncode": -signal.SIGXCPU}, "native", "time_limit"),
-        ({"memory_kb": 64 * 1024 + 1}, "native", "memory_limit"),
-        ({"returncode": 3}, "java", "memory_limit"),
-        ({"returncode": 3}, "native", "runtime_error"),
-        ({"returncode": -signal.SIGSEGV}, "native", "runtime_error"),
-    ],
-)
+JUDGED: list[tuple[dict[str, Any], str, str]] = [
+    ({}, "native", "accepted"),
+    ({"stopped": "time"}, "native", "time_limit"),
+    ({"stopped": "memory", "returncode": -9}, "native", "memory_limit"),
+    ({"stopped": "output", "returncode": -9}, "native", "output_limit"),
+    ({"returncode": -signal.SIGXFSZ}, "native", "output_limit"),
+    (
+        {"output_bytes": sandbox_run.OUTPUT_LIMIT + 1, "returncode": 1},
+        "python",
+        "output_limit",
+    ),
+    ({"cpu_seconds": 1.01}, "native", "time_limit"),
+    ({"wall_seconds": 3.5}, "native", "time_limit"),
+    ({"returncode": -signal.SIGXCPU}, "native", "time_limit"),
+    ({"memory_kb": 64 * 1024 + 1}, "native", "memory_limit"),
+    ({"returncode": 3}, "java", "memory_limit"),
+    ({"returncode": 3}, "native", "runtime_error"),
+    ({"returncode": -signal.SIGSEGV}, "native", "runtime_error"),
+]
+"""Runs and how `judge` ends each, one of every way it decides."""
+
+
+@pytest.mark.parametrize(("changes", "kind", "outcome"), JUDGED)
 def test_judge(changes: dict[str, Any], kind: str, outcome: str) -> None:
     """The stop reason first, then output, time and memory, then the exit."""
     assert sandbox_run.judge(make_run(**changes), ITEM, kind) == outcome
+
+
+def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
+    """The outcome port's outcomes are exactly the ones `judge` gives, each
+    with a line saying when, for the workflow editor's drawer.
+    """
+    reported = {
+        sandbox_run.judge(make_run(**changes), ITEM, kind)
+        for changes, kind, _ in JUDGED
+    }
+
+    outcomes = declaration()["outputs"]["outcome"]["outcomes"]
+
+    assert list(outcomes) == [
+        "accepted",
+        "time_limit",
+        "memory_limit",
+        "output_limit",
+        "runtime_error",
+    ]
+    assert set(outcomes) == reported
+    assert all(isinstance(when, str) and "\n" not in when for when in outcomes.values())
+
+
+def test_the_declaration_says_every_outcome_judge_can_give() -> None:
+    """The declared outcomes are every one `judge` can return, read from its
+    source rather than from the runs `JUDGED` picks, so a new way to an
+    outcome needs its line too.
+    """
+    outcomes = declaration()["outputs"]["outcome"]["outcomes"]
+
+    assert set(outcomes) == returned_outcomes(sandbox_run.judge)
 
 
 def test_detect(tmp_path: Path) -> None:

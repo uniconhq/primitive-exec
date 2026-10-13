@@ -33,7 +33,7 @@ and outputs.
 | Output | `output` | file | `out/<n>/output`, `n` the item's place in the batch from 1, what the binary printed on standard output |
 | Output | `time_ms` | number | CPU time used, user plus system, in milliseconds; on `time_limit` at least the limit |
 | Output | `memory_kb` | number | Peak resident memory of the run, all its processes together (below), in kilobytes |
-| Output | `outcome` | outcome | `accepted`, `time_limit`, `memory_limit`, `output_limit` or `runtime_error` |
+| Output | `outcome` | outcome | `accepted`, `time_limit`, `memory_limit`, `output_limit` or `runtime_error` (see "Limits and outcomes"); `primitive.yaml` says when each is given under `outcomes`, for the workflow editor |
 
 The output goes under the item's place in the batch, not its test, because a
 test id holds a `/`.
@@ -262,6 +262,10 @@ tests/                      unit tests, and image tests that run it on Docker
 
 `primitive.yaml` has no `image` line here: bootstrap writes the image by
 digest, from the release manifest, into the version it creates at the forge.
+Its `title`, its `description`s and the `outcome` port's `outcomes`, each
+outcome the program can report with a line saying when, are what the
+workflow editor shows; a test keeps `outcomes` to exactly the outcomes
+`judge` gives.
 
 ## Running it locally
 
