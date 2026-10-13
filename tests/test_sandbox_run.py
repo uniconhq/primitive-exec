@@ -27,6 +27,7 @@ from support import (
     peeked,
     printed,
     python_binary,
+    returned_outcomes,
 )
 
 
@@ -138,6 +139,16 @@ def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
     ]
     assert set(outcomes) == reported
     assert all(isinstance(when, str) and "\n" not in when for when in outcomes.values())
+
+
+def test_the_declaration_says_every_outcome_judge_can_give() -> None:
+    """The declared outcomes are every one `judge` can return, read from its
+    source rather than from the runs `JUDGED` picks, so a new way to an
+    outcome needs its line too.
+    """
+    outcomes = declaration()["outputs"]["outcome"]["outcomes"]
+
+    assert set(outcomes) == returned_outcomes(sandbox_run.judge)
 
 
 def test_detect(tmp_path: Path) -> None:
