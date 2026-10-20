@@ -13,8 +13,8 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-NAME = "primitive-sandbox-run"
-SCHEMA_VERSION = 5
+NAME = "primitive-exec"
+SCHEMA_VERSION = 6
 SIBLING_SCHEMA = ROOT.parent / "runner" / "schemas" / "primitive.schema.json"
 SIBLING_COMPILE = ROOT.parent / "primitive-compile"
 
@@ -137,29 +137,29 @@ def batch_inputs(
     memory_limit: float = 64,
     args: dict[str, str] | None = None,
 ) -> None:
-    """Write inputs.json, the binary and one input per item under `in/`, as the
-    harness does: the binary is `in/1/binary` and the nth item's input
-    `in/<n + 1>/input`.
+    """Write inputs.json, the program and one input per item under `in/`, as the
+    harness does: the program is `in/1/program` and the nth item's standard
+    input `in/<n + 1>/input`.
 
-    `items` are (test, standard input) pairs, all run under the same limits;
-    `args` gives the `args` input of the tests it names, and the others have
+    `items` are (run, standard input) pairs, all run under the same limits;
+    `args` gives the `args` input of the runs it names, and the others have
     none.
     """
     (work / "in" / "1").mkdir(parents=True)
-    (work / "in" / "1" / "binary").write_bytes(binary)
+    (work / "in" / "1" / "program").write_bytes(binary)
     batch = []
-    for number, (test, stdin) in enumerate(items, 2):
+    for number, (run, stdin) in enumerate(items, 2):
         (work / "in" / str(number)).mkdir()
         (work / "in" / str(number) / "input").write_text(stdin)
         inputs: dict[str, Any] = {
-            "binary": {"file": "in/1/binary"},
-            "input": {"file": f"in/{number}/input"},
+            "program": {"file": "in/1/program"},
+            "stdin": {"file": f"in/{number}/input"},
             "time_limit": time_limit,
             "memory_limit": memory_limit,
         }
-        if args and test in args:
-            inputs["args"] = args[test]
-        batch.append({"test": test, "inputs": inputs})
+        if args and run in args:
+            inputs["args"] = args[run]
+        batch.append({"run": run, "inputs": inputs})
     document = {"schema_version": SCHEMA_VERSION, "batch": batch}
     (work / "inputs.json").write_text(json.dumps(document))
 
@@ -194,13 +194,13 @@ def peeked(work: str) -> list[str]:
     ]
 
 
-def by_test(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """A batch's outputs keyed by test."""
-    return {entry["test"]: entry["outputs"] for entry in result["batch"]}
+def by_run(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """A batch's outputs keyed by run."""
+    return {entry["run"]: entry["outputs"] for entry in result["batch"]}
 
 
 def printed(work: Path, outputs: dict[str, Any]) -> str:
-    """What one item's binary printed, from the file its `output` names."""
+    """What one item's program printed, from the file its `output` names."""
     return (work / str(outputs["output"]["file"])).read_text()
 
 
@@ -421,7 +421,7 @@ elif case == "mark-and-lock":
 elif case == "lock-scratch":
     os.chmod(os.path.dirname(os.path.abspath(sys.argv[0])), 0o500)
     os.chmod(sys.argv[0], 0)
-    os.chmod("/work/in/1/binary", 0)
+    os.chmod("/work/in/1/program", 0)
     print("locked")
 elif case == "leave-mq":
     import ctypes

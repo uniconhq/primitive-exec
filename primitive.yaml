@@ -1,5 +1,6 @@
 title: Run program
-description: Runs a program on each test's input and records its output, time and memory.
+description: Runs a program once under limits and records its output, time and memory.
+schema_version: 6
 batch: true
 network: false
 limits: {time_ms: 2000, cpu_ms: 2000, memory_mb: 256, pids: 128, output_mb: 64, gpus: 0}
@@ -8,33 +9,38 @@ limits_from:
   cpu_ms: {input: time_limit, scale: 2000, add: 3000}
   memory_mb: {input: memory_limit, add: 256}
 inputs:
-  binary:
+  program:
     type: file
     runs: true
     description: The program to run.
-  input:
+  stdin:
     type: file
     runs: false
-    description: What the program reads on standard input.
+    optional: true
+    description: What the program reads on standard input; nothing when left out.
   args:
     type: text
     optional: true
     description: Arguments added to the program's command line, split on spaces.
   time_limit:
     type: number
-    description: Seconds of CPU time the program may use on each test.
+    description: Seconds of CPU time the program may use.
   memory_limit:
     type: number
-    description: Megabytes of memory the program may use on each test.
+    description: Megabytes of memory the program may use.
 outputs:
   output:
     type: file
     description: What the program printed on standard output.
   time_ms:
     type: number
+    better: lower
+    at_least: 0
     description: The CPU time the program used, in milliseconds.
   memory_kb:
     type: number
+    better: lower
+    at_least: 0
     description: The most memory the program used, in kilobytes.
   outcome:
     type: outcome

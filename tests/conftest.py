@@ -9,7 +9,7 @@ and pids limits, the CPU-time and file-size limits as `RLIMIT_CPU` and
 directory at /work. They are skipped when Docker is not reachable.
 
 The contract checks use `primitive.schema.json` from `PRIMITIVE_SCHEMA`, or
-from a runner checkout beside this one, when it is the version 5 contract.
+from a runner checkout beside this one, when it has the version 6 contract.
 
 Native and Java binaries come from the compile primitive's image, named by
 `COMPILE_IMAGE` or built from a primitive-compile checkout beside this one;
@@ -47,7 +47,7 @@ from support import (
     sandbox_flags,
 )
 
-collect_ignore = [] if sys.platform == "linux" else ["test_sandbox_run.py"]
+collect_ignore = [] if sys.platform == "linux" else ["test_exec.py"]
 
 
 @pytest.fixture(scope="session")
@@ -164,29 +164,31 @@ def compile_image(image: str) -> str:
 
 @pytest.fixture
 def compiled(compile_image: str, tmp_path_factory: pytest.TempPathFactory) -> Compiled:
-    """Compile a source with the compile primitive and return the binary.
+    """Compile a source with the compile primitive and return the program.
 
     The source goes in as compile's `source` folder holding the one file, in
-    contract version 5. A compile image that answers it speaks another
-    version, as the compile v1 image speaks 4 with `source` a file, is asked
-    again in that shape, so these tests run against either.
+    contract version 6, as compile@v3 takes it. A compile image that answers
+    it speaks another version, as compile@v2 speaks 5, is asked again in that
+    shape, so these tests run against either.
     """
 
     def build(language: str, name: str, source: str) -> bytes:
         work = source_in(tmp_path_factory, name, source)
         inputs = {"source": {"folder": "in/1/source"}, "language": language}
         result = compile_once(
-            compile_image, work, {"schema_version": SCHEMA_VERSION, "inputs": inputs}
+            compile_image, work, {"schema_version": 6, "inputs": inputs}
         )
         if "contract version" in result.get("error", ""):
-            # A directory of its own: what the first run wrote belongs to the
+            # compile@v2 speaks version 5 and names its output binary. A
+            # directory of its own: what the first run wrote belongs to the
             # container's user, which this one cannot open up again.
             work = source_in(tmp_path_factory, name, source)
-            inputs = {"source": {"file": f"in/1/source/{name}"}, "language": language}
-            document = {"schema_version": 4, "inputs": inputs}
+            document = {"schema_version": 5, "inputs": inputs}
             result = compile_once(compile_image, work, document)
         assert result["outputs"]["outcome"] == "accepted", result
-        return (work / str(result["outputs"]["binary"]["file"])).read_bytes()
+        outputs = result["outputs"]
+        program = outputs["program"] if "program" in outputs else outputs["binary"]
+        return (work / str(program["file"])).read_bytes()
 
     return build
 
@@ -219,16 +221,16 @@ def compile_once(
 
 @pytest.fixture(scope="session")
 def schema() -> dict[str, Any]:
-    """The runner's primitive.schema.json at contract version 5."""
+    """The runner's primitive.schema.json, when it has contract version 6."""
     named = os.environ.get("PRIMITIVE_SCHEMA")
     path = Path(named) if named else SIBLING_SCHEMA
     if not path.is_file():
         pytest.skip("no primitive.schema.json; set PRIMITIVE_SCHEMA")
     document: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     inputs = document.get("$defs", {}).get("inputs_file", {})
-    version = inputs.get("properties", {}).get("schema_version", {}).get("const")
-    if version != SCHEMA_VERSION:
-        pytest.skip(f"{path} is not the version {SCHEMA_VERSION} contract")
+    version = inputs.get("properties", {}).get("schema_version", {})
+    if SCHEMA_VERSION not in version.get("enum", [version.get("const")]):
+        pytest.skip(f"{path} has no version {SCHEMA_VERSION} contract")
     return document
 
 

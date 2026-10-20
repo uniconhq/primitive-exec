@@ -1,7 +1,7 @@
 [project]
-name = "primitive-sandbox-run"
-version = "2.2.0"
-description = "The Unicon sandbox-run primitive: run a binary once per test and measure each run."
+name = "primitive-exec"
+version = "1.0.0"
+description = "The Unicon exec primitive: run a program under limits and measure the run."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -9,7 +9,7 @@ requires-python = ">=3.14"
 dependencies = []
 
 [project.urls]
-Source = "https://github.com/uniconhq/primitive-sandbox-run"
+Source = "https://github.com/uniconhq/primitive-exec"
 
 # The program is one file with no dependencies, copied into the image as it is.
 # These are the tools that check it.

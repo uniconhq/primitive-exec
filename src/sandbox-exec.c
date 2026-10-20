@@ -3,14 +3,14 @@
  *
  *     sandbox-exec REPORT_FD RULESET_FD PROGRAM [ARGUMENT...]
  *
- * sandbox-run starts this small static program instead of the binary itself,
+ * exec starts this small static program instead of the program itself,
  * with the run's limits already set, and this program forks and runs the
  * binary. The reason is memory: Linux carries a process's peak resident set
- * across exec, so a binary started straight from sandbox-run's Python would
+ * across exec(2), so a program started straight from exec's Python would
  * report at least the interpreter's own size. Forked from this program it
  * starts from almost nothing and reports its own peak.
  *
- * RULESET_FD is a Landlock ruleset sandbox-run made for the run; without one
+ * RULESET_FD is a Landlock ruleset exec made for the run; without one
  * nothing is started. The child enforces it on itself just before exec, so
  * the binary and everything it starts are confined and this program is not:
  * from Landlock ABI 6 the binary cannot signal it, and from ABI 1 it cannot

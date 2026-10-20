@@ -1,28 +1,32 @@
 #!/usr/local/bin/python3 -I
-"""The sandbox-run primitive: run one binary once per input and measure each run.
+"""The exec primitive: run one program under limits and measure the run, once
+per item of a batch.
 
 The harness mounts a working directory at `/work` (or the directory named by
 the first argument) holding `inputs.json` and the files under `in/`. The
-inputs are a batch: one item per test, each naming the binary, the input to
-feed it on standard input, optional arguments for its command line, a time
-limit in seconds and a memory limit in megabytes. For every item this program
-runs the binary, keeps what it printed as `out/<n>/output`, `n` being the
-item's place in the batch, and reports the CPU time, the peak memory and an
-outcome, then writes `outputs.json` with one entry per item in the same order.
+inputs are a batch: one item per run, each naming the program, an optional
+file to feed it on standard input, optional arguments for its command line, a
+time limit in seconds and a memory limit in megabytes. For every item, in the
+order given, it runs the program, keeps what it printed as
+`out/<n>/output`, `n` being the item's place in the batch, and reports the
+CPU time, the peak memory and an outcome, then writes `outputs.json` with one
+entry per item in the same order. The order is the forge's: it runs the runs
+whose results entrants see sooner first, so a run can tell nothing to one
+whose results are shown before its own.
 
 A run that goes over a limit is an ordinary result (`time_limit`,
 `memory_limit`, `output_limit`, `runtime_error`), never an error of the step,
 and every item reports its time and memory whatever its outcome.
 `error` in `outputs.json` is kept for the cases where the primitive could not
-work at all, such as a missing input or a binary in no format it runs.
+work at all, such as a missing input or a program in no format it runs.
 
 Each run is a fresh process in a fresh empty directory, running a fresh copy
-of the binary, with every process it left behind killed, and every System V
+of the program, with every process it left behind killed, and every System V
 shared memory segment, message queue and semaphore set and every `user`
 extended attribute under the working directory it left removed, before the
 next item starts. Every run is put under
 Landlock: it may write only inside that directory and to /dev/null, read only
-the system's own directories, its binary and that directory, and may not
+the system's own directories, its program and that directory, and may not
 trace anything outside itself, and from Landlock ABI 6 it may not signal
 anything outside itself either. A kernel without Landlock ABI 3 is an error of
 the step: the runs are not started less confined.
@@ -49,7 +53,7 @@ from pathlib import Path
 from stat import S_IMODE, S_ISDIR, S_ISLNK
 from typing import BinaryIO
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 OUTPUT_LIMIT = 32 * 1024 * 1024
 POLL_SECONDS = 0.005
 TOTAL_SPACING = 4.0
@@ -70,22 +74,21 @@ OWNER_PROGRAM = 0o700
 OOM_EVENTS = Path("/sys/fs/cgroup/memory.events")
 CGROUP = Path("/sys/fs/cgroup")
 NO_CGROUP = (
-    "sandbox-run: this program is not alone in a cgroup of its own with cgroup v2 "
+    "exec: this program is not alone in a cgroup of its own with cgroup v2 "
     "memory accounting, so memory a run keeps outside its processes, in files, "
     "pipes or sockets, is not counted against its limit"
 )
 JAVA_OUT_OF_MEMORY = 3
 RUN_PATH = "/usr/local/bin:/usr/bin:/bin"
 HELPER = "/usr/local/bin/sandbox-exec"
-TEST_ID = re.compile(r"[A-Za-z0-9_-]+/[A-Za-z0-9_-]+")
-"""A test's id, `<group>/<test>`. It holds a `/`, so no file is named after
-it: an item's output goes under its place in the batch.
-"""
+RUN_ID = re.compile(r"[A-Za-z0-9_-]+")
+"""A run's id, which only the forge knows the meaning of. An item's output
+goes under its place in the batch, not its id."""
 REPORT_LINE = re.compile(rb"([PLER]) (-?[0-9]{1,20}(?: -?[0-9]{1,20}){0,3})\n")
 REFUSED_BINARY = frozenset(
     {errno.ENOEXEC, errno.ENOMEM, errno.E2BIG, errno.EINVAL, errno.ELIBBAD}
 )
-"""What the kernel answers when it will not run a native binary as built: the
+"""What the kernel answers when it will not run a native program as built: the
 contestant's program, not the step, failed.
 """
 REFUSED_ARGUMENTS = frozenset({errno.E2BIG})
@@ -125,7 +128,7 @@ READABLE_DIRECTORIES = (
     "/proc",
     "/sys",
 )
-"""What a run may read besides its binary and its own directory: the system's
+"""What a run may read besides its program and its own directory: the system's
 programs, libraries and settings, which the interpreters need (Java its
 configuration under /etc, its container support /proc/self and
 /sys/fs/cgroup), and nothing under /work or /tmp. The image holds nothing
@@ -139,7 +142,7 @@ SYSVIPC = Path("/proc/sysvipc")
 """The kernel's tables of the System V objects in this program's IPC
 namespace, the step container's own, one line each after a header."""
 NO_SYSVIPC = (
-    "sandbox-run: this machine shows no /proc/sysvipc, so System V objects a run "
+    "exec: this machine shows no /proc/sysvipc, so System V objects a run "
     "leaves cannot be found and removed; a kernel without them has none to leave"
 )
 IPC_RMID = 0
@@ -160,14 +163,14 @@ class PrimitiveError(Exception):
 
 @dataclass(frozen=True)
 class Item:
-    """One test to run: its id, its place in the batch from 1, the binary, the
-    input, the two limits and the arguments.
+    """One run: its id, its place in the batch from 1, the program, the file
+    for standard input if any, the two limits and the arguments.
     """
 
-    test: str
+    run: str
     number: int
-    binary: Path
-    input: Path
+    program: Path
+    stdin: Path | None
     time_limit: float
     memory_limit: float
     args: tuple[str, ...] = ()
@@ -197,14 +200,14 @@ class Item:
 
 @dataclass(frozen=True)
 class Program:
-    """A binary ready to run: its format and the file the command starts."""
+    """A program ready to run: its format and the file the command starts."""
 
     kind: str
     path: Path
 
     def readable(self) -> list[Path]:
-        """What a run of this binary reads besides the system's directories:
-        the binary, and for Python the interpreter's own installation, which
+        """What a run of this program reads besides the system's directories:
+        the program, and for Python the interpreter's own installation, which
         is under /usr in the image. The interpreter is started by its real
         path, outside any virtual environment this program runs in, so it
         reads no `pyvenv.cfg` it could not be allowed.
@@ -216,12 +219,12 @@ class Program:
     @property
     def mode(self) -> int:
         """The access its file's owner needs: running it too, for a native
-        binary the kernel starts itself.
+        program the kernel starts itself.
         """
         return OWNER_PROGRAM if self.kind == "native" else OWNER_FILE
 
     def command(self, item: Item) -> list[str]:
-        """The command line that runs this binary for one item, the item's
+        """The command line that runs this program for one item, the item's
         arguments last.
         """
         if self.kind == "native":
@@ -272,7 +275,7 @@ class RunMemory:
     (`VmHWM`), so no process's own peak between two readings is missed. The
     second is the resident memory of all the run's processes added up, with
     each page several of them share divided among them (`Pss`): a child
-    forked from the binary shares its parent's pages until it changes them,
+    forked from the program shares its parent's pages until it changes them,
     so it is charged only for the pages it changes, while two processes that
     each fill memory of their own are charged for both. The third is what
     `cgroup`, the step container's, holds beyond what it held when the
@@ -332,7 +335,7 @@ def main(argv: list[str]) -> int:
             "batch": run_batch(root, items),
         }
     except PrimitiveError as error:
-        print(f"sandbox-run: {error}", file=sys.stderr)
+        print(f"exec: {error}", file=sys.stderr)
         document = {"schema_version": SCHEMA_VERSION, "error": str(error)}
     write_json(root / "outputs.json", document)
     return 0
@@ -356,8 +359,8 @@ def read_inputs(root: Path) -> list[Item]:
     if not isinstance(batch, list):
         raise PrimitiveError("inputs.json has no batch list")
     items = [read_item(root, entry, number) for number, entry in enumerate(batch, 1)]
-    if len({item.test for item in items}) != len(items):
-        raise PrimitiveError("two items in the batch are for the same test")
+    if len({item.run for item in items}) != len(items):
+        raise PrimitiveError("two items in the batch are for the same run")
     return items
 
 
@@ -365,57 +368,57 @@ def read_item(root: Path, entry: object, number: int) -> Item:
     """Check one batch entry, the `number`th, and return it as an item."""
     if not isinstance(entry, dict) or not isinstance(entry.get("inputs"), dict):
         raise PrimitiveError("a batch item has no inputs object")
-    test = entry.get("test")
-    if not isinstance(test, str) or len(test) > 255 or not TEST_ID.fullmatch(test):
-        raise PrimitiveError(f"the batch item test {test!r} is not a test id")
+    run = entry.get("run")
+    if not isinstance(run, str) or len(run) > 255 or not RUN_ID.fullmatch(run):
+        raise PrimitiveError(f"the batch item run {run!r} is not a run id")
     inputs = entry["inputs"]
     return Item(
-        test=test,
+        run=run,
         number=number,
-        binary=input_file(root, inputs, "binary", test),
-        input=input_file(root, inputs, "input", test),
-        time_limit=positive_number(inputs, "time_limit", test),
-        memory_limit=positive_number(inputs, "memory_limit", test),
-        args=arguments(inputs, test),
+        program=input_file(root, inputs, "program", run),
+        stdin=input_file(root, inputs, "stdin", run) if "stdin" in inputs else None,
+        time_limit=positive_number(inputs, "time_limit", run),
+        memory_limit=positive_number(inputs, "memory_limit", run),
+        args=arguments(inputs, run),
     )
 
 
-def input_file(root: Path, inputs: dict[str, object], name: str, test: str) -> Path:
+def input_file(root: Path, inputs: dict[str, object], name: str, run: str) -> Path:
     """Resolve a file input to a path, refusing anything outside `in/`."""
     value = inputs.get(name)
     if not isinstance(value, dict) or not isinstance(value.get("file"), str):
-        raise PrimitiveError(f"the input named {name} of test {test} is not a file")
+        raise PrimitiveError(f"the input named {name} of run {run} is not a file")
     path = (root / str(value["file"])).resolve()
     if not path.is_relative_to((root / "in").resolve()):
-        raise PrimitiveError(f"the input named {name} of test {test} is outside in/")
+        raise PrimitiveError(f"the input named {name} of run {run} is outside in/")
     if not path.is_file():
         raise PrimitiveError(
-            f"the input named {name} of test {test} is not in the working directory"
+            f"the input named {name} of run {run} is not in the working directory"
         )
     return path
 
 
-def positive_number(inputs: dict[str, object], name: str, test: str) -> float:
+def positive_number(inputs: dict[str, object], name: str, run: str) -> float:
     """Read a number input that must be above zero."""
     value = inputs.get(name)
     if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
         raise PrimitiveError(
-            f"the input named {name} of test {test} is not a positive number"
+            f"the input named {name} of run {run} is not a positive number"
         )
     return float(value)
 
 
-def arguments(inputs: dict[str, object], test: str) -> tuple[str, ...]:
-    """Read `args`, the optional text appended to the binary's command line,
+def arguments(inputs: dict[str, object], run: str) -> tuple[str, ...]:
+    """Read `args`, the optional text appended to the program's command line,
     split on spaces: a run of spaces separates two arguments, and spaces at
     either end separate nothing. There is no quoting, so no argument holds a
-    space. Absent, the binary gets no arguments.
+    space. Absent, the program gets no arguments.
     """
     value = inputs.get("args")
     if value is None:
         return ()
     if not isinstance(value, str):
-        raise PrimitiveError(f"the input named args of test {test} is not text")
+        raise PrimitiveError(f"the input named args of run {run} is not text")
     return tuple(part for part in value.split(" ") if part)
 
 
@@ -443,16 +446,17 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
 
 def run_all(root: Path, items: list[Item]) -> list[dict[str, object]]:
     """Run the items one after another, in the order given, each on a copy of
-    its binary of its own.
+    its program of its own.
 
-    A run may take this program's access away from the binary under `in/`
+    A run may take this program's access away from the program under `in/`
     and from the scratch folder its copy is in, both of which it can name, so
     each is given back before the copy is made and before it is removed: a
     run that could make the next copy fail would end the whole batch in an
-    error, which a hidden test's run could do or not by what its input holds.
+    error, which a run whose results are shown later could do or not by what
+    its input holds.
 
     Nothing runs unless the kernel offers Landlock at `MINIMUM_LANDLOCK_ABI`
-    or later: without it a run could read the other tests' inputs and outputs
+    or later: without it a run could read the other runs' inputs and outputs
     and write the files `outputs.json` is built from.
     """
     abi = landlock_abi()
@@ -461,51 +465,51 @@ def run_all(root: Path, items: list[Item]) -> list[dict[str, object]]:
             "this machine's kernel does not offer Landlock ABI 3, which every run "
             "is confined with; it needs Linux 6.2 or later with Landlock enabled"
         )
-    scratch = Path(tempfile.mkdtemp(prefix=".sandbox-run-", dir=root))
+    scratch = Path(tempfile.mkdtemp(prefix=".exec-", dir=root))
     kinds: dict[Path, str] = {}
     results: list[dict[str, object]] = []
     try:
         for item in items:
-            give_back_along(root, item.binary)
+            give_back_along(root, item.program)
             give_back(scratch)
-            if item.binary not in kinds:
-                kinds[item.binary] = detect(item.binary)
-            program = prepare(item, kinds[item.binary], scratch)
+            if item.program not in kinds:
+                kinds[item.program] = detect(item.program)
+            program = prepare(item, kinds[item.program], scratch)
             try:
                 outputs = run_item(root, item, program, abi)
             finally:
                 give_back(scratch)
                 program.path.unlink(missing_ok=True)
-            results.append({"test": item.test, "outputs": outputs})
+            results.append({"run": item.run, "outputs": outputs})
     finally:
         give_back_tree(root)
         shutil.rmtree(scratch, ignore_errors=True)
     return results
 
 
-def detect(binary: Path) -> str:
-    """Tell which of the three binary formats a file is.
+def detect(program: Path) -> str:
+    """Tell which of the three program formats a file is.
 
     `native` is an ELF executable, `python` a zip application with a
     `__main__.py`, `java` a jar with a manifest.
     """
-    with binary.open("rb") as stream:
+    with program.open("rb") as stream:
         if stream.read(4) == ELF_MAGIC:
             return "native"
-    if zipfile.is_zipfile(binary):
-        with zipfile.ZipFile(binary) as archive:
+    if zipfile.is_zipfile(program):
+        with zipfile.ZipFile(program) as archive:
             names = set(archive.namelist())
         if "__main__.py" in names:
             return "python"
         if "META-INF/MANIFEST.MF" in names:
             return "java"
     raise PrimitiveError(
-        "the binary is not a native executable, a Python zip application or a Java jar"
+        "the program is not a native executable, a Python zip application or a Java jar"
     )
 
 
 def prepare(item: Item, kind: str, scratch: Path) -> Program:
-    """Get the item's binary, of format `kind`, ready to run: copied into the
+    """Get the item's program, of format `kind`, ready to run: copied into the
     scratch directory for this item alone, and for a native executable marked
     executable there, since the file under `in/` may not be.
 
@@ -515,7 +519,7 @@ def prepare(item: Item, kind: str, scratch: Path) -> Program:
     before the item's clock starts, so its time is not the run's.
     """
     path = scratch / f"program-{item.number}"
-    shutil.copyfile(item.binary, path)
+    shutil.copyfile(item.program, path)
     if kind == "native":
         path.chmod(0o755)
     return Program(kind, path)
@@ -523,16 +527,17 @@ def prepare(item: Item, kind: str, scratch: Path) -> Program:
 
 def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, object]:
     """Run one item and return its outputs, all of them whatever the outcome:
-    what the binary printed, its CPU time and its peak memory.
+    what the program printed, its CPU time and its peak memory.
 
     The time is the CPU time, and on `time_limit` at least the limit: a run
     the wall clock stopped, one that slept or waited, used little CPU. An
     argument holding a NUL character, which no command line can carry, is a
-    run that could not start, a `runtime_error`, like a binary the kernel
+    run that could not start, a `runtime_error`, like a program the kernel
     will not run.
     """
     give_back_along(root, root / "out")
-    give_back_along(root, item.input)
+    if item.stdin is not None:
+        give_back_along(root, item.stdin)
     give_back_along(root, program.path, program.mode)
     out = root / "out" / str(item.number)
     out.mkdir(parents=True, exist_ok=True)
@@ -542,7 +547,8 @@ def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, ob
         descriptor = os.open(
             output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644
         )
-        with item.input.open("rb") as stdin, os.fdopen(descriptor, "wb") as stdout:
+        stdin_path = item.stdin if item.stdin is not None else Path(os.devnull)
+        with stdin_path.open("rb") as stdin, os.fdopen(descriptor, "wb") as stdout:
             if any("\0" in argument for argument in item.args):
                 run = Run(127, 0.0, 0.0, 0, 0, None)
             else:
@@ -578,25 +584,25 @@ def execute(
 ) -> Run:
     """Start one run and watch it until it and everything it started are gone.
 
-    The binary is started through `sandbox-exec`, which forks it and reports
+    The program is started through `sandbox-exec`, which forks it and reports
     its process id and, once it ends, its exit status, CPU time and peak
     memory. Every few milliseconds every process of the run is read: their
     CPU time together, their memory (see `RunMemory`), the wall-clock time
-    and the output size, and the binary is killed as soon as one is over its
+    and the output size, and the program is killed as soon as one is over its
     limit. Resource limits set before the start back this up: CPU time, file
     size, stack, and no core dumps.
 
-    The memory reported is the higher of the binary's own peak, as
+    The memory reported is the higher of the program's own peak, as
     `sandbox-exec` saw it, and the highest this program read while the run
     went on.
 
-    The CPU time reported is the binary's own, as `sandbox-exec` saw it, plus
+    The CPU time reported is the program's own, as `sandbox-exec` saw it, plus
     that of every process the run left behind, which this program reaps, so a
     run cannot hide work in a child it never waits for. A run that kills
     `sandbox-exec` is judged on what this program measured itself.
 
     A command line too long for the kernel, which only the item's arguments
-    can make, is a run that could not start, judged as a native binary the
+    can make, is a run that could not start, judged as a native program the
     kernel will not run is.
     """
     env = {"PATH": RUN_PATH, "HOME": str(cwd), "TMPDIR": str(cwd), "LANG": "C.UTF-8"}
@@ -626,7 +632,7 @@ def execute(
         os.close(read_end)
         if isinstance(error, OSError) and error.errno in REFUSED_ARGUMENTS:
             return Run(127, 0.0, 0.0, 0, 0, None)
-        raise PrimitiveError(f"the binary could not be started: {error}") from None
+        raise PrimitiveError(f"the program could not be started: {error}") from None
     finally:
         os.close(write_end)
         os.close(ruleset)
@@ -659,7 +665,7 @@ def execute(
                 kill(pid or -helper.pid)
                 # The run may have stopped `sandbox-exec` with SIGSTOP where
                 # Landlock does not scope signals, and a stopped helper never
-                # reaps the binary; woken, it reports at once, and whatever
+                # reaps the program; woken, it reports at once, and whatever
                 # is left goes after STRAY_SECONDS.
                 wake(helper.pid)
         elif now - stopped_at > STRAY_SECONDS:
@@ -682,7 +688,7 @@ def execute(
         contestants = REFUSED_BINARY if program.kind == "native" else frozenset()
         if refused not in contestants | REFUSED_ARGUMENTS:
             raise PrimitiveError(
-                f"the binary could not be started: {os.strerror(refused)}"
+                f"the program could not be started: {os.strerror(refused)}"
             )
         return Run(127, 0.0, wall, 0, 0, stopped)
     if "R" in lines:
@@ -810,7 +816,7 @@ def sample(me: int, helper: int) -> tuple[float, set[int]]:
     """The run's CPU seconds so far and the process ids of the run.
 
     The run is every process descended from this program but `sandbox-exec`:
-    the binary, whatever it started, and whatever it left behind, which comes
+    the program, whatever it started, and whatever it left behind, which comes
     back to this program as the subreaper. Their CPU time is added up, with
     what each has reaped of its own children.
     """
@@ -1191,16 +1197,16 @@ def landlock_ruleset(directory: Path, readable: list[Path], abi: int) -> int:
 
     Writing, creating, removing and renaming are allowed under `directory`,
     and writing to /dev/null. Reading is allowed under `directory`, of each
-    file in `readable` and beneath each directory in it (the binary, and the
+    file in `readable` and beneath each directory in it (the program, and the
     interpreter it needs), beneath the system directories in
     READABLE_DIRECTORIES, and of /dev/null and the devices in
-    READABLE_DEVICES, and nowhere else: not the other tests' inputs under
+    READABLE_DEVICES, and nowhere else: not the other runs' inputs under
     `in/`, their outputs under `out/`, nor `inputs.json`. From
     ABI 6 a process under it also may not signal, or reach an abstract Unix
     socket of, anything outside its own Landlock domain; from ABI 1 it may not
     trace anything outside it. Running a file needs reading it, so only the
-    binary and the system's programs can be run. Files already open, standard
-    input and output, stay usable. `sandbox-exec` enforces it on the binary
+    program and the system's programs can be run. Files already open, standard
+    input and output, stay usable. `sandbox-exec` enforces it on the program
     alone, just before exec, so neither it nor this program is inside.
     """
     handled = FS_WRITES | FS_READS | FS_REFER | FS_TRUNCATE

@@ -18,11 +18,11 @@ from typing import Any
 
 import pytest
 
-import sandbox_run
+import exec as primitive
 from support import (
     PROGRAM,
     batch_inputs,
-    by_test,
+    by_run,
     declaration,
     peek_input,
     peeked,
@@ -55,14 +55,14 @@ def tables(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     folder.mkdir()
     for kind in ("shm", "msg", "sem"):
         (folder / kind).write_text(f"       key      {kind}id perms\n")
-    monkeypatch.setattr(sandbox_run, "SYSVIPC", folder)
+    monkeypatch.setattr(primitive, "SYSVIPC", folder)
     return folder
 
 
 @pytest.fixture
 def run(helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     """Run the program over a batch of the test program's cases."""
-    monkeypatch.setattr(sandbox_run, "HELPER", helper)
+    monkeypatch.setattr(primitive, "HELPER", helper)
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
 
     def batch(
@@ -72,7 +72,7 @@ def run(helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     ) -> dict[str, Any]:
         work = tmp_path / "work"
         batch_inputs(work, binary, items, args=args, **limits)
-        assert sandbox_run.main(["sandbox-run", str(work)]) == 0
+        assert primitive.main(["exec", str(work)]) == 0
         document: dict[str, Any] = json.loads(
             (work / "outputs.json").read_text(encoding="utf-8")
         )
@@ -81,7 +81,7 @@ def run(helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     return batch
 
 
-def make_run(**changes: Any) -> sandbox_run.Run:
+def make_run(**changes: Any) -> primitive.Run:
     """A run that exited cleanly well inside every limit, with some fields changed."""
     fields: dict[str, Any] = {
         "returncode": 0,
@@ -91,11 +91,11 @@ def make_run(**changes: Any) -> sandbox_run.Run:
         "output_bytes": 10,
         "stopped": None,
     }
-    return sandbox_run.Run(**(fields | changes))
+    return primitive.Run(**(fields | changes))
 
 
-ITEM = sandbox_run.Item(
-    "main/1", 1, Path("b"), Path("i"), time_limit=1.0, memory_limit=64
+ITEM = primitive.Item(
+    "main-1", 1, Path("b"), Path("i"), time_limit=1.0, memory_limit=64
 )
 
 
@@ -103,7 +103,7 @@ ITEM = sandbox_run.Item(
     ("limit", "ms"), [(1.0, 1000), (0.1, 100), (0.3, 300), (2.5, 2500), (0.0005, 1)]
 )
 def test_the_time_limit_in_milliseconds_is_rounded_up(limit: float, ms: int) -> None:
-    item = sandbox_run.Item("main/1", 1, Path("b"), Path("i"), limit, 64)
+    item = primitive.Item("main-1", 1, Path("b"), Path("i"), limit, 64)
     assert item.time_limit_ms == ms
 
 
@@ -114,7 +114,7 @@ JUDGED: list[tuple[dict[str, Any], str, str]] = [
     ({"stopped": "output", "returncode": -9}, "native", "output_limit"),
     ({"returncode": -signal.SIGXFSZ}, "native", "output_limit"),
     (
-        {"output_bytes": sandbox_run.OUTPUT_LIMIT + 1, "returncode": 1},
+        {"output_bytes": primitive.OUTPUT_LIMIT + 1, "returncode": 1},
         "python",
         "output_limit",
     ),
@@ -132,7 +132,7 @@ JUDGED: list[tuple[dict[str, Any], str, str]] = [
 @pytest.mark.parametrize(("changes", "kind", "outcome"), JUDGED)
 def test_judge(changes: dict[str, Any], kind: str, outcome: str) -> None:
     """The stop reason first, then output, time and memory, then the exit."""
-    assert sandbox_run.judge(make_run(**changes), ITEM, kind) == outcome
+    assert primitive.judge(make_run(**changes), ITEM, kind) == outcome
 
 
 def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
@@ -140,8 +140,7 @@ def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
     with a line saying when, for the workflow editor's drawer.
     """
     reported = {
-        sandbox_run.judge(make_run(**changes), ITEM, kind)
-        for changes, kind, _ in JUDGED
+        primitive.judge(make_run(**changes), ITEM, kind) for changes, kind, _ in JUDGED
     }
 
     outcomes = declaration()["outputs"]["outcome"]["outcomes"]
@@ -164,7 +163,7 @@ def test_the_declaration_says_every_outcome_judge_can_give() -> None:
     """
     outcomes = declaration()["outputs"]["outcome"]["outcomes"]
 
-    assert set(outcomes) == returned_outcomes(sandbox_run.judge)
+    assert set(outcomes) == returned_outcomes(primitive.judge)
 
 
 def test_detect(tmp_path: Path) -> None:
@@ -177,101 +176,135 @@ def test_detect(tmp_path: Path) -> None:
         archive.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n")
     other = tmp_path / "other"
     other.write_text("#!/bin/sh\necho hi\n")
-    assert sandbox_run.detect(native) == "native"
-    assert sandbox_run.detect(python) == "python"
-    assert sandbox_run.detect(java) == "java"
-    with pytest.raises(sandbox_run.PrimitiveError, match="not a native executable"):
-        sandbox_run.detect(other)
+    assert primitive.detect(native) == "native"
+    assert primitive.detect(python) == "python"
+    assert primitive.detect(java) == "java"
+    with pytest.raises(primitive.PrimitiveError, match="not a native executable"):
+        primitive.detect(other)
 
 
 @pytest.mark.parametrize(
     ("inputs", "message"),
     [
-        ({"time_limit": 0}, "time_limit of test main/1 is not a positive number"),
-        ({"time_limit": True}, "time_limit of test main/1 is not a positive number"),
-        ({"memory_limit": "64"}, "memory_limit of test main/1 is not a positive"),
-        ({"binary": {"file": "in/../inputs.json"}}, "binary of test main/1 is outside"),
-        ({"input": {"file": "in/none"}}, "input of test main/1 is not in the working"),
-        ({"input": "in/2/input"}, "input of test main/1 is not a file"),
-        ({"args": 3}, "args of test main/1 is not text"),
+        ({"time_limit": 0}, "time_limit of run main-1 is not a positive number"),
+        ({"time_limit": True}, "time_limit of run main-1 is not a positive number"),
+        ({"memory_limit": "64"}, "memory_limit of run main-1 is not a positive"),
+        (
+            {"program": {"file": "in/../inputs.json"}},
+            "program of run main-1 is outside",
+        ),
+        ({"stdin": {"file": "in/none"}}, "stdin of run main-1 is not in the working"),
+        ({"stdin": "in/2/input"}, "stdin of run main-1 is not a file"),
+        ({"args": 3}, "args of run main-1 is not text"),
     ],
 )
 def test_inputs_it_cannot_use_are_an_error(
     tmp_path: Path, inputs: dict[str, Any], message: str
 ) -> None:
     """Anything that stops the primitive working is `error` alone, in one sentence."""
-    batch_inputs(tmp_path, b"", [("main/1", "")])
+    batch_inputs(tmp_path, b"", [("main-1", "")])
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["batch"][0]["inputs"].update(inputs)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
-    assert sandbox_run.main(["sandbox-run", str(tmp_path)]) == 0
+    assert primitive.main(["exec", str(tmp_path)]) == 0
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert set(result) == {"schema_version", "error"}
     assert message in result["error"]
 
 
+def test_a_version_5_batch_is_an_error(tmp_path: Path) -> None:
+    """exec speaks contract version 6 alone, whose items are keyed by run."""
+    batch_inputs(tmp_path, b"", [("main-1", "")])
+    document = json.loads((tmp_path / "inputs.json").read_text())
+    document["schema_version"] = 5
+    (tmp_path / "inputs.json").write_text(json.dumps(document))
+    primitive.main(["exec", str(tmp_path)])
+    result = json.loads((tmp_path / "outputs.json").read_text())
+    assert "not written against contract version 6" in result["error"]
+    assert result["schema_version"] == 6
+
+
 @pytest.mark.parametrize(
-    ("tests", "message"),
+    ("runs", "message"),
     [
-        (["main/1", "main/1"], "for the same test"),
-        (["main"], "is not a test id"),
-        (["main/../1"], "is not a test id"),
-        (["main/1/2"], "is not a test id"),
+        (["main-1", "main-1"], "for the same run"),
+        (["main/1"], "is not a run id"),
+        (["main.1"], "is not a run id"),
+        ([""], "is not a run id"),
+        (["x" * 256], "is not a run id"),
     ],
 )
-def test_items_must_be_for_distinct_tests(
-    tmp_path: Path, tests: list[str], message: str
+def test_items_must_be_for_distinct_runs(
+    tmp_path: Path, runs: list[str], message: str
 ) -> None:
-    """Each item names one test, `<group>/<test>`, and no two the same one."""
-    batch_inputs(tmp_path, b"", [(f"main/{n}", "") for n in range(len(tests))])
+    """Each item names one run, by an id of letters, digits, `_` and `-`, and no
+    two the same one."""
+    batch_inputs(tmp_path, b"", [(f"main-{n}", "") for n in range(len(runs))])
     document = json.loads((tmp_path / "inputs.json").read_text())
-    for entry, test in zip(document["batch"], tests, strict=True):
-        entry["test"] = test
+    for entry, run in zip(document["batch"], runs, strict=True):
+        entry["run"] = run
     (tmp_path / "inputs.json").write_text(json.dumps(document))
-    sandbox_run.main(["sandbox-run", str(tmp_path)])
+    primitive.main(["exec", str(tmp_path)])
     assert message in json.loads((tmp_path / "outputs.json").read_text())["error"]
 
 
+def test_a_run_without_stdin_reads_nothing(
+    helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no `stdin`, standard input is empty, as `/dev/null` is."""
+    monkeypatch.setattr(primitive, "HELPER", helper)
+    program = python_binary(tmp_path / "build" / "program", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    batch_inputs(work, program, [("main-1", "")])
+    document = json.loads((work / "inputs.json").read_text())
+    del document["batch"][0]["inputs"]["stdin"]
+    (work / "inputs.json").write_text(json.dumps(document))
+    primitive.main(["exec", str(work)])
+    outputs = by_run(json.loads((work / "outputs.json").read_text()))["main-1"]
+    assert outputs["outcome"] == "accepted"
+    assert printed(work, outputs) == ""
+
+
 def test_a_binary_in_no_known_format_is_an_error(tmp_path: Path) -> None:
-    """A binary sandbox-run cannot run is the step failing, not the contestant."""
-    batch_inputs(tmp_path, b"#!/bin/sh\n", [("main/1", "")])
-    sandbox_run.main(["sandbox-run", str(tmp_path)])
+    """A program exec cannot run is the step failing, not the contestant."""
+    batch_inputs(tmp_path, b"#!/bin/sh\n", [("main-1", "")])
+    primitive.main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert "not a native executable" in result["error"]
 
 
 def test_every_outcome(run: Any, tmp_path: Path) -> None:
     """One batch reaches each outcome, keeps each output and measures each run,
-    answering in the batch's order under each item's test, with each output
-    under the item's place in the batch, since a test id holds a `/`.
+    answering in the batch's order under each item's run, with each output
+    under the item's place in the batch.
     """
-    tests = ["samples/ok", "main/spin", "main/sleep", "main/grow", "main/fail"]
+    runs = ["samples-ok", "main-spin", "main-sleep", "main-grow", "main-fail"]
     cases = ["double\n21\n", "spin\n", "sleep\n", "grow\n", "fail\n"]
-    items = list(zip(tests, cases, strict=True))
+    items = list(zip(runs, cases, strict=True))
     result = run(items, time_limit=0.5, memory_limit=64)
-    outputs = by_test(result)
-    assert [entry["test"] for entry in result["batch"]] == tests
-    assert {test: entry["outcome"] for test, entry in outputs.items()} == {
-        "samples/ok": "accepted",
-        "main/spin": "time_limit",
-        "main/sleep": "time_limit",
-        "main/grow": "memory_limit",
-        "main/fail": "runtime_error",
+    outputs = by_run(result)
+    assert [entry["run"] for entry in result["batch"]] == runs
+    assert {run: entry["outcome"] for run, entry in outputs.items()} == {
+        "samples-ok": "accepted",
+        "main-spin": "time_limit",
+        "main-sleep": "time_limit",
+        "main-grow": "memory_limit",
+        "main-fail": "runtime_error",
     }
     work = tmp_path / "work"
     assert [entry["output"]["file"] for entry in outputs.values()] == [
         f"out/{number}/output" for number in range(1, 6)
     ]
-    assert printed(work, outputs["samples/ok"]) == "42\n"
-    assert printed(work, outputs["main/fail"]) == "partial\n"
+    assert printed(work, outputs["samples-ok"]) == "42\n"
+    assert printed(work, outputs["main-fail"]) == "partial\n"
     for entry in outputs.values():
         assert set(entry) == {"output", "time_ms", "memory_kb", "outcome"}
         assert isinstance(entry["time_ms"], int)
         assert isinstance(entry["memory_kb"], int)
         assert entry["memory_kb"] > 0
-    assert outputs["main/grow"]["memory_kb"] > 64 * 1024
-    assert outputs["samples/ok"]["memory_kb"] < 64 * 1024
-    assert not list(work.glob(".sandbox-run-*"))
+    assert outputs["main-grow"]["memory_kb"] > 64 * 1024
+    assert outputs["samples-ok"]["memory_kb"] < 64 * 1024
+    assert not list(work.glob(".exec-*"))
 
 
 def test_a_run_stopped_at_its_time_limit_reports_at_least_the_limit(
@@ -280,12 +313,12 @@ def test_a_run_stopped_at_its_time_limit_reports_at_least_the_limit(
     """Stopped by the CPU limit or by the wall clock, a run reports at least
     the time limit, though one that slept used next to no CPU.
     """
-    items = [("main/spin", "spin\n"), ("main/sleep", "sleep\n")]
-    outputs = by_test(run(items, time_limit=0.3))
-    assert outputs["main/spin"]["outcome"] == "time_limit"
-    assert outputs["main/sleep"]["outcome"] == "time_limit"
-    assert 300 <= outputs["main/spin"]["time_ms"] < 1300
-    assert outputs["main/sleep"]["time_ms"] == 300
+    items = [("main-spin", "spin\n"), ("main-sleep", "sleep\n")]
+    outputs = by_run(run(items, time_limit=0.3))
+    assert outputs["main-spin"]["outcome"] == "time_limit"
+    assert outputs["main-sleep"]["outcome"] == "time_limit"
+    assert 300 <= outputs["main-spin"]["time_ms"] < 1300
+    assert outputs["main-sleep"]["time_ms"] == 300
 
 
 @pytest.mark.parametrize(
@@ -306,15 +339,15 @@ def test_args_reach_the_command_line_split_on_spaces(
     """`args` is appended to the binary's command line, split on spaces, with
     no empty arguments; absent, the binary gets none.
     """
-    given = {"main/1": args} if args is not None else None
-    outputs = by_test(run([("main/1", "argv\n")], args=given))
-    assert outputs["main/1"]["outcome"] == "accepted"
-    assert printed(tmp_path / "work", outputs["main/1"]) == f"{argv!r}\n"
+    given = {"main-1": args} if args is not None else None
+    outputs = by_run(run([("main-1", "argv\n")], args=given))
+    assert outputs["main-1"]["outcome"] == "accepted"
+    assert printed(tmp_path / "work", outputs["main-1"]) == f"{argv!r}\n"
 
 
 def test_args_are_each_items_own(run: Any, tmp_path: Path) -> None:
-    items = [("main/1", "argv\n"), ("main/2", "argv\n"), ("main/3", "argv\n")]
-    outputs = by_test(run(items, args={"main/1": "a b", "main/3": "c"}))
+    items = [("main-1", "argv\n"), ("main-2", "argv\n"), ("main-3", "argv\n")]
+    outputs = by_run(run(items, args={"main-1": "a b", "main-3": "c"}))
     work = tmp_path / "work"
     assert [printed(work, outputs[test]) for test, _ in items] == [
         "['a', 'b']\n",
@@ -329,38 +362,38 @@ def test_args_no_command_line_can_carry_are_a_runtime_error(
     """An argument holding a NUL character, or longer than the kernel takes,
     is the contestant's input failing, never an error of the step.
     """
-    items = [("main/nul", "argv\n"), ("main/long", "argv\n"), ("main/ok", "argv\n")]
-    args = {"main/nul": "a \0 b", "main/long": "x" * (256 * 1024)}
-    outputs = by_test(run(items, args=args))
+    items = [("main-nul", "argv\n"), ("main-long", "argv\n"), ("main-ok", "argv\n")]
+    args = {"main-nul": "a \0 b", "main-long": "x" * (256 * 1024)}
+    outputs = by_run(run(items, args=args))
     assert {test: entry["outcome"] for test, entry in outputs.items()} == {
-        "main/nul": "runtime_error",
-        "main/long": "runtime_error",
-        "main/ok": "accepted",
+        "main-nul": "runtime_error",
+        "main-long": "runtime_error",
+        "main-ok": "accepted",
     }
     for entry in outputs.values():
         assert set(entry) == {"output", "time_ms", "memory_kb", "outcome"}
-    assert printed(tmp_path / "work", outputs["main/nul"]) == ""
+    assert printed(tmp_path / "work", outputs["main-nul"]) == ""
 
 
 def test_output_over_the_limit(run: Any, tmp_path: Path) -> None:
     """Printing too much is an output limit, and the output is cut at the limit."""
-    result = run([("main/flood", "flood\n")], time_limit=10)
-    assert by_test(result)["main/flood"]["outcome"] == "output_limit"
+    result = run([("main-flood", "flood\n")], time_limit=10)
+    assert by_run(result)["main-flood"]["outcome"] == "output_limit"
     output = tmp_path / "work" / "out" / "1" / "output"
-    assert output.stat().st_size == sandbox_run.OUTPUT_LIMIT
+    assert output.stat().st_size == primitive.OUTPUT_LIMIT
 
 
 def test_processes_left_behind_are_killed(run: Any) -> None:
     """A process a run leaves behind, even in its own session, is killed."""
-    result = run([("main/linger", "linger\n")])
-    assert by_test(result)["main/linger"]["outcome"] == "accepted"
-    assert sandbox_run.child_pids() == []
+    result = run([("main-linger", "linger\n")])
+    assert by_run(result)["main-linger"]["outcome"] == "accepted"
+    assert primitive.child_pids() == []
 
 
 def test_runs_write_only_their_own_directory(run: Any, tmp_path: Path) -> None:
     """A run cannot write the working directory or the rest of /tmp."""
     work = tmp_path / "work"
-    run([("main/escape", f"escape\n{work}\n")])
+    run([("main-escape", f"escape\n{work}\n")])
     lines = (work / "out" / "1" / "output").read_text().splitlines()
     assert lines == [
         f"refused {work}/escaped 13",
@@ -378,12 +411,12 @@ def test_a_run_that_kills_its_launcher_is_a_runtime_error(
     the program measured itself. Either way it is the run's own runtime
     error, never an error of the step.
     """
-    result = run([("main/parricide", "parricide\n"), ("main/ok", "double\n21\n")])
-    outputs = by_test(result)
-    assert outputs["main/parricide"]["outcome"] == "runtime_error"
-    assert outputs["main/ok"]["outcome"] == "accepted"
-    said = printed(tmp_path / "work", outputs["main/parricide"]).splitlines()
-    if sandbox_run.landlock_abi() >= 6:
+    result = run([("main-parricide", "parricide\n"), ("main-ok", "double\n21\n")])
+    outputs = by_run(result)
+    assert outputs["main-parricide"]["outcome"] == "runtime_error"
+    assert outputs["main-ok"]["outcome"] == "accepted"
+    said = printed(tmp_path / "work", outputs["main-parricide"]).splitlines()
+    if primitive.landlock_abi() >= 6:
         assert said == [f"refused {errno.EPERM}"]
 
 
@@ -393,9 +426,9 @@ def test_a_run_that_stops_its_launcher_is_still_ended_on_time(run: Any) -> None:
     within a second or so of that, not after a long wait for the helper.
     """
     started = time.monotonic()
-    result = run([("main/freeze", "freeze\n")], time_limit=0.5)
+    result = run([("main-freeze", "freeze\n")], time_limit=0.5)
     elapsed = time.monotonic() - started
-    assert by_test(result)["main/freeze"]["outcome"] == "time_limit"
+    assert by_run(result)["main-freeze"]["outcome"] == "time_limit"
     assert elapsed < 4
 
 
@@ -404,44 +437,44 @@ def test_a_run_the_kernel_killed_for_memory_is_over_the_memory_limit(
 ) -> None:
     events = tmp_path / "memory.events"
     events.write_text("low 0\nhigh 0\nmax 3\noom 1\noom_kill 2\n")
-    monkeypatch.setattr(sandbox_run, "OOM_EVENTS", events)
-    item = sandbox_run.Item(
-        "main/x",
+    monkeypatch.setattr(primitive, "OOM_EVENTS", events)
+    item = primitive.Item(
+        "main-x",
         1,
         tmp_path / "binary",
         tmp_path / "input",
         time_limit=1.0,
         memory_limit=64,
     )
-    run = sandbox_run.Run(-9, 0.1, 0.2, 1000, 0, None, out_of_memory=True)
+    run = primitive.Run(-9, 0.1, 0.2, 1000, 0, None, out_of_memory=True)
 
-    assert sandbox_run.oom_kills() == 2
-    assert sandbox_run.judge(run, item, "native") == "memory_limit"
+    assert primitive.oom_kills() == 2
+    assert primitive.judge(run, item, "native") == "memory_limit"
 
 
 def test_work_in_a_child_counts_against_the_time_limit(run: Any) -> None:
     """A child the binary never waits for still spends the run's time."""
-    result = run([("main/hidden-work", "hidden-work\n")], time_limit=0.5)
-    outputs = by_test(result)
-    assert outputs["main/hidden-work"]["outcome"] == "time_limit"
-    assert outputs["main/hidden-work"]["time_ms"] >= 500
+    result = run([("main-hidden-work", "hidden-work\n")], time_limit=0.5)
+    outputs = by_run(result)
+    assert outputs["main-hidden-work"]["outcome"] == "time_limit"
+    assert outputs["main-hidden-work"]["time_ms"] >= 500
 
 
 def test_memory_in_a_child_counts_against_the_memory_limit(run: Any) -> None:
-    result = run([("main/hidden-memory", "hidden-memory\n")], memory_limit=64)
-    outputs = by_test(result)
-    assert outputs["main/hidden-memory"]["outcome"] == "memory_limit"
-    assert outputs["main/hidden-memory"]["memory_kb"] > 64 * 1024
+    result = run([("main-hidden-memory", "hidden-memory\n")], memory_limit=64)
+    outputs = by_run(result)
+    assert outputs["main-hidden-memory"]["outcome"] == "memory_limit"
+    assert outputs["main-hidden-memory"]["memory_kb"] > 64 * 1024
 
 
 def test_memory_spread_over_processes_is_added_up(run: Any) -> None:
     """Two processes that each hold 40 MB of their own at the same moment are
     over a 64 MB limit together, though each alone is under it.
     """
-    result = run([("main/split", "split-memory\n")], time_limit=3, memory_limit=64)
-    outputs = by_test(result)
-    assert outputs["main/split"]["outcome"] == "memory_limit"
-    assert outputs["main/split"]["memory_kb"] > 64 * 1024
+    result = run([("main-split", "split-memory\n")], time_limit=3, memory_limit=64)
+    outputs = by_run(result)
+    assert outputs["main-split"]["outcome"] == "memory_limit"
+    assert outputs["main-split"]["memory_kb"] > 64 * 1024
 
 
 def test_a_forked_child_is_not_charged_again_for_what_it_shares(run: Any) -> None:
@@ -449,9 +482,9 @@ def test_a_forked_child_is_not_charged_again_for_what_it_shares(run: Any) -> Non
     own, costs the run almost nothing: the pages it shares with its parent
     count once, not once in each process.
     """
-    items = [("main/alone", "hold-memory\n"), ("main/shared", "shared-memory\n")]
-    outputs = by_test(run(items, time_limit=3, memory_limit=64))
-    alone, shared = outputs["main/alone"], outputs["main/shared"]
+    items = [("main-alone", "hold-memory\n"), ("main-shared", "shared-memory\n")]
+    outputs = by_run(run(items, time_limit=3, memory_limit=64))
+    alone, shared = outputs["main-alone"], outputs["main-shared"]
     assert alone["outcome"] == "accepted"
     assert shared["outcome"] == "accepted"
     assert alone["memory_kb"] > 40 * 1024
@@ -467,7 +500,7 @@ def test_what_the_cgroup_holds_beyond_the_start_of_a_run_counts(tmp_path: Path) 
     (tmp_path / "memory.stat").write_text(
         f"anon {10 * 2**20}\nfile {900 * 2**20}\nshmem 0\n"
     )
-    memory = sandbox_run.RunMemory(cgroup=tmp_path)
+    memory = primitive.RunMemory(cgroup=tmp_path)
     (tmp_path / "memory.current").write_text(str(84 * 2**20))
     (tmp_path / "memory.stat").write_text(
         f"anon {20 * 2**20}\nfile {60 * 2**20}\nshmem {50 * 2**20}\nsock {4 * 2**20}\n"
@@ -479,7 +512,7 @@ def test_what_the_cgroup_holds_beyond_the_start_of_a_run_counts(tmp_path: Path) 
 
 
 def test_a_cgroup_with_no_memory_accounting_adds_no_reading(tmp_path: Path) -> None:
-    memory = sandbox_run.RunMemory(cgroup=tmp_path / "absent")
+    memory = primitive.RunMemory(cgroup=tmp_path / "absent")
 
     memory.read(set())
 
@@ -492,12 +525,12 @@ def test_a_run_outside_a_cgroup_of_its_own_is_warned_about(
     """A test machine's cgroup holds other processes too, so its memory is
     not read, and the program says so.
     """
-    assert sandbox_run.own_cgroup() is None
+    assert primitive.own_cgroup() is None
 
-    outputs = by_test(run([("main/ok", "double\n21\n")]))
+    outputs = by_run(run([("main-ok", "double\n21\n")]))
 
-    assert outputs["main/ok"]["outcome"] == "accepted"
-    assert sandbox_run.NO_CGROUP in capsys.readouterr().err
+    assert outputs["main-ok"]["outcome"] == "accepted"
+    assert primitive.NO_CGROUP in capsys.readouterr().err
 
 
 def test_the_total_is_read_only_when_it_could_raise_the_peak(
@@ -514,9 +547,9 @@ def test_the_total_is_read_only_when_it_could_raise_the_peak(
         read.append(pid)
         return resident_kb
 
-    monkeypatch.setattr(sandbox_run, "resident_memory", resident.__getitem__)
-    monkeypatch.setattr(sandbox_run, "proportional_memory", proportional)
-    memory = sandbox_run.RunMemory()
+    monkeypatch.setattr(primitive, "resident_memory", resident.__getitem__)
+    monkeypatch.setattr(primitive, "proportional_memory", proportional)
+    memory = primitive.RunMemory()
     memory.read({1})
     assert (memory.peak_kb, read) == (30_000, [])
     resident[2] = (40_000, 40_000)
@@ -534,25 +567,25 @@ def test_the_total_is_read_only_when_it_could_raise_the_peak(
 def test_a_native_binary_the_kernel_will_not_run_is_a_runtime_error(
     helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(sandbox_run, "HELPER", helper)
-    batch_inputs(tmp_path, b"\x7fELF" + bytes(60), [("main/1", "")])
-    sandbox_run.main(["sandbox-run", str(tmp_path)])
+    monkeypatch.setattr(primitive, "HELPER", helper)
+    batch_inputs(tmp_path, b"\x7fELF" + bytes(60), [("main-1", "")])
+    primitive.main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
-    outputs = by_test(result)["main/1"]
+    outputs = by_run(result)["main-1"]
     assert outputs["outcome"] == "runtime_error"
     assert (outputs["time_ms"], outputs["memory_kb"]) == (0, 0)
 
 
 def test_the_report_reads_only_the_lines_sandbox_exec_writes() -> None:
     report = b"P 12\nR 0 5 6 7\nR 0 0 0 0\nZ 1\n\xff\nE x\nR 1"
-    assert sandbox_run.parse_report(report) == {"P": [12], "R": [0, 5, 6, 7]}
+    assert primitive.parse_report(report) == {"P": [12], "R": [0, 5, 6, 7]}
 
 
 def test_a_json_file_is_written_whole_past_a_planted_link(tmp_path: Path) -> None:
     target = tmp_path / "elsewhere"
     target.write_text("untouched")
     (tmp_path / "outputs.json.partial").symlink_to(target)
-    sandbox_run.write_json(tmp_path / "outputs.json", {"schema_version": 5})
+    primitive.write_json(tmp_path / "outputs.json", {"schema_version": 5})
     assert target.read_text() == "untouched"
     assert not (tmp_path / "outputs.json").is_symlink()
     assert json.loads((tmp_path / "outputs.json").read_text()) == {"schema_version": 5}
@@ -566,11 +599,11 @@ def test_a_run_reads_neither_another_runs_files_nor_the_steps(
     leaves reaches the next; the system's files it can.
     """
     work = str(tmp_path / "work")
-    result = run([("main/first", "double\n21\n"), ("main/peek", peek_input(work))])
-    outputs = by_test(result)
-    assert outputs["main/peek"]["outcome"] == "accepted"
-    assert printed(tmp_path / "work", outputs["main/first"]) == "42\n"
-    lines = printed(tmp_path / "work", outputs["main/peek"]).splitlines()
+    result = run([("main-first", "double\n21\n"), ("main-peek", peek_input(work))])
+    outputs = by_run(result)
+    assert outputs["main-peek"]["outcome"] == "accepted"
+    assert printed(tmp_path / "work", outputs["main-first"]) == "42\n"
+    lines = printed(tmp_path / "work", outputs["main-peek"]).splitlines()
     assert lines == peeked(work)
 
 
@@ -582,8 +615,8 @@ def test_without_landlock_nothing_runs(
     below 3, which cannot keep a run from truncating a file it may only
     read, is an error of the step, never a run left less confined.
     """
-    monkeypatch.setattr(sandbox_run, "landlock_abi", lambda: abi)
-    result = run([("main/ok", "double\n21\n")])
+    monkeypatch.setattr(primitive, "landlock_abi", lambda: abi)
+    result = run([("main-ok", "double\n21\n")])
     assert set(result) == {"schema_version", "error"}
     assert "Landlock ABI 3" in result["error"]
     assert "Linux 6.2" in result["error"]
@@ -595,8 +628,8 @@ def test_a_ruleset_the_kernel_refuses_is_an_error(
     def refuse(directory: Path, readable: list[Path], abi: int) -> int:
         raise OSError(1, "Operation not permitted")
 
-    monkeypatch.setattr(sandbox_run, "landlock_ruleset", refuse)
-    result = run([("main/ok", "double\n21\n")])
+    monkeypatch.setattr(primitive, "landlock_ruleset", refuse)
+    result = run([("main-ok", "double\n21\n")])
     assert "could not be confined with Landlock" in result["error"]
 
 
@@ -610,7 +643,7 @@ def test_the_launcher_starts_nothing_without_a_ruleset(helper: str) -> None:
     report = os.read(read_end, 64)
     os.close(read_end)
     assert done.returncode == 2
-    assert sandbox_run.parse_report(report) == {"L": [errno.EBADF]}
+    assert primitive.parse_report(report) == {"L": [errno.EBADF]}
 
 
 def test_the_sweep_removes_every_object_the_kernel_lists(
@@ -624,16 +657,16 @@ def test_the_sweep_removes_every_object_the_kernel_lists(
     (tables / "sem").write_text("       key      semid perms\n  0   7   600\n")
     removed: list[tuple[str, int]] = []
     monkeypatch.setattr(
-        sandbox_run, "remove_sysv", lambda kind, ident: removed.append((kind, ident))
+        primitive, "remove_sysv", lambda kind, ident: removed.append((kind, ident))
     )
-    sandbox_run.sweep_sysv()
+    primitive.sweep_sysv()
     assert removed == [("shm", 5), ("shm", 9), ("sem", 7)]
 
 
 def test_an_object_already_gone_is_passed_over() -> None:
-    sandbox_run.remove_sysv("shm", 2**31 - 1)
-    sandbox_run.remove_sysv("msg", 2**31 - 1)
-    sandbox_run.remove_sysv("sem", 2**31 - 1)
+    primitive.remove_sysv("shm", 2**31 - 1)
+    primitive.remove_sysv("msg", 2**31 - 1)
+    primitive.remove_sysv("sem", 2**31 - 1)
 
 
 def test_an_object_that_cannot_be_removed_is_an_error(
@@ -647,9 +680,9 @@ def test_an_object_that_cannot_be_removed_is_an_error(
             ctypes.set_errno(errno.EPERM)
             return -1
 
-    monkeypatch.setattr(sandbox_run, "libc", Refusing)
-    with pytest.raises(sandbox_run.PrimitiveError, match="shm 5, could not be removed"):
-        sandbox_run.remove_sysv("shm", 5)
+    monkeypatch.setattr(primitive, "libc", Refusing)
+    with pytest.raises(primitive.PrimitiveError, match="shm 5, could not be removed"):
+        primitive.remove_sysv("shm", 5)
 
 
 def test_an_attribute_on_a_locked_file_or_folder_is_removed(tmp_path: Path) -> None:
@@ -663,7 +696,7 @@ def test_an_attribute_on_a_locked_file_or_folder_is_removed(tmp_path: Path) -> N
     os.setxattr(folder, "user.cache", b"x")
     marked.chmod(0o444)
     folder.chmod(0)
-    sandbox_run.clear_attributes(tmp_path)
+    primitive.clear_attributes(tmp_path)
     assert os.listxattr(folder) == []
     assert os.listxattr(marked) == []
 
@@ -678,8 +711,8 @@ def test_an_attribute_that_cannot_be_removed_is_an_error(
         raise PermissionError(errno.EPERM, "Operation not permitted")
 
     monkeypatch.setattr(os, "removexattr", refuse)
-    with pytest.raises(sandbox_run.PrimitiveError, match="could not be removed"):
-        sandbox_run.clear_attributes(tmp_path)
+    with pytest.raises(primitive.PrimitiveError, match="could not be removed"):
+        primitive.clear_attributes(tmp_path)
 
 
 def test_a_path_gone_or_without_attributes_is_passed_over(
@@ -689,8 +722,8 @@ def test_a_path_gone_or_without_attributes_is_passed_over(
         raise OSError(errno.ENOTSUP, "Operation not supported")
 
     monkeypatch.setattr(os, "listxattr", unsupported)
-    sandbox_run.clear_attributes(tmp_path)
-    sandbox_run.clear_attributes(tmp_path / "gone")
+    primitive.clear_attributes(tmp_path)
+    primitive.clear_attributes(tmp_path / "gone")
 
 
 def test_a_machine_without_system_v_tables_warns_and_runs(
@@ -699,16 +732,16 @@ def test_a_machine_without_system_v_tables_warns_and_runs(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(sandbox_run, "SYSVIPC", tmp_path / "missing")
-    outputs = by_test(run([("main/ok", "double\n21\n")]))
-    assert outputs["main/ok"]["outcome"] == "accepted"
-    assert sandbox_run.NO_SYSVIPC in capsys.readouterr().err
+    monkeypatch.setattr(primitive, "SYSVIPC", tmp_path / "missing")
+    outputs = by_run(run([("main-ok", "double\n21\n")]))
+    assert outputs["main-ok"]["outcome"] == "accepted"
+    assert primitive.NO_SYSVIPC in capsys.readouterr().err
 
 
 def test_a_sweep_with_nothing_to_remove_takes_under_a_millisecond() -> None:
     started = time.perf_counter()
     for _ in range(1000):
-        sandbox_run.sweep_sysv()
+        primitive.sweep_sysv()
     assert time.perf_counter() - started < 1.0
 
 
@@ -718,7 +751,7 @@ def test_each_item_runs_a_copy_of_the_binary_of_its_own(
     """An attribute or a time one run sets on the file it runs, which Landlock
     does not stop, is gone for the next.
     """
-    outputs = by_test(run([("main/mark", "mark\n"), ("main/read", "read-mark\n")]))
+    outputs = by_run(run([("main-mark", "mark\n"), ("main-read", "read-mark\n")]))
     work = tmp_path / "work"
-    assert printed(work, outputs["main/mark"]) == "marked\n"
-    assert printed(work, outputs["main/read"]) == "no attribute\ntime fresh\n"
+    assert printed(work, outputs["main-mark"]) == "marked\n"
+    assert printed(work, outputs["main-read"]) == "no attribute\ntime fresh\n"
