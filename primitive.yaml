@@ -18,6 +18,16 @@ inputs:
     runs: false
     optional: true
     description: What the program reads on standard input; nothing when left out.
+  files:
+    type: named_files
+    runs: false
+    optional: true
+    description: Files placed read-only in the program's working directory, under their names.
+  loads:
+    type: named_files
+    runs: true
+    optional: true
+    description: Code the program loads, placed as files are, such as the module a test harness imports.
   args:
     type: text
     optional: true

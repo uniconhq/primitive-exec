@@ -91,9 +91,13 @@ def run_batch(
     memory_limit: float = 64,
     args: dict[str, str] | None = None,
     owned: bool = False,
+    files: dict[str, dict[str, bytes]] | None = None,
+    loads: dict[str, dict[str, bytes]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Run one batch under the container limits the declaration gives it."""
-    batch_inputs(work, binary, items, time_limit, memory_limit, args)
+    batch_inputs(
+        work, binary, items, time_limit, memory_limit, args, files=files, loads=loads
+    )
     limits = container_limits(time_limit, memory_limit, len(items))
     return by_run(run_image(work, limits, owned=owned))
 
@@ -358,6 +362,51 @@ def test_a_run_can_make_no_posix_message_queue(
     assert outcomes(outputs) == {"main-leave": "accepted", "main-find": "accepted"}
     assert printed(work, outputs["main-leave"]).split()[0] == "refused"
     assert printed(work, outputs["main-find"]) == f"none {errno.ENOENT}\n"
+
+
+def test_named_files_are_placed_read_only_in_the_sandbox(
+    tmp_path: Path, run_image: RunImage, check: Check
+) -> None:
+    """In the sandbox, as the harness lays `in/` out: the program sees exactly
+    its named files and its loads, by name, and cannot open one to write."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    files = {"main-1": {"answer": b"42\n"}}
+    loads = {"main-1": {"solution.py": b"def answer():\n    return 7\n"}}
+    items = [("main-1", "named\nanswer\n"), ("main-2", "load\n")]
+    batch_inputs(
+        work, binary, items, files=files, loads=loads | {"main-2": loads["main-1"]}
+    )
+    check(json.loads((work / "inputs.json").read_text()), "inputs_file")
+    result = run_image(work, container_limits(1.0, 64, len(items)), owned=True)
+    check(result, "outputs_file")
+    outputs = by_run(result)
+    assert printed(work, outputs["main-1"]).splitlines() == [
+        "answer 0o444 3 42",
+        "solution.py 0o444 27 def answer():",
+        f"refused answer {errno.EACCES}",
+    ]
+    assert printed(work, outputs["main-2"]) == "7\n"
+
+
+def test_a_large_named_file_costs_the_run_no_time(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """A 64 MB named file is copied before the run's clock starts, so a
+    trivial program reports no more time with it than without."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    large = {f"main-{n}": {"data": b"x" * (64 * 1024 * 1024)} for n in range(3)}
+    items = [(f"main-{n}", "double\n21\n") for n in range(3)]
+    without = run_batch(
+        run_image, tmp_path / "without", binary, items, memory_limit=256
+    )
+    with_file = run_batch(
+        run_image, tmp_path / "with", binary, items, memory_limit=256, files=large
+    )
+    assert outcomes(with_file) == dict.fromkeys(large, "accepted")
+    plain = sorted(entry["time_ms"] for entry in without.values())
+    heavy = sorted(entry["time_ms"] for entry in with_file.values())
+    assert heavy[1] <= plain[1] + 30, (plain, heavy)
 
 
 def test_a_hostile_run_cannot_reach_the_program_that_watches_it(

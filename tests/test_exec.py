@@ -68,10 +68,12 @@ def run(helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     def batch(
         items: list[tuple[str, str]],
         args: dict[str, str] | None = None,
+        files: dict[str, dict[str, bytes]] | None = None,
+        loads: dict[str, dict[str, bytes]] | None = None,
         **limits: float,
     ) -> dict[str, Any]:
         work = tmp_path / "work"
-        batch_inputs(work, binary, items, args=args, **limits)
+        batch_inputs(work, binary, items, args=args, files=files, loads=loads, **limits)
         assert primitive.main(["exec", str(work)]) == 0
         document: dict[str, Any] = json.loads(
             (work / "outputs.json").read_text(encoding="utf-8")
@@ -263,6 +265,89 @@ def test_a_run_without_stdin_reads_nothing(
     outputs = by_run(json.loads((work / "outputs.json").read_text()))["main-1"]
     assert outputs["outcome"] == "accepted"
     assert printed(work, outputs) == ""
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ({"x": {"file": "in/2/input"}}, "files of run main-1 is not named files"),
+        ({"files": [{"file": "in/2/input"}]}, "files of run main-1 is not named files"),
+        ({"files": {"../x": {"file": "in/2/input"}}}, "a file '../x', not a plain"),
+        ({"files": {".": {"file": "in/2/input"}}}, "a file '.', not a plain name"),
+        ({"files": {".hidden": {"file": "in/2/input"}}}, "'.hidden', not a plain"),
+        ({"files": {"a/b": {"file": "in/2/input"}}}, "a file 'a/b', not a plain"),
+        ({"files": {"": {"file": "in/2/input"}}}, "a file '', not a plain name"),
+        ({"files": {"a": {"file": "in/../inputs.json"}}}, "file a of the input"),
+        ({"files": {"a": {"file": "in/none"}}}, "is not in the working directory"),
+        ({"files": {"a": "in/2/input"}}, "file a of the input named files"),
+    ],
+)
+def test_named_files_it_cannot_use_are_an_error(
+    tmp_path: Path, value: object, message: str
+) -> None:
+    batch_inputs(tmp_path, b"", [("main-1", "")])
+    document = json.loads((tmp_path / "inputs.json").read_text())
+    document["batch"][0]["inputs"]["files"] = value
+    (tmp_path / "inputs.json").write_text(json.dumps(document))
+    primitive.main(["exec", str(tmp_path)])
+    assert message in json.loads((tmp_path / "outputs.json").read_text())["error"]
+
+
+def test_a_name_in_both_files_and_loads_is_an_error(tmp_path: Path) -> None:
+    """Each name is one file in the run's working directory; the save should
+    have caught two."""
+    named = {"main-1": {"solution.py": b"x"}}
+    batch_inputs(tmp_path, b"", [("main-1", "")], files=named, loads=named)
+    primitive.main(["exec", str(tmp_path)])
+    result = json.loads((tmp_path / "outputs.json").read_text())
+    assert "names solution.py in both files and loads" in result["error"]
+
+
+def test_named_files_are_in_the_working_directory_and_cannot_be_written(
+    run: Any, tmp_path: Path
+) -> None:
+    """The program sees exactly its named files, by their names, readable and
+    not writable, and each run only its own."""
+    files = {"main-1": {"answer": b"42\n", "grid.txt": b"..#\n"}, "main-2": {}}
+    loads = {"main-1": {"solution.py": b"def answer(): return 7\n"}}
+    items = [("main-1", "named\nanswer\n"), ("main-2", "named\n")]
+    outputs = by_run(run(items, files=files, loads=loads))
+    assert printed(tmp_path / "work", outputs["main-1"]).splitlines() == [
+        "answer 0o444 3 42",
+        "grid.txt 0o444 4 ..#",
+        "solution.py 0o444 23 def answer(): re",
+        f"refused answer {errno.EACCES}",
+    ]
+    assert printed(tmp_path / "work", outputs["main-2"]) == ""
+
+
+def test_a_program_loads_code_from_its_working_directory(
+    run: Any, tmp_path: Path
+) -> None:
+    loads = {"main-1": {"solution.py": b"def answer():\n    return 7\n"}}
+    outputs = by_run(run([("main-1", "load\n")], loads=loads))
+    assert outputs["main-1"]["outcome"] == "accepted"
+    assert printed(tmp_path / "work", outputs["main-1"]) == "7\n"
+
+
+def test_a_run_that_removes_or_changes_its_named_files_changes_no_later_run(
+    run: Any, tmp_path: Path
+) -> None:
+    """A run owns its copies, so it may make one writable or remove it; the
+    next run that names the same file under `in/` still gets it whole."""
+    work = tmp_path / "work"
+    items = [("main-1", "spoil\n"), ("main-2", "named\n")]
+    batch_inputs(work, python_binary(tmp_path / "b" / "p", PROGRAM).read_bytes(), items)
+    (work / "in" / "shared").mkdir()
+    (work / "in" / "shared" / "answer").write_text("42\n")
+    document = json.loads((work / "inputs.json").read_text())
+    for entry in document["batch"]:
+        entry["inputs"]["files"] = {"files": {"answer": {"file": "in/shared/answer"}}}
+    (work / "inputs.json").write_text(json.dumps(document))
+    primitive.main(["exec", str(work)])
+    outputs = by_run(json.loads((work / "outputs.json").read_text()))
+    assert printed(work, outputs["main-1"]) == "spoiled\n"
+    assert printed(work, outputs["main-2"]) == "answer 0o444 3 42\n"
 
 
 def test_a_binary_in_no_known_format_is_an_error(tmp_path: Path) -> None:

@@ -136,6 +136,8 @@ def batch_inputs(
     time_limit: float = 1.0,
     memory_limit: float = 64,
     args: dict[str, str] | None = None,
+    files: dict[str, dict[str, bytes]] | None = None,
+    loads: dict[str, dict[str, bytes]] | None = None,
 ) -> None:
     """Write inputs.json, the program and one input per item under `in/`, as the
     harness does: the program is `in/1/program` and the nth item's standard
@@ -143,7 +145,8 @@ def batch_inputs(
 
     `items` are (run, standard input) pairs, all run under the same limits;
     `args` gives the `args` input of the runs it names, and the others have
-    none.
+    none; `files` and `loads` give each run they name its named files, by
+    name and content, under `in/<n + 1>/files/` and `in/<n + 1>/loads/`.
     """
     (work / "in" / "1").mkdir(parents=True)
     (work / "in" / "1" / "program").write_bytes(binary)
@@ -159,6 +162,18 @@ def batch_inputs(
         }
         if args and run in args:
             inputs["args"] = args[run]
+        for port, given in (("files", files), ("loads", loads)):
+            if given and run in given:
+                folder = work / "in" / str(number) / port
+                folder.mkdir()
+                for name, content in given[run].items():
+                    (folder / name).write_bytes(content)
+                inputs[port] = {
+                    "files": {
+                        name: {"file": f"in/{number}/{port}/{name}"}
+                        for name in given[run]
+                    }
+                }
         batch.append({"run": run, "inputs": inputs})
     document = {"schema_version": SCHEMA_VERSION, "batch": batch}
     (work / "inputs.json").write_text(json.dumps(document))
@@ -433,6 +448,28 @@ elif case == "find-mq":
     libc = ctypes.CDLL(None, use_errno=True)
     found = libc.mq_open(b"/leak", os.O_RDONLY)
     print("found" if found >= 0 else "none", ctypes.get_errno() if found < 0 else 0)
+elif case == "named":
+    for name in sorted(os.listdir(".")):
+        with open(name, "rb") as stream:
+            data = stream.read()
+        mode = oct(os.stat(name).st_mode & 0o777)
+        print(name, mode, len(data), data[:16].decode(errors="replace").strip())
+    for name in sys.stdin.read().split():
+        try:
+            open(name, "w").close()
+            print("wrote", name)
+        except OSError as error:
+            print("refused", name, error.errno)
+elif case == "spoil":
+    os.chmod("answer", 0o644)
+    with open("answer", "w") as stream:
+        stream.write("spoiled")
+    os.remove("answer")
+    print("spoiled")
+elif case == "load":
+    sys.path.insert(0, os.getcwd())
+    import solution
+    print(solution.answer())
 elif case == "read-mark":
     try:
         print("attribute", os.getxattr(sys.argv[0], "user.leak").decode())

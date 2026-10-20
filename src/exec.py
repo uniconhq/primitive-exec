@@ -5,8 +5,9 @@ per item of a batch.
 The harness mounts a working directory at `/work` (or the directory named by
 the first argument) holding `inputs.json` and the files under `in/`. The
 inputs are a batch: one item per run, each naming the program, an optional
-file to feed it on standard input, optional arguments for its command line, a
-time limit in seconds and a memory limit in megabytes. For every item, in the
+file to feed it on standard input, optional named files to place in its
+working directory, optional arguments for its command line, a time limit in
+seconds and a memory limit in megabytes. For every item, in the
 order given, it runs the program, keeps what it printed as
 `out/<n>/output`, `n` being the item's place in the batch, and reports the
 CPU time, the peak memory and an outcome, then writes `outputs.json` with one
@@ -81,6 +82,10 @@ NO_CGROUP = (
 JAVA_OUT_OF_MEMORY = 3
 RUN_PATH = "/usr/local/bin:/usr/bin:/bin"
 HELPER = "/usr/local/bin/sandbox-exec"
+FILE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+"""A name a named file is placed under in the run's working directory: never
+`.` or `..`, never a path, never hidden."""
+NAMED_FILE_MODE = 0o444
 RUN_ID = re.compile(r"[A-Za-z0-9_-]+")
 """A run's id, which only the forge knows the meaning of. An item's output
 goes under its place in the batch, not its id."""
@@ -164,7 +169,9 @@ class PrimitiveError(Exception):
 @dataclass(frozen=True)
 class Item:
     """One run: its id, its place in the batch from 1, the program, the file
-    for standard input if any, the two limits and the arguments.
+    for standard input if any, the two limits, the arguments, and the named
+    files placed in its working directory: `files` it reads, and `loads`, code
+    the program loads, such as the entrant's module a test harness imports.
     """
 
     run: str
@@ -174,6 +181,8 @@ class Item:
     time_limit: float
     memory_limit: float
     args: tuple[str, ...] = ()
+    files: dict[str, Path] = field(default_factory=dict)
+    loads: dict[str, Path] = field(default_factory=dict)
 
     @property
     def wall_limit(self) -> float:
@@ -372,6 +381,14 @@ def read_item(root: Path, entry: object, number: int) -> Item:
     if not isinstance(run, str) or len(run) > 255 or not RUN_ID.fullmatch(run):
         raise PrimitiveError(f"the batch item run {run!r} is not a run id")
     inputs = entry["inputs"]
+    files = named_files(root, inputs, "files", run)
+    loads = named_files(root, inputs, "loads", run)
+    clash = sorted(files.keys() & loads.keys())
+    if clash:
+        raise PrimitiveError(
+            f"the run {run} names {clash[0]} in both files and loads; each name "
+            "is one file in its working directory"
+        )
     return Item(
         run=run,
         number=number,
@@ -380,22 +397,49 @@ def read_item(root: Path, entry: object, number: int) -> Item:
         time_limit=positive_number(inputs, "time_limit", run),
         memory_limit=positive_number(inputs, "memory_limit", run),
         args=arguments(inputs, run),
+        files=files,
+        loads=loads,
     )
 
 
 def input_file(root: Path, inputs: dict[str, object], name: str, run: str) -> Path:
     """Resolve a file input to a path, refusing anything outside `in/`."""
-    value = inputs.get(name)
+    return in_file(root, inputs.get(name), f"the input named {name} of run {run}")
+
+
+def in_file(root: Path, value: object, what: str) -> Path:
+    """Resolve one file value, `{"file": "in/..."}`, to a path under `in/`."""
     if not isinstance(value, dict) or not isinstance(value.get("file"), str):
-        raise PrimitiveError(f"the input named {name} of run {run} is not a file")
+        raise PrimitiveError(f"{what} is not a file")
     path = (root / str(value["file"])).resolve()
     if not path.is_relative_to((root / "in").resolve()):
-        raise PrimitiveError(f"the input named {name} of run {run} is outside in/")
+        raise PrimitiveError(f"{what} is outside in/")
     if not path.is_file():
-        raise PrimitiveError(
-            f"the input named {name} of run {run} is not in the working directory"
-        )
+        raise PrimitiveError(f"{what} is not in the working directory")
     return path
+
+
+def named_files(
+    root: Path, inputs: dict[str, object], name: str, run: str
+) -> dict[str, Path]:
+    """Read a `named_files` input, `{"files": {<name>: {"file": "in/..."}}}`,
+    as each name and its path under `in/`. Absent, there are none.
+    """
+    if name not in inputs:
+        return {}
+    value = inputs[name]
+    what = f"the input named {name} of run {run}"
+    if not isinstance(value, dict) or set(value) != {"files"}:
+        raise PrimitiveError(f"{what} is not named files")
+    files = value["files"]
+    if not isinstance(files, dict):
+        raise PrimitiveError(f"{what} is not named files")
+    found = {}
+    for file_name, file in files.items():
+        if len(file_name) > 255 or not FILE_NAME.fullmatch(file_name):
+            raise PrimitiveError(f"{what} names a file {file_name!r}, not a plain name")
+        found[file_name] = in_file(root, file, f"the file {file_name} of {what}")
+    return found
 
 
 def positive_number(inputs: dict[str, object], name: str, run: str) -> float:
@@ -544,6 +588,7 @@ def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, ob
     output = out / "output"
     cwd = Path(tempfile.mkdtemp(prefix="run-"))
     try:
+        place_files(root, cwd, item.files | item.loads)
         descriptor = os.open(
             output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644
         )
@@ -572,6 +617,24 @@ def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, ob
         "memory_kb": run.memory_kb,
         "outcome": outcome,
     }
+
+
+def place_files(root: Path, cwd: Path, files: dict[str, Path]) -> None:
+    """Copy each named file into the run's working directory under its name,
+    readable and not writable, before the run's clock starts, so the program
+    opens `answer` or `input` as a plain relative path.
+
+    Each run gets copies of its own, removed with its directory, and nothing
+    is read back from them, so a run that makes its copy writable again, as
+    the copy's owner may, changes only what it reads itself. A source under
+    `in/` an earlier run took this program's access away from is given back
+    first, as the program is.
+    """
+    for name, source in files.items():
+        give_back_along(root, source)
+        placed = cwd / name
+        shutil.copyfile(source, placed)
+        placed.chmod(NAMED_FILE_MODE)
 
 
 def execute(

@@ -32,6 +32,8 @@ these inputs and outputs.
 |---|---|---|---|
 | Input | `program` | file, `runs: true` | The program from compile, in one of the formats below |
 | Input | `stdin` | file, optional, `runs: false` | What the program reads on standard input; with none, standard input is empty |
+| Input | `files` | named files, optional, `runs: false` | Files placed read-only in the program's working directory under their names, such as `input` or `answer` |
+| Input | `loads` | named files, optional, `runs: true` | Code the program loads, placed as `files` are, such as the entrant's module a test harness imports |
 | Input | `args` | text, optional | Appended to the program's command line, split on spaces |
 | Input | `time_limit` | number | Seconds of CPU time the run may use |
 | Input | `memory_limit` | number | Megabytes of memory the run may use |
@@ -41,6 +43,18 @@ these inputs and outputs.
 | Output | `outcome` | outcome | `accepted`, `time_limit`, `memory_limit`, `output_limit` or `runtime_error` (see "Limits and outcomes"); `primitive.yaml` says when each is given under `outcomes`, for the workflow editor |
 
 The output goes under the item's place in the batch, not its run id.
+
+**`files` and `loads`** are copied into the run's working directory under
+their names, mode 0444, before the run's clock starts, so the program opens
+`answer` as a plain relative path, and lists them and nothing else there. A
+name is letters, digits, `_`, `.` and `-`, not starting with a `.`, so never
+a path. One name in both is an `error`: each is one file. Each run gets
+copies of its own, removed after it, and exec reads nothing back from them,
+so a run that makes a copy writable again, which as its owner it may,
+changes only what it reads itself. `loads` differs from `files` only in
+`runs: true`: the forge knows the entrant's code is there. A Python program
+imports from its working directory once it puts it on `sys.path`, since it
+runs with `-I`.
 
 **`args`** is split on spaces: a run of spaces separates two arguments, and
 spaces at either end separate nothing. There is no quoting, so no argument
@@ -83,7 +97,8 @@ The task's save does not check these; the scoring rules rely on them.
 `outputs.json` carries `error` instead, and nothing else, only when the
 primitive could not work at all: `inputs.json` is missing, is not JSON or is
 for another contract version; a file is missing or lies outside `in/`; a
-limit is not a positive number, or `args` is not text; an item's run is not
+limit is not a positive number, or `args` is not text; a named file's name
+is not a plain name, or one name is in both `files` and `loads`; an item's run is not
 a run id, or two items are for the same run; the program is in none of the
 three formats; the interpreter a Python or Java program needs could not be
 started; the machine's kernel does not offer Landlock ABI 3, or a run could
@@ -102,7 +117,8 @@ For each item, in order:
 2. A fresh, empty directory is made under `/tmp` and becomes the run's
    working directory, `HOME` and `TMPDIR`. The environment holds only those,
    `PATH` and `LANG=C.UTF-8`.
-3. The `stdin` file, or `/dev/null` without one, is opened as standard input, `out/<n>/output` as standard
+3. Each of `files` and `loads` is copied into that directory, read-only.
+   The `stdin` file, or `/dev/null` without one, is opened as standard input, `out/<n>/output` as standard
    output, and standard error goes nowhere.
 4. The copy is started through `sandbox-exec`, with its arguments and its
    limits already set (below), and watched until it ends.
