@@ -409,6 +409,50 @@ def test_a_large_named_file_costs_the_run_no_time(
     assert heavy[1] <= plain[1] + 30, (plain, heavy)
 
 
+def test_a_run_reaches_no_network_socket_and_no_io_uring(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """The filter `sandbox-exec` installs refuses every socket but a Unix one,
+    and io_uring, with EPERM, so a run reaches no network whatever the
+    container was given; a Unix socket, which Java and Python use, works.
+    Docker's own seccomp profile is off here, so the refusals are the
+    filter's."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    batch_inputs(work, binary, [("main-1", "sockets\n")])
+    limits = container_limits(1.0, 64, 1)
+    outputs = by_run(run_image(work, limits, unconfined=True))
+    assert outcomes(outputs) == {"main-1": "accepted"}
+    assert printed(work, outputs["main-1"]).splitlines() == [
+        f"socket AF_INET {errno.EPERM}",
+        f"socket AF_INET6 {errno.EPERM}",
+        f"socket AF_NETLINK {errno.EPERM}",
+        f"socket AF_PACKET {errno.EPERM}",
+        "socket AF_UNIX True",
+        "socketpair AF_UNIX True",
+        f"socketpair AF_INET {errno.EPERM}",
+        f"io_uring_setup {errno.EPERM}",
+    ]
+
+
+def test_a_fork_bomb_stops_at_the_process_limit_without_a_pids_limit(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """Under a container pids limit far above `pids`, as a Woodpecker step
+    has, a run still stops at 128 processes of its user, and the next run
+    starts, its leftovers reaped."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [("main-bomb", "fork-bomb\n"), ("main-next", "double\n21\n")]
+    batch_inputs(work, binary, items)
+    limits = container_limits(1.0, 64, len(items)) | {"pids": 4096}
+    outputs = by_run(run_image(work, limits))
+    assert outcomes(outputs) == {"main-bomb": "accepted", "main-next": "accepted"}
+    # Linux's EAGAIN, which the host running the tests may number otherwise.
+    assert printed(work, outputs["main-bomb"]) == "stopped 11 True\n"
+    assert printed(work, outputs["main-next"]) == "42\n"
+
+
 def test_a_hostile_run_cannot_reach_the_program_that_watches_it(
     tmp_path: Path, run_image: RunImage
 ) -> None:

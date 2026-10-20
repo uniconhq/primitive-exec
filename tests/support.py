@@ -470,6 +470,39 @@ elif case == "load":
     sys.path.insert(0, os.getcwd())
     import solution
     print(solution.answer())
+elif case == "sockets":
+    import ctypes
+    import socket
+    libc = ctypes.CDLL(None, use_errno=True)
+    families = [
+        ("AF_INET", socket.AF_INET),
+        ("AF_INET6", socket.AF_INET6),
+        ("AF_NETLINK", socket.AF_NETLINK),
+        ("AF_PACKET", socket.AF_PACKET),
+        ("AF_UNIX", socket.AF_UNIX),
+    ]
+    for name, family in families:
+        kind = socket.SOCK_RAW if family == socket.AF_PACKET else socket.SOCK_DGRAM
+        made = libc.socket(family, kind, 0)
+        print("socket", name, made >= 0 or ctypes.get_errno())
+    pair = (ctypes.c_int * 2)()
+    for name, family in (("AF_UNIX", socket.AF_UNIX), ("AF_INET", socket.AF_INET)):
+        made = libc.socketpair(family, socket.SOCK_STREAM, 0, pair)
+        print("socketpair", name, made == 0 or ctypes.get_errno())
+    params = ctypes.create_string_buffer(120)
+    ring = libc.syscall(425, 8, params)
+    print("io_uring_setup", ring >= 0 or ctypes.get_errno())
+elif case == "fork-bomb":
+    children = 0
+    try:
+        while True:
+            pid = os.fork()
+            if pid == 0:
+                time.sleep(60)
+                os._exit(0)
+            children += 1
+    except OSError as error:
+        print("stopped", error.errno, children < 128)
 elif case == "read-mark":
     try:
         print("attribute", os.getxattr(sys.argv[0], "user.leak").decode())

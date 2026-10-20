@@ -102,7 +102,7 @@ is not a plain name, or one name is in both `files` and `loads`; an item's run i
 a run id, or two items are for the same run; the program is in none of the
 three formats; the interpreter a Python or Java program needs could not be
 started; the machine's kernel does not offer Landlock ABI 3, or a run could
-not be put under its Landlock rules; or processes, a System V object or an
+not be put under its seccomp filter or its Landlock rules; or processes, a System V object or an
 attribute a run left behind could not be stopped or removed. The harness
 turns an error into a `system_error`, so no entrant is graded by a broken
 step. A native program the kernel refuses to run as built is the entrant's
@@ -121,7 +121,8 @@ For each item, in order:
    The `stdin` file, or `/dev/null` without one, is opened as standard input, `out/<n>/output` as standard
    output, and standard error goes nowhere.
 4. The copy is started through `sandbox-exec`, with its arguments and its
-   limits already set (below), and watched until it ends.
+   limits already set (below), under the seccomp filter and Landlock, and
+   watched until it ends.
 5. Every process the run left behind is killed and reaped, every System V
    shared memory segment, message queue and semaphore set it left is
    removed, every `user` extended attribute under `/work` is removed, and
@@ -226,6 +227,23 @@ processes or System V objects a run leaves is there for the next one:
   measured itself. It cannot stop exec: exec is the
   container's first process, which the kernel keeps signals from unless it
   handles them, and it ignores the one Python would handle, SIGINT.
+- **The network and io_uring.** `sandbox-exec` puts the run under a
+  seccomp filter of its own, after no-new-privileges and before Landlock:
+  `socket` and `socketpair` fail with `EPERM` for every family but
+  `AF_UNIX`, and `io_uring_setup` fails with `EPERM`, since a ring's
+  operations are calls neither the filter nor Landlock sees. On x86_64 every
+  x32 call is refused too, and a call of another architecture (i386 on
+  x86_64, arm32 on aarch64) kills the run. So a run reaches no network and
+  no netlink even in a container that has one, as a Woodpecker step may; a
+  Unix socket, which the Java and Python runtimes use, still works. The
+  filter does not lean on Docker's own profile: the tests show its refusals
+  with that profile off.
+- **Processes.** `RLIMIT_NPROC` is the container's pids limit, or 128,
+  `pids` in `primitive.yaml`, when the container sets none or a higher one,
+  as a Woodpecker step does: a fork bomb stops there, and its leftovers are
+  reaped after the run. It counts every process and thread of the run's
+  user, exec's own among them, so it holds as meant only where that user
+  is the grading's alone.
 - **Memory pressure.** Every run's processes carry the highest out-of-memory
   score, so when the container reaches its memory limit the kernel kills
   the run rather than exec.
@@ -248,7 +266,8 @@ before the machine takes runs.
 
 The container itself is the harness's: no network, a read-only root
 filesystem, every capability dropped, `no-new-privileges`, Docker's built-in
-seccomp profile and a non-root user; the image's user is 65532. The only
+seccomp profile and a non-root user; the image's user is 65532. The walls
+above hold inside whatever container exec is given. The only
 writable places are `/work` and a small tmpfs at `/tmp`. Each run's copy of
 the program goes into a scratch directory under `/work`, removed before
 exec exits, because `/tmp` may be mounted `noexec`.

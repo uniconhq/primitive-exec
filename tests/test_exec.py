@@ -11,6 +11,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import zipfile
 from pathlib import Path
@@ -809,6 +810,66 @@ def test_a_path_gone_or_without_attributes_is_passed_over(
     monkeypatch.setattr(os, "listxattr", unsupported)
     primitive.clear_attributes(tmp_path)
     primitive.clear_attributes(tmp_path / "gone")
+
+
+@pytest.mark.parametrize(
+    ("pids", "limit"), [("64\n", 64), ("4096\n", 128), ("max\n", 128), (None, 128)]
+)
+def test_the_process_limit_is_the_containers_or_the_declarations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pids: str | None, limit: int
+) -> None:
+    path = tmp_path / "pids.max"
+    if pids is not None:
+        path.write_text(pids)
+    monkeypatch.setattr(primitive, "PIDS_MAX", path)
+    assert primitive.process_limit() == limit
+
+
+def test_a_filter_that_cannot_be_installed_is_an_error(
+    run: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`sandbox-exec` reports a filter the kernel refuses and starts nothing;
+    the run is not started unfiltered."""
+    refusing = tmp_path / "refusing-helper"
+    refusing.write_text(
+        f"#!{os.path.realpath(sys.executable)}\nimport os, sys\n"
+        f"os.write(int(sys.argv[1]), b'S {errno.EINVAL}\\n')\nsys.exit(127)\n"
+    )
+    refusing.chmod(0o755)
+    monkeypatch.setattr(primitive, "HELPER", str(refusing))
+    result = run([("main-ok", "double\n21\n")])
+    assert set(result) == {"schema_version", "error"}
+    assert "could not be put under its system call filter" in result["error"]
+
+
+def test_the_launcher_filters_sockets(helper: str, tmp_path: Path) -> None:
+    """`sandbox-exec` refuses an internet socket to what it starts and lets
+    a Unix one through."""
+    script = (
+        "import socket\n"
+        "for family in (socket.AF_INET, socket.AF_UNIX):\n"
+        "    try:\n"
+        "        socket.socket(family, socket.SOCK_DGRAM).close()\n"
+        "        print('made', family.name)\n"
+        "    except OSError as error:\n"
+        "        print('refused', family.name, error.errno)\n"
+    )
+    python = os.path.realpath(sys.executable)
+    read_end, write_end = os.pipe()
+    ruleset = primitive.landlock_ruleset(tmp_path, [Path(sys.base_prefix)], 3)
+    done = subprocess.run(
+        [helper, str(write_end), str(ruleset), python, "-I", "-c", script],
+        pass_fds=(write_end, ruleset),
+        capture_output=True,
+        text=True,
+    )
+    os.close(write_end)
+    os.close(ruleset)
+    os.close(read_end)
+    assert done.stdout.splitlines() == [
+        f"refused AF_INET {errno.EPERM}",
+        "made AF_UNIX",
+    ]
 
 
 def test_a_machine_without_system_v_tables_warns_and_runs(

@@ -73,6 +73,11 @@ OWNER_FOLDER = 0o700
 OWNER_FILE = 0o600
 OWNER_PROGRAM = 0o700
 OOM_EVENTS = Path("/sys/fs/cgroup/memory.events")
+PIDS_MAX = Path("/sys/fs/cgroup/pids.max")
+PROCESS_LIMIT = 128
+"""The most processes and threads a run's user may have at once, `pids` in
+`primitive.yaml`, when the container's cgroup sets none lower: a Woodpecker
+step's container has no pids limit of its own."""
 CGROUP = Path("/sys/fs/cgroup")
 NO_CGROUP = (
     "exec: this program is not alone in a cgroup of its own with cgroup v2 "
@@ -89,7 +94,7 @@ NAMED_FILE_MODE = 0o444
 RUN_ID = re.compile(r"[A-Za-z0-9_-]+")
 """A run's id, which only the forge knows the meaning of. An item's output
 goes under its place in the batch, not its id."""
-REPORT_LINE = re.compile(rb"([PLER]) (-?[0-9]{1,20}(?: -?[0-9]{1,20}){0,3})\n")
+REPORT_LINE = re.compile(rb"([PSLER]) (-?[0-9]{1,20}(?: -?[0-9]{1,20}){0,3})\n")
 REFUSED_BINARY = frozenset(
     {errno.ENOEXEC, errno.ENOMEM, errno.E2BIG, errno.EINVAL, errno.ELIBBAD}
 )
@@ -689,7 +694,7 @@ def execute(
             stderr=subprocess.DEVNULL,
             pass_fds=passed,
             start_new_session=True,
-            preexec_fn=child_setup(item),
+            preexec_fn=child_setup(item, process_limit()),
         )
     except (OSError, subprocess.SubprocessError) as error:
         os.close(read_end)
@@ -742,6 +747,11 @@ def execute(
     before_strays = children_cpu()
     reap_strays()
     strays = children_cpu() - before_strays
+    if "S" in lines:
+        raise PrimitiveError(
+            "the run could not be put under its system call filter: "
+            f"{os.strerror(lines['S'][0])}"
+        )
     if "L" in lines:
         raise PrimitiveError(
             f"the run could not be confined with Landlock: {os.strerror(lines['L'][0])}"
@@ -812,7 +822,17 @@ def children_cpu() -> float:
     return usage.ru_utime + usage.ru_stime
 
 
-def child_setup(item: Item) -> Callable[[], None]:
+def process_limit() -> int:
+    """The processes a run's user may have at once: the container's own pids
+    limit, or `PROCESS_LIMIT` when it sets none or a higher one."""
+    try:
+        text = PIDS_MAX.read_text().strip()
+    except OSError:
+        return PROCESS_LIMIT
+    return min(int(text), PROCESS_LIMIT) if text.isdigit() else PROCESS_LIMIT
+
+
+def child_setup(item: Item, processes: int) -> Callable[[], None]:
     """The function the child runs between fork and exec."""
 
     def setup() -> None:
@@ -822,9 +842,14 @@ def child_setup(item: Item) -> Callable[[], None]:
         A POSIX message queue outlives the process that made it, as a System
         V object does, and none can be listed to remove it, so a run may make
         none: `RLIMIT_MSGQUEUE` at 0 gives it no bytes for one.
+        `RLIMIT_NPROC` at `processes` stops a fork bomb where the container
+        has no pids limit; it counts every process and thread of the run's
+        user, this program and `sandbox-exec` among them, so it holds only
+        where the user is the grading's own.
         """
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         resource.setrlimit(resource.RLIMIT_MSGQUEUE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_NPROC, (processes, processes))
         resource.setrlimit(resource.RLIMIT_FSIZE, (OUTPUT_LIMIT + 1, OUTPUT_LIMIT + 1))
         cpu = math.ceil(item.time_limit) + 1
         resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))

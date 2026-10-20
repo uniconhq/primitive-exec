@@ -81,11 +81,14 @@ def run_image(image: str) -> RunImage:
         limits: dict[str, int] | None = None,
         seconds: list[float] | None = None,
         owned: bool = False,
+        unconfined: bool = False,
     ) -> dict[str, Any]:
         """Run the batch in `work`; `seconds`, when given, gets how long the
         sandboxed container took, from `docker run` to its exit. `owned`
         hands the whole working directory to the step's user, as the harness
-        lays it out, rather than opening it to every user."""
+        lays it out, rather than opening it to every user. `unconfined`
+        turns Docker's own seccomp profile off, as a Woodpecker step may
+        have it, to show what exec's filter refuses alone."""
         limits = limits or declaration()["limits"]
         open_up(work)
         volume = f"{NAME}-test-{secrets.token_hex(4)}"
@@ -119,7 +122,15 @@ def run_image(image: str) -> RunImage:
                         "65532:65532",
                         "/work",
                     )
-                command = ["docker", "run", "--rm", *sandbox_flags(limits)]
+                flags = sandbox_flags(limits)
+                if unconfined:
+                    flags = [
+                        "--security-opt=seccomp=unconfined"
+                        if flag == "--security-opt=seccomp=builtin"
+                        else flag
+                        for flag in flags
+                    ]
+                command = ["docker", "run", "--rm", *flags]
                 command += ["--volume", f"{volume}:/work", image]
                 started = time.monotonic()
                 subprocess.run(
