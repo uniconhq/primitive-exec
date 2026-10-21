@@ -13,7 +13,7 @@ permissions: {}
 # it needs.
 jobs:
   release:
-    uses: uniconhq/runner/.github/workflows/primitive-release.yaml@v0.10.0
+    uses: uniconhq/runner/.github/workflows/primitive-release.yaml@v0.10.0 # zizmor: ignore[unpinned-uses] our own repo, pinned by release tag
     permissions:
       contents: write
       packages: write

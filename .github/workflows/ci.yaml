@@ -14,7 +14,21 @@ permissions:
 # from it.
 jobs:
   ci:
-    uses: uniconhq/runner/.github/workflows/primitive-ci.yaml@v0.10.0
+    uses: uniconhq/runner/.github/workflows/primitive-ci.yaml@v0.10.0 # zizmor: ignore[unpinned-uses] our own repo, pinned by release tag
     with:
       runner-ref: v0.10.0
       compile-image: true
+
+  workflows:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - name: zizmor
+        run: uvx zizmor@1.31.1 --offline --format github .github/workflows
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
