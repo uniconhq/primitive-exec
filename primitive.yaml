@@ -3,6 +3,7 @@ description: Runs a program once under limits and records its output, time and m
 schema_version: 6
 batch: true
 network: false
+cache: true
 outputs_from: manifest
 limits: {time_ms: 2000, cpu_ms: 2000, memory_mb: 256, pids: 160, output_mb: 64, gpus: 0}
 limits_from:
