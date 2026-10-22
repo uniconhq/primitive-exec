@@ -38,6 +38,7 @@ SHARED = (
     "shown_bytes",
     "check_shape",
     "set_up_step",
+    "planned_kb",
     "check_launcher",
     "box_users",
     "refuse_constant",

@@ -454,9 +454,14 @@ Docker: the shape picked for every step that runs code, provisionally
    The box's own limits are isolate's. Raising a hard limit needs the
    machine's root, so exec refuses to start where the container's hard
    limit on either is lower; Docker's default leaves both high enough;
-3. moves the container's processes into a cgroup `step` and makes
-   `isolate` beside it, under which each box gets its cgroup, with the CPU
-   and memory controllers on;
+3. makes a cgroup `step`, moves the container's processes into `main`
+   under it and makes `isolate` beside that, under which each box gets its
+   cgroup, with the CPU and memory controllers on, and caps `step`, with no
+   swap, at what the forge's planner gave the batch's largest run: the most
+   of the 256 MB `primitive.yaml` gives at the least, the run's memory
+   limit with the 256 MB it adds, and the memory limit and copies with
+   112 MB for the step wrapper, exec and isolate. So steps side by side in
+   one slot of a machine stay within what the planner gave each;
 4. makes `/run/boxdev`, the boxes' `/dev`;
 5. writes isolate's configuration, `/usr/local/etc/isolate`, with the step's
    box users.

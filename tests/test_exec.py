@@ -13,6 +13,7 @@ import os
 import re
 import resource
 import stat
+import subprocess
 import sys
 import time
 import traceback
@@ -691,6 +692,21 @@ def test_memory_held_and_memory_in_a_child_read_as_held(run: Any) -> None:
         assert abs(held - 40 * 1024) <= 4 * 1024, (test, held)
 
 
+def read_outside_the_step(path: Path) -> None:
+    """Read `path` into the page cache from a process in a cgroup of its own
+    beside the step's, removed after; the pages stay charged above it."""
+    reader = primitive.CGROUP / "reader"
+    reader.mkdir()
+    try:
+        subprocess.run(
+            ["sh", "-c", f'echo $$ > {reader / "cgroup.procs"} && cat "$0"', path],
+            stdout=subprocess.DEVNULL,
+            check=True,
+        )
+    finally:
+        reader.rmdir()
+
+
 @pytest.mark.parametrize("cached", [False, True], ids=["cold", "cached"])
 def test_reading_a_large_input_counts_what_the_box_reads_in(
     run: Any, tmp_path: Path, cached: bool
@@ -699,8 +715,12 @@ def test_reading_a_large_input_counts_what_the_box_reads_in(
     is charged the page cache its reads bring in, up to its limit, which it
     takes back from the file's pages and does not kill for. So `memory_kb`
     for such a run is near the limit when the file was not in memory yet,
-    and the interpreter's own when it was, read in by another process. The
-    run is `accepted` either way."""
+    and the interpreter's own when it was, read in by another process. That
+    process reads it in a cgroup of its own beside the step's, as the step
+    wrapper's download is charged outside the step's cap: read under the
+    cap, by this test's process, which an earlier test's setup moved into
+    the step's `main`, the file's pages would be taken back for the copy
+    into the box. The run is `accepted` either way."""
     work = tmp_path / "work"
     binary = python_binary(tmp_path / "b" / "p", PROGRAM).read_bytes()
     items = [("main-base", "double\n21\n"), ("main-read", "")]
@@ -712,9 +732,7 @@ def test_reading_a_large_input_counts_what_the_box_reads_in(
         stream.flush()
         os.fsync(stream.fileno())
         if cached:
-            with (work / "in" / "3" / "input").open("rb") as again:
-                while again.read(2**20):
-                    pass
+            read_outside_the_step(work / "in" / "3" / "input")
         else:
             os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
     primitive.main(["exec", str(work)])
@@ -1092,7 +1110,7 @@ def test_two_steps_at_once_share_a_process_count_only_on_the_same_users(
     namespace, every step of one rootless Docker, so two steps given
     distinct box users each fork up to their limit at once, and two given
     the same one share it."""
-    primitive.set_up_step(primitive.box_users())
+    primitive.set_up_step(primitive.box_users(), primitive.DECLARED_MEMORY_KB)
     binary = python_binary(tmp_path / "b" / "p", PROGRAM).read_bytes()
     works = []
     for number in range(2):
@@ -1111,7 +1129,7 @@ def test_two_steps_at_once_share_a_process_count_only_on_the_same_users(
         forked.append(int(printed(work, outputs).split()[1]))
     for number in range(2):
         cgroup = primitive.CGROUP / f"apart-{number}"
-        for inner in ("isolate", "step"):
+        for inner in ("step/isolate", "step/main", "step"):
             (cgroup / inner).rmdir()
         cgroup.rmdir()
     if apart:
@@ -1125,7 +1143,7 @@ def test_a_box_a_dead_step_left_mounted_does_not_stop_the_next(
 ) -> None:
     """A step killed in the middle of an item leaves its box initialised and
     its tmpfs mounted; the next item unmounts it and starts afresh."""
-    primitive.set_up_step(primitive.box_users())
+    primitive.set_up_step(primitive.box_users(), primitive.DECLARED_MEMORY_KB)
     primitive.isolate_box(primitive.BOX, "--init")
     folder = primitive.BOX_ROOT / str(primitive.BOX) / "box"
     primitive.mount("box-0", folder, "tmpfs", 0, "size=1m")
@@ -1135,6 +1153,44 @@ def test_a_box_a_dead_step_left_mounted_does_not_stop_the_next(
     assert "box ['program', 'run', 'shm', 'tmp']" in printed(
         tmp_path / "work", outputs["main-find"]
     )
+
+
+def test_the_step_is_capped_at_what_the_planner_gave_its_largest_run(
+    run: Any, tmp_path: Path
+) -> None:
+    """The step's cgroup, which holds exec's own processes and every box,
+    is capped at what the planner gave the batch's largest run: steps side
+    by side in one slot stay within what the planner gave each."""
+    files = {"main-2": {"data": b"x" * (8 * 2**20)}}
+    outputs = by_run(
+        run([("main-1", "double\n21\n"), ("main-2", "double\n21\n")], files=files)
+    )
+    assert {each["outcome"] for each in outputs.values()} == {"accepted"}
+    items = primitive.read_inputs(tmp_path / "work")
+    needed = [primitive.box_size_kb(item) for item in items]
+    assert needed[1] > needed[0]
+    capped = (primitive.STEP_CGROUP / "memory.max").read_text()
+    planned = [
+        primitive.planned_kb(item.memory_limit_kb, each)
+        for item, each in zip(items, needed, strict=True)
+    ]
+    assert int(capped) == max(planned) * 1024
+    assert primitive.BOX_CGROUPS.parent == primitive.STEP_CGROUP
+    assert str(os.getpid()) in (primitive.MAIN_CGROUP / "cgroup.procs").read_text()
+
+
+def test_the_step_is_planned_by_the_declaration_and_what_its_boxes_need() -> None:
+    """The planner's rule: the declaration's least memory, the memory limit
+    with the declaration's room, or what the box and its copies need with
+    the step's own, whichever is most."""
+    limits = declaration()["limits"]
+    room = declaration()["limits_from"]["memory_mb"]["add"]
+    assert primitive.DECLARED_MEMORY_KB == limits["memory_mb"] * 1024
+    assert primitive.DECLARED_ROOM_KB == room * 1024
+    assert primitive.planned_kb(0, 0) == limits["memory_mb"] * 1024
+    assert primitive.planned_kb(64 * 1024, 72 * 1024) == (64 + room) * 1024
+    copies = 64 * 1024 + 900 * 1024
+    assert primitive.planned_kb(64 * 1024, copies) == copies + primitive.STEP_MEMORY_KB
 
 
 def test_a_step_that_cannot_be_set_up_runs_nothing(
@@ -1148,7 +1204,7 @@ def test_a_step_that_cannot_be_set_up_runs_nothing(
 
 
 def test_the_box_launchers_self_test_passes_in_a_box(boxes: None) -> None:
-    primitive.set_up_step(primitive.box_users())
+    primitive.set_up_step(primitive.box_users(), primitive.DECLARED_MEMORY_KB)
     primitive.check_launcher()
 
 
