@@ -43,6 +43,7 @@ from support import (
     Check,
     Compiled,
     RunImage,
+    base_build_args,
     declaration,
     open_up,
     sandbox_flags,
@@ -63,7 +64,8 @@ def image() -> str:
     if named:
         return named
     tag = f"{NAME}:test"
-    subprocess.run(["docker", "build", "--quiet", "--tag", tag, str(ROOT)], check=True)
+    command = ["docker", "build", "--quiet", *base_build_args(), "--tag", tag]
+    subprocess.run([*command, str(ROOT)], check=True)
     return tag
 
 
@@ -140,7 +142,8 @@ def compile_image(image: str) -> str:
     if not (SIBLING_COMPILE / "Dockerfile").is_file():
         pytest.skip("no compile image to build binaries with; set COMPILE_IMAGE")
     tag = "primitive-compile:test"
-    command = ["docker", "build", "--quiet", "--tag", tag, str(SIBLING_COMPILE)]
+    command = ["docker", "build", "--quiet", *base_build_args(), "--tag", tag]
+    command.append(str(SIBLING_COMPILE))
     subprocess.run(command, check=True)
     return tag
 

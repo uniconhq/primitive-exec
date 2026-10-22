@@ -4,9 +4,12 @@ import ast
 import inspect
 import json
 import math
+import os
+import subprocess
 import textwrap
 import zipapp
 from collections.abc import Callable
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 NAME = "primitive-exec"
 SCHEMA_VERSION = 6
 SIBLING_SCHEMA = ROOT.parent / "runner" / "schemas" / "primitive.schema.json"
+SIBLING_RUNNER = ROOT.parent / "runner"
 SIBLING_COMPILE = ROOT.parent / "primitive-compile"
 SIBLING_DIFF = ROOT.parent / "deploy" / "workflows-next" / "classic" / "v3" / "diff"
 USERNS = Path(__file__).resolve().parent / "userns.py"
@@ -700,3 +704,21 @@ elif case == "read-mark":
     marked = os.stat(sys.argv[0]).st_mtime == 1000000000
     print("time", "marked" if marked else "fresh")
 """
+
+
+@cache
+def base_build_args() -> tuple[str, ...]:
+    """The `docker build` arguments naming the base image this repo's image
+    builds on: `BASE_IMAGE`, or primitive-base built from a runner checkout
+    beside this one, or none, which leaves the Dockerfile's own, the runner
+    release's."""
+    named = os.environ.get("BASE_IMAGE")
+    if not named:
+        dockerfile = SIBLING_RUNNER / "images" / "primitive-base" / "Dockerfile"
+        if not dockerfile.is_file():
+            return ()
+        named = "primitive-base:test"
+        command = ["docker", "build", "--quiet", "--tag", named]
+        command += ["--file", str(dockerfile), str(SIBLING_RUNNER)]
+        subprocess.run(command, check=True, capture_output=True)
+    return ("--build-arg", f"BASE_IMAGE={named}")

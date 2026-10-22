@@ -479,7 +479,8 @@ holding a `__main__.py` at its root, or a zip holding a jar manifest.
 
 Static linking means a native program needs nothing from the image it runs
 in. A Python or Java program needs the interpreter it was checked against, so
-both images are built from the same pinned `python:3.14-slim` base and
+both images build on the runner's `primitive-base`, the same pinned
+`python:3.14-slim`, and
 install the same Debian OpenJDK 21 packages: the JDK in compile, the runtime
 in exec. A change to any of the three formats, or to either image's
 Python or Java, is made in both repos together.
@@ -487,8 +488,8 @@ Python or Java, is made in both repos together.
 ## Layout
 
 ```
-Dockerfile                  the image: isolate built in a stage of its own, python:3.14-slim, OpenJDK 21 runtime
-src/exec.py                 exec, installed as /usr/local/bin/exec, the image's entrypoint
+Dockerfile                  the image: isolate built in a stage of its own, primitive-base, OpenJDK 21 runtime
+src/exec.py                 exec, installed as /usr/local/bin/exec, the image's command
 src/isolate-keyrings.patch  our patch to isolate: add_key and request_key refused beside keyctl
 primitive.yaml              the declaration, without the image line
 tests/                      unit tests, and image tests that run it on Docker
@@ -537,10 +538,17 @@ need root and isolate too, so on a host they are skipped, and they run in
 the test container: `tests/Dockerfile` builds it on the image with the
 tests' tools, and the image test
 `test_the_in_process_tests_pass_in_the_test_container` runs
-`tests/test_exec.py` in it, privileged, where none is skipped. By hand:
+`tests/test_exec.py` in it, privileged, where none is skipped.
+
+The image builds on the runner's `primitive-base` (`ARG BASE_IMAGE`), whose
+step wrapper is the entrypoint and runs `exec` as the image's command in
+a grading step, and runs it in its own place anywhere else. The Dockerfile
+names the runner release's image; the image tests build one from a `runner`
+checkout beside this one, or take `BASE_IMAGE`. By hand:
 
 ```
-docker build -t primitive-exec:test .
+docker build -t primitive-base:test -f ../runner/images/primitive-base/Dockerfile ../runner
+docker build -t primitive-exec:test --build-arg BASE_IMAGE=primitive-base:test .
 docker build -t primitive-exec:test-container --build-arg IMAGE=primitive-exec:test \
   -f tests/Dockerfile .
 docker run --rm --privileged --env=UNICON_BOX_USERS=60000-60009 -v "$PWD:/src:ro" \

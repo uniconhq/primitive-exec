@@ -4,10 +4,18 @@
 # /work/out/. Each run goes in an isolate box of its own, so the container
 # runs as root and privileged (see "Where it runs" in the README).
 
-# Pinned by digest so a release rebuilds from the same base. python:3.14-slim
-# (Debian 13), pulled 2026-09-13, the same pin as the runner's images and the
-# compile primitive, whose Python and Java versions this image must match to
-# run what compile builds. Change it in both primitives together, from
+# The image builds on the primitives' base, the runner's
+# ghcr.io/uniconhq/primitive-base: the same python:3.14-slim, with the step
+# wrapper as its entrypoint, which runs this image's command in a grading
+# step and runs it in its own place anywhere else. BASE_IMAGE names the
+# runner release's image; a build against a runner checkout passes the one
+# built from it, as the tests and the shared CI do.
+ARG BASE_IMAGE=ghcr.io/uniconhq/primitive-base:v0.10.0
+
+# The stage that builds isolate is pinned by digest, python:3.14-slim
+# (Debian 13), pulled 2026-09-13, the base image's own pin, so isolate
+# links the libraries the final stage has. Change it with the runner's
+# images/primitive-base/Dockerfile, from
 # `docker image inspect python:3.14-slim --format '{{index .RepoDigests 0}}'`.
 FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6 AS isolate
 
@@ -31,7 +39,7 @@ RUN git clone --quiet https://github.com/ioi/isolate /src \
     && make install DESTDIR=/out
 
 
-FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
+FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="primitive-exec" \
       org.opencontainers.image.description="The Unicon exec primitive: run a program under limits and measure it." \
@@ -54,4 +62,4 @@ COPY --chmod=0755 src/exec.py /usr/local/bin/exec
 # exec runs as root: it sets up the step's cgroup, mounts each box's tmpfs and
 # runs isolate, and each run is a box user of its own, never root.
 WORKDIR /work
-ENTRYPOINT ["/usr/local/bin/exec"]
+CMD ["/usr/local/bin/exec"]
