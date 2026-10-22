@@ -100,27 +100,21 @@ CGROUP = Path("/sys/fs/cgroup")
 """The step container's cgroup, the root of its own cgroup namespace: a
 privileged container on cgroup v2 sees its own cgroup there, writable."""
 STEP_CGROUP = CGROUP / "step"
-"""Everything the step runs, capped together at what it needs
-(`set_up_cgroup`): exec's own processes in `main`, the boxes in
-`isolate`. The container's own cgroup is the namespace's root, whose
-limits only the machine sets."""
+"""Everything the step runs, capped together at the memory the planner
+gave the step (`set_up_cgroup`): exec's own processes in `main`, the
+boxes in `isolate`. The container's own cgroup is the namespace's root,
+whose limits only the machine sets."""
 MAIN_CGROUP = STEP_CGROUP / "main"
 BOX_CGROUPS = STEP_CGROUP / "isolate"
 CONTAINER_MEMORY = CGROUP / "memory.max"
-"""The container's memory limit in bytes, or `max` for none, which holds
-every box's memory and the copies made into the boxes' tmpfs together: the
-copies are charged to the step, not to a box."""
+"""The container's memory limit in bytes, or `max` for none: the machine's
+slot, which the step's own memory is never more than outside the tests."""
 STEP_MEMORY_KB = 112 * 1024
-"""What the step needs of the container's memory beside the boxes and the
-copies: the image's step wrapper, unicon-step, the container's first
+"""What the step needs of its memory beside the boxes and the copies, at
+the least: the image's step wrapper, unicon-step, the container's first
 process, whose peak was measured at about 35 MB with 48 MB allowed for it,
 then the primitive itself, isolate, and the kernel's own use, 64 MB."""
-DECLARED_MEMORY_KB = 256 * 1024
-"""The memory `primitive.yaml` gives the step at the least, its
-`limits.memory_mb`."""
-DECLARED_ROOM_KB = 256 * 1024
-"""The room `primitive.yaml` adds to a run's memory limit for the step,
-its `limits_from.memory_mb.add`."""
+STEP_MEMORY_VARIABLE = "UNICON_STEP_MEMORY_MB"
 CACHE_MOUNT = "/cache"
 """Where a box sees the item folder of the step's cache that its cached
 named files are in, bound read-only."""
@@ -647,24 +641,19 @@ def arguments(inputs: dict[str, object], run: str) -> tuple[str, ...]:
 
 
 def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
-    """Check the container holds each item's box (`check_memory`), set the
-    step up for its boxes, capped at what the planner gave it (`planned_kb`)
-    for its largest item, then run
-    the items one after another, in the order given, each in a fresh box
+    """Check the step's memory holds each item's box (`check_memory`), set
+    the step up for its boxes, capped at that memory (`step_memory_kb`),
+    then run the items one after another, in the order given, each in a fresh box
     with a fresh copy of its program, and return one outputs entry per item.
 
     isolate's meta file and its own standard error go in a folder of exec's
     in the container's `/tmp`, which no box sees.
     """
     users = box_users()
-    needs = [box_size_kb(item) for item in items]
-    for item, needed in zip(items, needs, strict=True):
-        check_memory(needed, item.run)
-    planned = (
-        planned_kb(item.memory_limit_kb, needed)
-        for item, needed in zip(items, needs, strict=True)
-    )
-    set_up_step(users, max(planned, default=DECLARED_MEMORY_KB))
+    memory_kb = step_memory_kb()
+    for item in items:
+        check_memory(box_size_kb(item), memory_kb, item.run)
+    set_up_step(users, memory_kb)
     scratch = Path(tempfile.mkdtemp(prefix="exec-"))
     kinds: dict[Path, str] = {}
     results: list[dict[str, object]] = []
@@ -760,42 +749,24 @@ def box_size_kb(item: Item) -> int:
     )
 
 
-def planned_kb(memory_limit_kb: int, needed_kb: int) -> int:
-    """The memory the forge's planner gives the step for one item, in
-    kilobytes: the most of `DECLARED_MEMORY_KB`, its boxes' memory limits
-    together, `memory_limit_kb`, with `DECLARED_ROOM_KB`, and what its boxes and copies
-    need, `needed_kb`, with `STEP_MEMORY_KB`. The room the declaration adds
-    holds what the step does outside the boxes beside `STEP_MEMORY_KB`'s
-    measured least, such as isolate walking a box's tree as deep as its
-    inodes go to give it back. The planner rounds each figure up to whole
-    megabytes and counts a copy at the most it may be, so this is never
-    more than what it gave."""
-    return max(
-        DECLARED_MEMORY_KB,
-        memory_limit_kb + DECLARED_ROOM_KB,
-        needed_kb + STEP_MEMORY_KB,
-    )
-
-
-def check_memory(needed_kb: int, run: str) -> None:
+def check_memory(needed_kb: int, memory_kb: int, run: str) -> None:
     """Refuse run `run`, before any program of the batch runs, when
     `needed_kb`, its boxes' memory limits and the files copied into their
-    tmpfs, and `STEP_MEMORY_KB` are more than the container's memory. The
-    container's limit would otherwise kill first: a program, which isolate
-    reads as the box's own kill, a `memory_limit` that was not the
-    program's, or the step itself, which then writes no outputs at all."""
-    try:
+    tmpfs, and `STEP_MEMORY_KB` are more than the step's memory,
+    `memory_kb`, or the container's, when that is less. The limit would
+    otherwise kill first: a program, which isolate reads as the box's own
+    kill, a `memory_limit` that was not the program's, or the step itself,
+    which then writes no outputs at all."""
+    held_kb = memory_kb
+    with contextlib.suppress(FileNotFoundError):
         text = CONTAINER_MEMORY.read_text().strip()
-    except FileNotFoundError:
-        return
-    if text == "max":
-        return
-    held_kb = int(text) // 1024
+        if text != "max":
+            held_kb = min(held_kb, int(text) // 1024)
     if needed_kb + STEP_MEMORY_KB > held_kb:
         raise PrimitiveError(
             f"the run {run} needs {math.ceil(needed_kb / 1024)} MB for its "
             "memory limits and the files copied in beside them, and the "
-            f"container's {held_kb // 1024} MB leaves "
+            f"step's {held_kb // 1024} MB leaves "
             f"{max(0, held_kb - STEP_MEMORY_KB) // 1024} MB for them"
         )
 
@@ -1326,6 +1297,27 @@ def box_users() -> range:
     return range(first, last + 1)
 
 
+def step_memory_kb() -> int:
+    """The step's memory in kilobytes, from `UNICON_STEP_MEMORY_MB`, which
+    whoever starts the step sets, from the step's job: what the forge's
+    planner gave the step, its largest item's boxes' memory limits, the
+    files copied in beside them, and the room `primitive.yaml` adds for
+    what the step does outside its boxes. The step is capped at it, so
+    steps side by side in one slot of a machine stay within what each was
+    planned; exec does not work it out again."""
+    text = os.environ.get(STEP_MEMORY_VARIABLE)
+    if text is None:
+        raise PrimitiveError(
+            f"{STEP_MEMORY_VARIABLE} is not set, so exec does not know the "
+            "memory the step was given"
+        )
+    if re.fullmatch(r"[1-9][0-9]{0,6}", text) is None:
+        raise PrimitiveError(
+            f"{STEP_MEMORY_VARIABLE} is not a whole number of MB: {text!r}"
+        )
+    return int(text) * 1024
+
+
 def set_up_step(users: range, memory_kb: int) -> None:
     """Set the step container up for isolate's boxes, as root, in this order:
     refuse root Docker's identity map (`check_shape`), raise the limits
@@ -1456,7 +1448,7 @@ def set_up_cgroup(memory_kb: int) -> None:
     cgroup with processes in it cannot hand controllers to its children,
     hence `main`; a process that will not move, gone already, is passed
     over. `step` is capped, with no swap, at `memory_kb`, what the forge's
-    planner gave the step (`planned_kb`), so steps side by side in one
+    planner gave the step (`step_memory_kb`), so steps side by side in one
     machine's slot stay within what the planner gave each."""
     MAIN_CGROUP.mkdir(parents=True, exist_ok=True)
     for pid in (CGROUP / "cgroup.procs").read_text().split():

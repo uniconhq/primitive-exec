@@ -25,6 +25,10 @@ SIBLING_DIFF = ROOT.parent / "deploy" / "workflows" / "classic" / "v3" / "diff"
 USERNS = Path(__file__).resolve().parent / "userns.py"
 BOX_USERS = "60000-60009"
 """The box users the tests give exec: one step's range."""
+STEP_MEMORY_MB = "1024"
+"""The memory the in-process tests give exec's step, as the planner would
+give a run of 512 MB, the most a test gives one, with its copies and the
+256 MB room."""
 
 RunImage = Callable[..., dict[str, Any]]
 Check = Callable[..., None]
@@ -126,10 +130,10 @@ def step_flags(limits: dict[str, int]) -> list[str]:
     """The docker run flags an exec step container gets: privileged, so exec
     can make its boxes, with the declared memory, pids and CPU-time limits,
     one CPU, a `/tmp` mounted `noexec`, `nosuid` and `nodev`, as Docker
-    mounts the harness's, the tests' box users, and the network Docker
-    gives it, as a Woodpecker step has one. Under root Docker, as on Docker
-    Desktop and a CI machine, exec refuses to start, so the tests start it
-    through `USERNS`.
+    mounts the harness's, the tests' box users, that memory as the step's,
+    and the network Docker gives it, as a Woodpecker step has one. Under
+    root Docker, as on Docker Desktop and a CI machine, exec refuses to
+    start, so the tests start it through `USERNS`.
     """
     memory = f"{limits['memory_mb']}m"
     cpu_seconds = math.ceil(limits["cpu_ms"] / 1000)
@@ -142,6 +146,7 @@ def step_flags(limits: dict[str, int]) -> list[str]:
         "--cpus=1",
         "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
         f"--env=UNICON_BOX_USERS={BOX_USERS}",
+        f"--env=UNICON_STEP_MEMORY_MB={limits['memory_mb']}",
     ]
 
 

@@ -29,6 +29,7 @@ from support import (
     BOX_USERS,
     PROGRAM,
     SCORE,
+    STEP_MEMORY_MB,
     batch_inputs,
     by_run,
     declaration,
@@ -46,14 +47,15 @@ there a missing isolate or root fails it rather than skipping it."""
 
 @pytest.fixture
 def boxes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give exec the tests' box users, or skip a test that runs programs
-    where exec cannot make boxes."""
+    """Give exec the tests' box users and step memory, or skip a test that
+    runs programs where exec cannot make boxes."""
     able = sys.platform == "linux" and os.geteuid() == 0
     if not (able and Path(primitive.ISOLATE).is_file()):
         if IN_BOXES:
             pytest.fail("the test container has no root with isolate")
         pytest.skip("runs programs in isolate boxes: run in the test container")
     monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
+    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, STEP_MEMORY_MB)
 
 
 @pytest.fixture
@@ -378,6 +380,7 @@ def test_on_root_docker_nothing_runs(
     uid_map.write_text("0 0 4294967295\n")
     monkeypatch.setattr(primitive, "UID_MAP", uid_map)
     monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
+    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, STEP_MEMORY_MB)
 
     def touched() -> None:
         raise AssertionError("the cgroup was set up")
@@ -1110,7 +1113,7 @@ def test_two_steps_at_once_share_a_process_count_only_on_the_same_users(
     namespace, every step of one rootless Docker, so two steps given
     distinct box users each fork up to their limit at once, and two given
     the same one share it."""
-    primitive.set_up_step(primitive.box_users(), primitive.DECLARED_MEMORY_KB)
+    primitive.set_up_step(primitive.box_users(), primitive.step_memory_kb())
     binary = python_binary(tmp_path / "b" / "p", PROGRAM).read_bytes()
     works = []
     for number in range(2):
@@ -1143,7 +1146,7 @@ def test_a_box_a_dead_step_left_mounted_does_not_stop_the_next(
 ) -> None:
     """A step killed in the middle of an item leaves its box initialised and
     its tmpfs mounted; the next item unmounts it and starts afresh."""
-    primitive.set_up_step(primitive.box_users(), primitive.DECLARED_MEMORY_KB)
+    primitive.set_up_step(primitive.box_users(), primitive.step_memory_kb())
     primitive.isolate_box(primitive.BOX, "--init")
     folder = primitive.BOX_ROOT / str(primitive.BOX) / "box"
     primitive.mount("box-0", folder, "tmpfs", 0, "size=1m")
@@ -1155,42 +1158,49 @@ def test_a_box_a_dead_step_left_mounted_does_not_stop_the_next(
     )
 
 
-def test_the_step_is_capped_at_what_the_planner_gave_its_largest_run(
+def test_the_step_is_capped_at_the_memory_it_was_given(
     run: Any, tmp_path: Path
 ) -> None:
     """The step's cgroup, which holds exec's own processes and every box,
-    is capped at what the planner gave the batch's largest run: steps side
-    by side in one slot stay within what the planner gave each."""
+    is capped at the memory the planner gave the step, whatever its runs
+    and their copies need within it: steps side by side in one slot stay
+    within what the planner gave each."""
     files = {"main-2": {"data": b"x" * (8 * 2**20)}}
     outputs = by_run(
         run([("main-1", "double\n21\n"), ("main-2", "double\n21\n")], files=files)
     )
     assert {each["outcome"] for each in outputs.values()} == {"accepted"}
-    items = primitive.read_inputs(tmp_path / "work")
-    needed = [primitive.box_size_kb(item) for item in items]
-    assert needed[1] > needed[0]
     capped = (primitive.STEP_CGROUP / "memory.max").read_text()
-    planned = [
-        primitive.planned_kb(item.memory_limit_kb, each)
-        for item, each in zip(items, needed, strict=True)
-    ]
-    assert int(capped) == max(planned) * 1024
+    assert int(capped) == int(STEP_MEMORY_MB) * 2**20
     assert primitive.BOX_CGROUPS.parent == primitive.STEP_CGROUP
     assert str(os.getpid()) in (primitive.MAIN_CGROUP / "cgroup.procs").read_text()
 
 
-def test_the_step_is_planned_by_the_declaration_and_what_its_boxes_need() -> None:
-    """The planner's rule: the declaration's least memory, the memory limit
-    with the declaration's room, or what the box and its copies need with
-    the step's own, whichever is most."""
-    limits = declaration()["limits"]
-    room = declaration()["limits_from"]["memory_mb"]["add"]
-    assert primitive.DECLARED_MEMORY_KB == limits["memory_mb"] * 1024
-    assert primitive.DECLARED_ROOM_KB == room * 1024
-    assert primitive.planned_kb(0, 0) == limits["memory_mb"] * 1024
-    assert primitive.planned_kb(64 * 1024, 72 * 1024) == (64 + room) * 1024
-    copies = 64 * 1024 + 900 * 1024
-    assert primitive.planned_kb(64 * 1024, copies) == copies + primitive.STEP_MEMORY_KB
+def test_the_steps_memory_is_what_it_was_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, "640")
+    assert primitive.step_memory_kb() == 640 * 1024
+
+
+@pytest.mark.parametrize(
+    ("given", "message"),
+    [
+        (None, "UNICON_STEP_MEMORY_MB is not set"),
+        ("0", "is not a whole number of MB"),
+        ("-512", "is not a whole number of MB"),
+        ("512.5", "is not a whole number of MB"),
+        (" 512", "is not a whole number of MB"),
+        ("0512", "is not a whole number of MB"),
+    ],
+)
+def test_a_steps_memory_it_cannot_use_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, given: str | None, message: str
+) -> None:
+    if given is None:
+        monkeypatch.delenv(primitive.STEP_MEMORY_VARIABLE, raising=False)
+    else:
+        monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, given)
+    with pytest.raises(primitive.PrimitiveError, match=re.escape(message)):
+        primitive.step_memory_kb()
 
 
 def test_a_step_that_cannot_be_set_up_runs_nothing(
@@ -1204,7 +1214,7 @@ def test_a_step_that_cannot_be_set_up_runs_nothing(
 
 
 def test_the_box_launchers_self_test_passes_in_a_box(boxes: None) -> None:
-    primitive.set_up_step(primitive.box_users(), primitive.DECLARED_MEMORY_KB)
+    primitive.set_up_step(primitive.box_users(), primitive.step_memory_kb())
     primitive.check_launcher()
 
 
@@ -1707,46 +1717,60 @@ MB = 1024 * 1024
 
 
 @pytest.mark.parametrize(
-    ("held", "needed_mb"),
-    [(None, 10**6), ("max\n", 10**6), (f"{256 * MB}\n", 144)],
+    ("held", "given_mb", "needed_mb"),
+    [
+        (None, 256, 144),
+        ("max\n", 256, 144),
+        (f"{256 * MB}\n", 10**6, 144),
+        (f"{10**6 * MB}\n", 256, 144),
+    ],
 )
-def test_a_run_the_container_holds_is_let_through(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held: str | None, needed_mb: int
+def test_a_run_the_step_holds_is_let_through(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    held: str | None,
+    given_mb: int,
+    needed_mb: int,
 ) -> None:
-    """With no limit on the container, or room for the run's memory limit,
-    its copies and the step's own, the run goes ahead."""
+    """With room in the step's memory, and in the container's when it has
+    a limit, for the run's memory limit, its copies and the step's own, the
+    run goes ahead."""
     memory = tmp_path / "memory.max"
     if held is not None:
         memory.write_text(held)
     monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
-    primitive.check_memory(needed_mb * 1024, "main-1")
+    primitive.check_memory(needed_mb * 1024, given_mb * 1024, "main-1")
 
 
-def test_a_run_the_container_cannot_hold_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("held", "given_mb"), [("max\n", 256), (f"{256 * MB}\n", 10**6)]
+)
+def test_a_run_the_step_cannot_hold_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held: str, given_mb: int
 ) -> None:
+    """The step's memory, or the container's when that is less, holds too
+    little for the run."""
     memory = tmp_path / "memory.max"
-    memory.write_text(f"{256 * MB}\n")
+    memory.write_text(held)
     monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
     with pytest.raises(primitive.PrimitiveError) as raised:
-        primitive.check_memory(144 * 1024 + 1, "main-1")
+        primitive.check_memory(144 * 1024 + 1, given_mb * 1024, "main-1")
     assert str(raised.value) == (
         "the run main-1 needs 145 MB for its memory limits and the files copied "
-        "in beside them, and the container's 256 MB leaves 144 MB for them"
+        "in beside them, and the step's 256 MB leaves 144 MB for them"
     )
 
 
-def test_a_batch_with_a_run_the_container_cannot_hold_runs_nothing(
+def test_a_batch_with_a_run_the_step_cannot_hold_runs_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The named files are counted with the memory limit, since they are
     copied into the box's tmpfs, charged to the step: so a run whose limit
     fits but whose files do not is refused before any program runs, an
-    error of the step, not a run the container's limit kills."""
-    memory = tmp_path / "memory.max"
-    memory.write_text(f"{240 * MB}\n")
-    monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
+    error of the step, not a run the step's limit kills."""
+    monkeypatch.setattr(primitive, "CONTAINER_MEMORY", tmp_path / "none")
     monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
+    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, "240")
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     files = {"main-2": {"data": b"x" * (80 * MB)}}

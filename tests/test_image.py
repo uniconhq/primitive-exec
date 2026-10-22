@@ -26,6 +26,7 @@ from support import (
     ROOT,
     SCORE,
     SIBLING_DIFF,
+    STEP_MEMORY_MB,
     Check,
     Compiled,
     RunImage,
@@ -435,10 +436,10 @@ def test_named_files_the_container_cannot_hold_are_an_error_of_the_step(
     tmp_path: Path, run_image: RunImage
 ) -> None:
     """A run's named files are copied into its box's tmpfs, charged to the
-    container beside the box's own memory: 96 MB of them with a 64 MB
-    limit do not fit a 256 MB container, and exec says so before any run,
-    where the container's limit would kill it with no outputs at all.
-    Without the files, the same container runs the batch."""
+    step beside the box's own memory: 96 MB of them with a 64 MB limit do
+    not fit a step of 256 MB, and exec says so before any run, where the
+    step's limit would kill it with no outputs at all. Without the files,
+    the same step runs the batch."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     limits = container_limits(1.0, 64, 1) | {"memory_mb": 256}
     items = [("main-1", "double\n21\n")]
@@ -446,7 +447,7 @@ def test_named_files_the_container_cannot_hold_are_an_error_of_the_step(
     batch_inputs(tmp_path / "large", binary, items, files=files)
     refused = run_image(tmp_path / "large", limits)
     assert refused["error"].startswith("the run main-1 needs 161 MB")
-    assert "container's 256 MB leaves 144 MB" in refused["error"]
+    assert "step's 256 MB leaves 144 MB" in refused["error"]
     batch_inputs(tmp_path / "small", binary, items)
     ran = by_run(run_image(tmp_path / "small", limits))
     assert outcomes(ran) == {"main-1": "accepted"}
@@ -1012,6 +1013,7 @@ def test_the_in_process_tests_pass_in_the_test_container(
     subprocess.run([*build, str(ROOT)], check=True, capture_output=True)
     command = ["docker", "run", "--rm", "--privileged"]
     command += [f"--env=UNICON_BOX_USERS={BOX_USERS}"]
+    command += [f"--env=UNICON_STEP_MEMORY_MB={STEP_MEMORY_MB}"]
     command += ["--volume", f"{ROOT}:/src:ro", tag]
     command += [] if rootless else ["python3", "tests/userns.py"]
     command += ["pytest", "-p", "no:cacheprovider", "tests/test_exec.py"]

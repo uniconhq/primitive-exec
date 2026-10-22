@@ -209,7 +209,8 @@ reports"); an item's run is not a run id, or two items are for the same
 run; the program is in none of the three formats; the interpreter a Python
 or Java program needs could not be started; exec could not start where it
 runs (see "Where it runs"): the container has root Docker's identity map,
-exec is not root, `UNICON_BOX_USERS` is missing or out of bounds, the
+exec is not root, `UNICON_BOX_USERS` is missing or out of bounds,
+`UNICON_STEP_MEMORY_MB` is missing or not a whole number, the
 container's hard limit on the stack or on open files is too low for
 isolate, or the step could not be set up for its boxes; or isolate could
 not make, run or clean up a box. The harness turns an error into a
@@ -457,11 +458,9 @@ Docker: the shape picked for every step that runs code, provisionally
 3. makes a cgroup `step`, moves the container's processes into `main`
    under it and makes `isolate` beside that, under which each box gets its
    cgroup, with the CPU and memory controllers on, and caps `step`, with no
-   swap, at what the forge's planner gave the batch's largest run: the most
-   of the 256 MB `primitive.yaml` gives at the least, the run's memory
-   limit with the 256 MB it adds, and the memory limit and copies with
-   112 MB for the step wrapper, exec and isolate. So steps side by side in
-   one slot of a machine stay within what the planner gave each;
+   swap, at `UNICON_STEP_MEMORY_MB`, the memory the forge's planner gave
+   the step. So steps side by side in one slot of a machine stay within
+   what the planner gave each;
 4. makes `/run/boxdev`, the boxes' `/dev`;
 5. writes isolate's configuration, `/usr/local/etc/isolate`, with the step's
    box users.
@@ -476,6 +475,14 @@ keyrings are per user. exec runs one box at a time and so uses the first;
 it takes a range so that a step that runs boxes side by side, as
 `interact` does, is given its users the same way. Without it, or with a
 range out of bounds, exec does not start.
+
+**The step's memory** is `UNICON_STEP_MEMORY_MB`, a whole number of MB,
+which whoever starts the step sets from the step's job, as it does the box
+users: what the forge's planner gave the step, its largest run's memory
+limit and the files copied in beside it, with the 256 MB `primitive.yaml`
+adds for the step wrapper, exec and isolate, so it holds the cleanup of a
+tree as deep as a box's inodes go. exec does not work the figure out
+again: the planner's is the one rule. Without it, exec does not start.
 
 **Its twin.** `primitive-interact`'s `src/interact.py` holds a copy of this
 box handling under the same names: the step's set-up, the box, the isolate
@@ -522,19 +529,20 @@ time_limit + 3` seconds, what one run can take at most:
   in all, and a batch 0.2 s to start, measured in the image on Docker
   Desktop with one CPU.
 
-Memory goes to `memory_limit + 256` MB: room for exec itself and for the
-copies of the program and the named files in the box's tmpfs, which are
-charged to exec, not the box. That room is fixed, and the copies are not:
-a run whose memory limit and copies, with 112 MB for the step wrapper,
-exec and isolate, are
-more than the container's memory (its cgroup's `memory.max`) is an error of
-the step, said before any run of the batch starts. The container's limit
-would otherwise kill first, the step with no outputs at all, or a run,
-which isolate reads as the run's own `memory_limit`. Whoever sizes the
-step must count the files it copies. The `forge` repo's compiler adds up
-time and CPU over the runs of the batch when it writes the plan. A box's
-processes inherit the container's `RLIMIT_CPU`, when it sets one, which is
-above the run's own limit, so isolate's limit is the one that stops a run.
+Memory goes to `memory_limit + 256` MB: room for the step wrapper, exec
+and isolate beside the box. The copies of the program and the named files
+in the box's tmpfs are charged to exec, not the box, and the forge's
+planner adds them on top, each at the most it may be, and gives the step
+the sum (`UNICON_STEP_MEMORY_MB`). A run whose memory limit and copies,
+with 112 MB for the step wrapper, exec and isolate, are more than the
+step's memory, or the container's (its cgroup's `memory.max`) when that is
+less, is an error of the step, said before any run of the batch starts.
+The limit would otherwise kill first, the step with no outputs at all, or
+a run, which isolate reads as the run's own `memory_limit`. The `forge`
+repo's compiler adds up time and CPU over the runs of the batch when it
+writes the plan. A box's processes inherit the container's `RLIMIT_CPU`,
+when it sets one, which is above the run's own limit, so isolate's limit
+is the one that stops a run.
 
 ## The program format
 
@@ -622,7 +630,8 @@ docker build -t primitive-base:test -f ../runner/images/primitive-base/Dockerfil
 docker build -t primitive-exec:test --build-arg BASE_IMAGE=primitive-base:test .
 docker build -t primitive-exec:test-container --build-arg IMAGE=primitive-exec:test \
   -f tests/Dockerfile .
-docker run --rm --privileged --env=UNICON_BOX_USERS=60000-60009 -v "$PWD:/src:ro" \
+docker run --rm --privileged --env=UNICON_BOX_USERS=60000-60009 \
+  --env=UNICON_STEP_MEMORY_MB=1024 -v "$PWD:/src:ro" \
   primitive-exec:test-container python3 tests/userns.py pytest -p no:cacheprovider tests/test_exec.py
 ```
 

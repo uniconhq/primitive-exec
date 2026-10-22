@@ -38,7 +38,7 @@ SHARED = (
     "shown_bytes",
     "check_shape",
     "set_up_step",
-    "planned_kb",
+    "step_memory_kb",
     "check_launcher",
     "box_users",
     "refuse_constant",
@@ -66,11 +66,18 @@ SHARED = (
 )
 """The functions exec and interact share. The others name a run or a
 program, and read differently in the two."""
-CONSTANTS = ("STEP_MEMORY_KB", "CACHE_MOUNT", "LAUNCHER", "LAUNCHER_CHECK_KB")
+CONSTANTS = (
+    "STEP_MEMORY_KB",
+    "STEP_MEMORY_VARIABLE",
+    "CACHE_MOUNT",
+    "LAUNCHER",
+    "LAUNCHER_CHECK_KB",
+)
 """The module constants exec and interact share, compared as their
 assignments: the room the step keeps beside the boxes, which the forge's
-planner keeps a copy of too, where a box sees its cached files, where
-the image installs the box launcher, and the box its self-test runs in."""
+planner keeps a copy of too, the variable the step's memory is given in,
+where a box sees its cached files, where the image installs the box
+launcher, and the box its self-test runs in."""
 RENAMED = {"entry": "item", "Entry": "Item"}
 """interact's names for what exec calls an item, one program of an item."""
 PRIMITIVE = re.compile(r"\b(exec|interact)\b")
