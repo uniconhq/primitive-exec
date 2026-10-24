@@ -940,7 +940,7 @@ def execute(
 def isolate_command(
     number: int,
     meta: Path,
-    item: Item,
+    item: Item | Entry,
     reports: bool,
     more: list[str],
     run: list[str],
@@ -1273,7 +1273,7 @@ def shown_bytes(content: bytes) -> str:
     return repr(text + "...") if len(content) > 24 else repr(text)
 
 
-def judge(run: Run, item: Item, kind: str) -> str:
+def judge(run: Run | ProgramsRun, item: Item | Entry, kind: str) -> str:
     """Give a run its outcome, from what isolate and the box's tmpfs say, in
     this order.
 
@@ -2286,7 +2286,7 @@ def start(
     command = isolate_command(
         each.number,
         each.meta,
-        cast(Item, entry),
+        entry,
         entry.manifest is not None,
         [bound, *cache_binding(entry.cached), "--special-files"],
         program.command(entry),
@@ -2425,7 +2425,7 @@ def stops(each: Running) -> bool:
     assert each.run is not None
     if each.run.interrupted:
         return False
-    over = judge(cast(Run, each.run), cast(Item, each.entry), each.kind) in OVER_LIMIT
+    over = judge(each.run, each.entry, each.kind) in OVER_LIMIT
     return over or each.entry.stops_others
 
 
@@ -2507,7 +2507,7 @@ def program_facts(each: Running, item: ProgramsItem) -> dict[str, object]:
     """
     assert each.run is not None and each.ended_at is not None
     run, entry = each.run, each.entry
-    outcome = judge(cast(Run, run), cast(Item, entry), each.kind)
+    outcome = judge(run, entry, each.kind)
     time_ms = round(run.cpu_seconds * 1000)
     if outcome == "time_limit":
         time_ms = max(time_ms, entry.time_limit_ms)
