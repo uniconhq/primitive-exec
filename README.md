@@ -137,7 +137,7 @@ echo "extra space on line 3" > $UNICON_REPORT/message
 
 **An outcome word** as the verdict is for a program that judged another
 program's run, not its own output: `unicon/interactive`'s verdict script
-reads the facts `interact` gives of the entrant and the judge, and writes
+reads the facts exec's programs form gives of the entrant and the judge, and writes
 `time_limit` when the entrant ran out of time. Under a word, as under `1`,
 the reports are shown and not counted. From a `self_reported` run a word is
 its `runtime_error`, so the entrant's code never chooses its own outcome.
@@ -184,7 +184,7 @@ a crash or a limit its own outcome, with no report, as for any run. Its
 report is only as honest as the entrant's code: that code runs in the same
 process, with `UNICON_REPORT` in reach, and can write a verdict of its own.
 A task that needs a verdict the entrant cannot write gives the judging to a
-program the entrant's code does not run in, such as the judge `interact`
+program the entrant's code does not run in, such as the judge exec's programs form
 runs beside it.
 
 The folder is in the run's box, so it is fresh for each run and goes with

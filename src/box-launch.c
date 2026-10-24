@@ -29,13 +29,10 @@
  * so on standard error and exits 127, as isolate does when a program
  * cannot start. A run's box sends its standard error nowhere, so no one
  * reads that, and the run ends as the program's runtime error. So exec
- * and interact start `box-launch --self-test` once in a box when a step
+ * starts `box-launch --self-test` once in a box when a step
  * starts: it sets the filter up, checks that inotify_init1 is refused
  * with ENOSYS, and exits 0, or says what failed and exits 127, which
  * fails the step before any program runs.
- *
- * primitive-exec and primitive-interact keep this file the same, which
- * their tests/test_twin.py checks.
  */
 #include <errno.h>
 #include <seccomp.h>

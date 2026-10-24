@@ -210,7 +210,7 @@ staff alone."""
 VERDICT_WORDS = ("time_limit", "memory_limit", "output_limit", "runtime_error")
 """The outcomes a report's verdict may name besides `0` and `1`: a program
 that judged another program's run, as `unicon/interactive`'s verdict script
-judges the programs `interact` ran, says whose limit it was, or that it
+judges the programs exec ran together, says whose limit it was, or that it
 crashed. From a `self_reported` run, the entrant's code, such a word is the
 run's `runtime_error`, so that code never chooses its own outcome."""
 REPORT_TEXT_LIMIT = 64 * 1024
@@ -858,7 +858,7 @@ def execute(
 
     The item folder of the step's cache its cached files are in, if any, is
     bound read-only as `CACHE_MOUNT` (`cache_binding`). isolate's
-    `--special-files` is always given, as interact gives it: it keeps the
+    `--special-files` is always given, as the programs form gives it: it keeps the
     links to cached files in the working directory, where isolate would
     remove them, and so too a link a run leaves in its report folder,
     which is a report that does not hold, whether or not the run had a
@@ -1712,7 +1712,7 @@ class ProgramsProgram:
         """The command line that runs this program, the entry's arguments
         last. The interpreters are the image's own, which every box sees
         under `/usr`; Python's is started by its real path, outside any
-        virtual environment interact runs in.
+        virtual environment exec runs in.
         """
         if self.kind == "native":
             return [str(self.path), *entry.args]
@@ -1747,7 +1747,7 @@ class ProgramsRun:
     the box's cgroup (`cg-mem`). `out_of_memory` says the kernel killed a
     process of the box for the box's memory, and `no_inodes` that the box's
     tmpfs had no file or folder left to give. `interrupted` says isolate
-    stopped the box because interact asked, and `wall_clock` that the wall
+    stopped the box because exec asked, and `wall_clock` that the wall
     clock stopped it.
     """
 
@@ -1764,12 +1764,12 @@ class ProgramsRun:
 
 @dataclass
 class Ends:
-    """A program's ends of the links, opened by interact before any box
+    """A program's ends of the links, opened by exec before any box
     starts: the descriptors that are its standard input and output, when a
     link is, the named pipes in its folder of them, and the stand-ins
-    interact holds for all of its ends, one opened in the program's place
-    for each, until interact has seen the program end. The program at the
-    other end then sees no end of input or `SIGPIPE` before interact has
+    exec holds for all of its ends, one opened in the program's place
+    for each, until exec has seen the program end. The program at the
+    other end then sees no end of input or `SIGPIPE` before exec has
     read how this one ended and stopped it where that stops the others, so
     a judge stopped for the entrant's limit is stopped before it can read
     the entrant gone and judge that."""
@@ -2013,7 +2013,7 @@ def programs_run_batch(
     and return one outputs entry per item.
 
     isolate's meta files and its own standard error, and the named pipes, go
-    in a folder of interact's in the container's `/tmp`, which no box sees
+    in a folder of exec's in the container's `/tmp`, which no box sees
     but for its own folder of pipes.
     """
     users = box_users()
@@ -2028,7 +2028,7 @@ def programs_run_batch(
         needed = sum(programs_box_size_kb(entry) for entry in item.programs)
         check_memory(needed, memory_kb, item.run)
     set_up_step(users, memory_kb)
-    scratch = Path(tempfile.mkdtemp(prefix="interact-"))
+    scratch = Path(tempfile.mkdtemp(prefix="programs-"))
     kinds: dict[Path, str] = {}
     results: list[dict[str, object]] = []
     try:
@@ -2228,7 +2228,7 @@ def programs_box_size_kb(entry: Entry) -> int:
     """The size of a program's box tmpfs, in kilobytes: its memory limit,
     which holds what the program writes there before the size does, as every
     page it writes is charged to the box's memory, plus the program and the
-    named files interact copies in, each to whole 4 KB pages. A cached named
+    named files exec copies in, each to whole 4 KB pages. A cached named
     file is not copied but bound in."""
     named = entry.files.values()
     copied = [entry.program, *(path for path in named if path.parent != entry.cached)]
@@ -2271,7 +2271,7 @@ def start(
     as Docker mounts a tmpfs; in a user namespace that flag cannot be taken
     away, so the folder is bound `noexec` too, or isolate could not bind
     it. Standard input and
-    output are the program's first links, handed over, interact keeping its
+    output are the program's first links, handed over, exec keeping its
     own end of each as a stand-in (`Ends`); standard input is
     `/dev/null` without one, and standard output without one is read and
     thrown away up to `OUTPUT_LIMIT` and one byte more, as exec reads it.
