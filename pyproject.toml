@@ -1,6 +1,6 @@
 [project]
 name = "primitive-exec"
-version = "1.0.0"
+version = "1.0.1"
 description = "The Unicon exec primitive: run a program under limits and measure the run."
 readme = "README.md"
 license = "MIT"
