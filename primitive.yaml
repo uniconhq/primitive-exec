@@ -1,91 +1,175 @@
-title: Run program
-description: Runs a program once under limits and records its output, time and memory.
+title: Run programs
+description: Runs one program, or several linked by pipes, under limits, and records how each ended.
 schema_version: 6
 batch: true
 network: false
 cache: true
-outputs_from: manifest
-limits: {time_ms: 2000, cpu_ms: 2000, memory_mb: 256, pids: 160, output_mb: 64, gpus: 0}
-limits_from:
-  time_ms: {input: time_limit, scale: 2000, add: 3000}
-  cpu_ms: {input: time_limit, scale: 2000, add: 3000}
-  memory_mb: {input: memory_limit, add: 256}
-inputs:
-  program:
-    type: file
-    runs: true
-    description: The program to run.
-  stdin:
-    type: file
-    runs: false
-    optional: true
-    description: What the program reads on standard input; nothing when left out.
-  files:
-    type: named_files
-    runs: false
-    optional: true
-    description: Files placed read-only in the program's working directory, under their names.
-  loads:
-    type: named_files
-    runs: true
-    optional: true
-    description: Code the program loads, placed as files are, such as the module a test harness imports.
-  manifest:
-    type: file
-    runs: false
-    optional: true
-    description: The reports the program declares, its program.yaml as JSON, when it is one that reports, such as a checker.
-  self_reported:
-    type: boolean
-    optional: true
-    description: True when the program given a manifest runs the entrant's code, so a report that does not hold is the entrant's runtime error, not a fault.
-  args:
-    type: text
-    optional: true
-    description: Arguments added to the program's command line, split on spaces.
-  time_limit:
-    type: number
-    description: Seconds of CPU time the program may use.
-  memory_limit:
-    type: number
-    description: Megabytes of memory the program may use.
-outputs:
-  output:
-    type: file
-    description: What the program printed on standard output.
-  time_ms:
-    type: number
-    better: lower
-    at_least: 0
-    description: The CPU time the program used, in milliseconds.
-  memory_kb:
-    type: number
-    better: lower
-    at_least: 0
-    description: The most memory the program used, in kilobytes.
-  label:
-    type: text
-    optional: true
-    description: A finer name for the outcome, from a program given a manifest.
-  message:
-    type: text
-    optional: true
-    description: A message shown with the run, from a program given a manifest.
-  staff_message:
-    type: text
-    optional: true
-    description: A message only staff see, from a program given a manifest.
-  extras:
-    type: folder
-    optional: true
-    description: Every other file a program given a manifest reported, shown with the run and never a column.
-  outcome:
-    type: outcome
-    description: How the program's run ended.
-    outcomes:
-      accepted: the program finishes within its limits, and given a manifest reports a verdict of 0
-      wrong_answer: the program given a manifest reports a verdict of 1
-      time_limit: it runs out of time, or a program given a manifest reports a verdict of time_limit
-      memory_limit: it uses more memory than allowed, or a program given a manifest reports a verdict of memory_limit
-      output_limit: it prints more than allowed, or a program given a manifest reports a verdict of output_limit
-      runtime_error: it crashes or exits with an error, or a program given a manifest reports a verdict of runtime_error
+forms:
+  one:
+    description: Runs a program once under limits and records its output, time and memory.
+    outputs_from: manifest
+    limits: {time_ms: 2000, cpu_ms: 2000, memory_mb: 256, pids: 160, output_mb: 64, gpus: 0}
+    limits_from:
+      time_ms: {input: time_limit, scale: 2000, add: 3000}
+      cpu_ms: {input: time_limit, scale: 2000, add: 3000}
+      memory_mb: {input: memory_limit, add: 256}
+    inputs:
+      program:
+        type: file
+        runs: true
+        description: The program to run.
+      stdin:
+        type: file
+        runs: false
+        optional: true
+        description: What the program reads on standard input; nothing when left out.
+      files:
+        type: named_files
+        runs: false
+        optional: true
+        description: Files placed read-only in the program's working directory, under their names.
+      loads:
+        type: named_files
+        runs: true
+        optional: true
+        description: Code the program loads, placed as files are, such as the module a test harness imports.
+      manifest:
+        type: file
+        runs: false
+        optional: true
+        description: The reports the program declares, its program.yaml as JSON, when it is one that reports, such as a checker.
+      self_reported:
+        type: boolean
+        optional: true
+        description: True when the program given a manifest runs the entrant's code, so a report that does not hold is the entrant's runtime error, not a fault.
+      args:
+        type: text
+        optional: true
+        description: Arguments added to the program's command line, split on spaces.
+      time_limit:
+        type: number
+        description: Seconds of CPU time the program may use.
+      memory_limit:
+        type: number
+        description: Megabytes of memory the program may use.
+    outputs:
+      output:
+        type: file
+        description: What the program printed on standard output.
+      time_ms:
+        type: number
+        better: lower
+        at_least: 0
+        description: The CPU time the program used, in milliseconds.
+      memory_kb:
+        type: number
+        better: lower
+        at_least: 0
+        description: The most memory the program used, in kilobytes.
+      label:
+        type: text
+        optional: true
+        description: A finer name for the outcome, from a program given a manifest.
+      message:
+        type: text
+        optional: true
+        description: A message shown with the run, from a program given a manifest.
+      staff_message:
+        type: text
+        optional: true
+        description: A message only staff see, from a program given a manifest.
+      extras:
+        type: folder
+        optional: true
+        description: Every other file a program given a manifest reported, shown with the run and never a column.
+      outcome:
+        type: outcome
+        description: How the program's run ended.
+        outcomes:
+          accepted: the program finishes within its limits, and given a manifest reports a verdict of 0
+          wrong_answer: the program given a manifest reports a verdict of 1
+          time_limit: it runs out of time, or a program given a manifest reports a verdict of time_limit
+          memory_limit: it uses more memory than allowed, or a program given a manifest reports a verdict of memory_limit
+          output_limit: it prints more than allowed, or a program given a manifest reports a verdict of output_limit
+          runtime_error: it crashes or exits with an error, or a program given a manifest reports a verdict of runtime_error
+  programs:
+    description: Runs programs side by side, linked by pipes, each under its own limits, and records how each one ended.
+    outputs_from: programs
+    limits: {time_ms: 4000, cpu_ms: 4000, memory_mb: 512, pids: 1056, output_mb: 64, gpus: 0}
+    limits_from:
+      time_ms: {max: programs.time_limit, scale: 4000, add: 6000}
+      cpu_ms: {max: programs.time_limit, scale: 4000, add: 6000}
+      memory_mb: {sum: programs.memory_limit, add: 512}
+    inputs:
+      programs:
+        type: programs
+        description: The programs to run side by side, one to eight, by the names the step gives them.
+        inputs:
+          program:
+            type: file
+            runs: true
+            description: The program, in one of exec's formats.
+          files:
+            type: named_files
+            runs: false
+            optional: true
+            description: Files placed read-only in this program's working directory alone, under their names, such as the hidden input.
+          args:
+            type: text
+            optional: true
+            description: Arguments added to the program's command line, split on spaces.
+          time_limit:
+            type: number
+            description: Seconds of CPU time the program may use.
+          memory_limit:
+            type: number
+            description: Megabytes of memory the program may use.
+          manifest:
+            type: file
+            runs: false
+            optional: true
+            description: The reports the program declares, its program.yaml as JSON, for a program that reports as a checker does.
+          stops_others:
+            type: boolean
+            optional: true
+            description: True to stop every other program when this one ends.
+        outputs:
+          time_ms:
+            type: number
+            better: lower
+            at_least: 0
+            description: The CPU time the program used, in milliseconds.
+          memory_kb:
+            type: number
+            better: lower
+            at_least: 0
+            description: The most memory the program used, in kilobytes.
+          ended:
+            type: enum
+            options: [finished, time_limit, memory_limit, output_limit, runtime_error]
+            description: How the program ended, finished for a clean exit.
+          signal:
+            type: text
+            optional: true
+            description: The signal that ended the program, such as SIGPIPE.
+          ended_at:
+            type: number
+            at_least: 0
+            description: When the program ended, in milliseconds from the start.
+          stopped_by:
+            type: text
+            optional: true
+            description: What stopped the program, wall_clock or the name of the program whose ending stopped it.
+      links:
+        type: links
+        optional: true
+        description: The pipes between the programs, each "<from> -> <to>"; a program's first each way is its standard output or input.
+    outputs:
+      facts:
+        type: file
+        description: Every program's facts and reports, as one JSON file, for a verdict script to read.
+      outcome:
+        type: outcome
+        description: Whether every program was started and measured.
+        outcomes:
+          accepted: every program was started and measured, however it ended

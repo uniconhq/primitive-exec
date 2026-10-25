@@ -50,17 +50,21 @@ import math
 import os
 import re
 import resource
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import zipfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from stat import S_IMODE, S_ISREG
-from typing import BinaryIO
+from typing import IO, BinaryIO, cast
 
 SCHEMA_VERSION = 6
 OUTPUT_LIMIT = 32 * 1024 * 1024
@@ -189,6 +193,15 @@ OWN_NAMES = frozenset(
 )
 """What no report may be named: the report folder's own files and exec's own
 outputs."""
+PROGRAMS_OWN_NAMES = OWN_NAMES | {
+    "ended",
+    "signal",
+    "ended_at",
+    "stopped_by",
+    "facts",
+    "reports",
+}
+"""`OWN_NAMES` plus what the several-programs form gives of each program."""
 REPORT_KEYS = frozenset({"type", "optional", "better", "at_least", "at_most"})
 TEXTS = ("label", "message", "staff_message")
 """The text files a report may hold besides its reports, each an output of
@@ -376,7 +389,7 @@ def main(argv: list[str]) -> int:
     return 0
 
 
-def read_inputs(root: Path) -> list[Item]:
+def read_inputs(root: Path) -> list[Item | ProgramsItem]:
     """Read `inputs.json` and return its items in order."""
     try:
         document = json.loads(
@@ -401,7 +414,7 @@ def read_inputs(root: Path) -> list[Item]:
     return items
 
 
-def read_item(root: Path, entry: object, number: int) -> Item:
+def read_item(root: Path, entry: object, number: int) -> Item | ProgramsItem:
     """Check one batch entry, the `number`th, and return it as an item."""
     if not isinstance(entry, dict) or not isinstance(entry.get("inputs"), dict):
         raise PrimitiveError("a batch item has no inputs object")
@@ -409,6 +422,10 @@ def read_item(root: Path, entry: object, number: int) -> Item:
     if not isinstance(run, str) or len(run) > 255 or not RUN_ID.fullmatch(run):
         raise PrimitiveError(f"the batch item run {run!r} is not a run id")
     inputs = entry["inputs"]
+    if "program" in inputs and "programs" in inputs:
+        raise PrimitiveError("a batch item gives both program and programs")
+    if "programs" in inputs:
+        return programs_read_item(root, entry, number)
     files = named_files(root, inputs, "files", run)
     loads = named_files(root, inputs, "loads", run)
     clash = sorted(files.keys() & loads.keys())
@@ -473,7 +490,9 @@ def read_item(root: Path, entry: object, number: int) -> Item:
     return item
 
 
-def read_manifest(path: Path, what: str) -> dict[str, Declared]:
+def read_manifest(
+    path: Path, what: str, own: frozenset[str] = OWN_NAMES
+) -> dict[str, Declared]:
     """Read a manifest, the reports a program declares in its `program.yaml`,
     as the forge gives it: that file's JSON form, `{"reports": {<name>:
     {"type": "number", "optional": false, "better": "higher", "at_least": 0,
@@ -497,7 +516,7 @@ def read_manifest(path: Path, what: str) -> dict[str, Declared]:
     reports = document["reports"]
     if not isinstance(reports, dict):
         raise PrimitiveError(f"{what} has reports that are not an object")
-    return {name: declared(name, port, what) for name, port in reports.items()}
+    return {name: declared(name, port, what, own) for name, port in reports.items()}
 
 
 def refuse_constant(constant: str) -> object:
@@ -506,11 +525,13 @@ def refuse_constant(constant: str) -> object:
     raise ValueError(f"{constant} is not JSON")
 
 
-def declared(name: str, port: object, what: str) -> Declared:
+def declared(
+    name: str, port: object, what: str, own: frozenset[str] = OWN_NAMES
+) -> Declared:
     """Check one report a manifest declares, `name`, and return it."""
     if not REPORT_NAME.fullmatch(name):
         raise PrimitiveError(f"{what} declares {name!r}, not a report name")
-    if name in OWN_NAMES:
+    if name in own:
         raise PrimitiveError(f"{what} declares {name}, a name exec gives already")
     if not isinstance(port, dict) or not set(port) <= REPORT_KEYS:
         raise PrimitiveError(f"{what} declares {name} with keys it does not know")
@@ -640,7 +661,7 @@ def arguments(inputs: dict[str, object], run: str) -> tuple[str, ...]:
     return tuple(part for part in value.split(" ") if part)
 
 
-def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
+def run_batch(root: Path, items: list[Item | ProgramsItem]) -> list[dict[str, object]]:
     """Check the step's memory holds each item's box (`check_memory`), set
     the step up for its boxes, capped at that memory (`step_memory_kb`),
     then run the items one after another, in the order given, each in a fresh box
@@ -649,16 +670,23 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
     isolate's meta file and its own standard error go in a folder of exec's
     in the container's `/tmp`, which no box sees.
     """
+    if any(isinstance(item, ProgramsItem) for item in items):
+        if not all(isinstance(item, ProgramsItem) for item in items):
+            raise PrimitiveError(
+                "a batch mixes the one-program form and the several-programs form"
+            )
+        return programs_run_batch(root, cast(list[ProgramsItem], items))
+    runs = cast(list[Item], items)
     users = box_users()
     memory_kb = step_memory_kb()
-    for item in items:
+    for item in runs:
         check_memory(box_size_kb(item), memory_kb, item.run)
     set_up_step(users, memory_kb)
     scratch = Path(tempfile.mkdtemp(prefix="exec-"))
     kinds: dict[Path, str] = {}
     results: list[dict[str, object]] = []
     try:
-        for item in items:
+        for item in runs:
             if item.program not in kinds:
                 kinds[item.program] = detect(item.program)
             outputs = run_item(root, item, kinds[item.program], scratch, users)
@@ -1564,6 +1592,968 @@ def libc() -> ctypes.CDLL:
 
 
 def write_json(path: Path, document: dict[str, object]) -> None:
+    """Write a JSON file whole: to a temporary name first, then renamed. The
+    temporary file is made afresh, never opened through a link a run left.
+    """
+    partial = path.with_name(path.name + ".partial")
+    partial.unlink(missing_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    with os.fdopen(os.open(partial, flags, 0o644), "w", encoding="utf-8") as stream:
+        stream.write(json.dumps(document, ensure_ascii=False))
+    partial.replace(path)
+
+
+MAX_PROGRAMS = 8
+
+
+PROGRAM_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+WALL_CLOCK = "wall_clock"
+
+
+LINK = re.compile(r"([a-z][a-z0-9_]{0,63}) -> ([a-z][a-z0-9_]{0,63})")
+
+
+FACTS = ("time_ms", "memory_kb", "ended", "signal", "ended_at", "stopped_by")
+
+
+OVER_LIMIT = frozenset({"time_limit", "memory_limit", "output_limit"})
+
+
+PIPES = "/pipes"
+
+
+PIPE_MODE = 0o240
+
+
+INTERRUPTED = "Interrupted"
+
+
+WALL_CLOCK_MESSAGE = "Time limit exceeded (wall clock)"
+
+
+PROGRAMS_GIVEN = ("program", "manifest")
+
+
+@dataclass(frozen=True)
+class Entry:
+    """One program of an item: the name the step gives it, the program, the
+    two limits, the arguments, the named files placed in its working
+    directory, the reports it declares when it is given a manifest,
+    whether its ending stops the others, and the item folder of the step's
+    cache its cached named files are in.
+    """
+
+    name: str
+    program: Path
+    time_limit: float
+    memory_limit: float
+    args: tuple[str, ...] = ()
+    files: dict[str, Path] = field(default_factory=dict)
+    manifest: dict[str, Declared] | None = None
+    stops_others: bool = False
+    cached: Path | None = None
+
+    @property
+    def wall_limit(self) -> float:
+        """The wall-clock seconds the program may take: twice the time limit
+        plus one, as under exec.
+
+        The time limit itself is on CPU time; the wall-clock limit stops a
+        program that sleeps or waits without using the CPU, such as one
+        waiting on another that waits on it.
+        """
+        return 2 * self.time_limit + 1
+
+    @property
+    def memory_limit_kb(self) -> int:
+        """The memory limit in kilobytes, the unit peak memory is measured in."""
+        return int(self.memory_limit * 1024)
+
+    @property
+    def time_limit_ms(self) -> int:
+        """The time limit in whole milliseconds, rounded up: the least time a
+        program stopped at it reports. Rounding to a microsecond first keeps
+        a limit such as 0.1 s, a little over 100 ms as a float, at 100.
+        """
+        return math.ceil(round(self.time_limit * 1000, 3))
+
+
+@dataclass(frozen=True)
+class Link:
+    """One link: what `writer` writes, `reader` reads."""
+
+    writer: str
+    reader: str
+
+
+@dataclass(frozen=True)
+class ProgramsItem:
+    """One run: its id, its place in the batch from 1, its programs in the
+    order given, the `n`th in box `n`, and the links between them in the
+    order given, which says which link is a program's first."""
+
+    run: str
+    number: int
+    programs: tuple[Entry, ...]
+    links: tuple[Link, ...] = ()
+
+
+@dataclass(frozen=True)
+class ProgramsProgram:
+    """A program ready to run: its format and the file the command starts,
+    as the box sees it."""
+
+    kind: str
+    path: Path
+
+    def command(self, entry: Entry) -> list[str]:
+        """The command line that runs this program, the entry's arguments
+        last. The interpreters are the image's own, which every box sees
+        under `/usr`; Python's is started by its real path, outside any
+        virtual environment interact runs in.
+        """
+        if self.kind == "native":
+            return [str(self.path), *entry.args]
+        if self.kind == "python":
+            interpreter = os.path.realpath(sys.executable)
+            return [interpreter, "-I", "-B", str(self.path), *entry.args]
+        java = shutil.which("java", path=RUN_PATH)
+        if java is None:
+            raise PrimitiveError("this image has no Java runtime to run a jar with")
+        return [
+            os.path.realpath(java),
+            f"-Xmx{max(16, int(entry.memory_limit))}m",
+            "-Xss64m",
+            "-XX:+UseSerialGC",
+            "-XX:-UsePerfData",
+            "-XX:+ExitOnOutOfMemoryError",
+            "-Djava.io.tmpdir=.",
+            "-jar",
+            str(self.path),
+            *entry.args,
+        ]
+
+
+@dataclass(frozen=True)
+class ProgramsRun:
+    """What one program did, as isolate's meta file and the box's tmpfs tell
+    it.
+
+    `status` is isolate's: empty when the program exited 0, `RE` for another
+    exit code, `SG` for a signal, `TO` for a time limit. `returncode` is the
+    exit code, or minus the signal that killed it. `memory_kb` is the peak of
+    the box's cgroup (`cg-mem`). `out_of_memory` says the kernel killed a
+    process of the box for the box's memory, and `no_inodes` that the box's
+    tmpfs had no file or folder left to give. `interrupted` says isolate
+    stopped the box because interact asked, and `wall_clock` that the wall
+    clock stopped it.
+    """
+
+    status: str
+    returncode: int
+    cpu_seconds: float
+    memory_kb: int
+    output_bytes: int
+    out_of_memory: bool = False
+    no_inodes: bool = False
+    interrupted: bool = False
+    wall_clock: bool = False
+
+
+@dataclass
+class Ends:
+    """A program's ends of the links, opened by interact before any box
+    starts: the descriptors that are its standard input and output, when a
+    link is, the named pipes in its folder of them, and the stand-ins
+    interact holds for all of its ends, one opened in the program's place
+    for each, until interact has seen the program end. The program at the
+    other end then sees no end of input or `SIGPIPE` before interact has
+    read how this one ended and stopped it where that stops the others, so
+    a judge stopped for the entrant's limit is stopped before it can read
+    the entrant gone and judge that."""
+
+    stdin: int | None = None
+    stdout: int | None = None
+    named: list[str] = field(default_factory=list)
+    stand_ins: list[int] = field(default_factory=list)
+
+
+@dataclass
+class Running:
+    """One program while the item runs: its entry, its box and that box's
+    folder, its ends of the links, the isolate that keeps it, a descriptor
+    for that process and one on its box's `cgroup.events`, and the thread
+    reading its unlinked standard output. `seen` says the box's cgroup has
+    been seen holding a process, `ended_at` is in milliseconds from just
+    before the first program started, `stopped_by` what stopped it, and
+    `run` what it did, once
+    its isolate has exited.
+    """
+
+    entry: Entry
+    number: int
+    kind: str
+    box: Path
+    meta: Path
+    errors: Path
+    ends: Ends = field(default_factory=Ends)
+    keeper: subprocess.Popen[bytes] | None = None
+    keeper_fd: int | None = None
+    events_fd: int | None = None
+    reader: threading.Thread | None = None
+    printed: list[int] = field(default_factory=lambda: [0])
+    seen: bool = False
+    ended_at: int | None = None
+    stopped_by: str | None = None
+    run: ProgramsRun | None = None
+
+
+def programs_read_item(root: Path, entry: object, number: int) -> ProgramsItem:
+    """Check one batch entry, the `number`th, and return it as an item."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("inputs"), dict):
+        raise PrimitiveError("a batch item has no inputs object")
+    run = entry.get("run")
+    if not isinstance(run, str) or len(run) > 255 or not RUN_ID.fullmatch(run):
+        raise PrimitiveError(f"the batch item run {run!r} is not a run id")
+    inputs = entry["inputs"]
+    value = inputs.get("programs")
+    if not isinstance(value, dict) or set(value) != {"programs"}:
+        raise PrimitiveError(f"the input named programs of run {run} is not programs")
+    given = value["programs"]
+    if not isinstance(given, dict) or not 0 < len(given) <= MAX_PROGRAMS:
+        raise PrimitiveError(
+            f"the input named programs of run {run} does not hold one to "
+            f"{MAX_PROGRAMS} programs"
+        )
+    programs = tuple(read_entry(root, name, each, run) for name, each in given.items())
+    links = read_links(inputs.get("links", []), {each.name for each in programs}, run)
+    item = ProgramsItem(run=run, number=number, programs=programs, links=links)
+    named = pipe_names(item)
+    for program in programs:
+        clash = sorted(program.files.keys() & set(named[program.name]))
+        if clash:
+            raise PrimitiveError(
+                f"the program {program.name} of run {run} has a named file "
+                f"{clash[0]}, the name of one of its pipes"
+            )
+    return item
+
+
+def read_entry(root: Path, name: object, inputs: object, run: str) -> Entry:
+    """Check one program of run `run`, `name`, and return it."""
+    if not isinstance(name, str) or not PROGRAM_NAME.fullmatch(name):
+        raise PrimitiveError(f"the run {run} names a program {name!r}, not a name")
+    if name == WALL_CLOCK:
+        raise PrimitiveError(
+            f"the run {run} names a program {WALL_CLOCK}, what stopped_by says "
+            "of the wall clock"
+        )
+    if not isinstance(inputs, dict):
+        raise PrimitiveError(f"the program {name} of run {run} has no inputs object")
+    what = f"program {name} of run {run}"
+    manifest = None
+    if "manifest" in inputs:
+        manifest = read_manifest(
+            programs_input_file(root, inputs, "manifest", what),
+            f"the input named manifest of {what}",
+            PROGRAMS_OWN_NAMES,
+        )
+    stops_others = inputs.get("stops_others", False)
+    if not isinstance(stops_others, bool):
+        raise PrimitiveError(
+            f"the input named stops_others of {what} is not true or false"
+        )
+    files = programs_named_files(root, inputs, "files", what)
+    entry = Entry(
+        name=name,
+        program=programs_input_file(root, inputs, "program", what),
+        time_limit=programs_positive_number(inputs, "time_limit", what),
+        memory_limit=programs_positive_number(inputs, "memory_limit", what),
+        args=programs_arguments(inputs, what),
+        files=files,
+        manifest=manifest,
+        stops_others=stops_others,
+        cached=cached_folder(
+            root,
+            [
+                *(
+                    programs_input_file(root, inputs, n, what)
+                    for n in PROGRAMS_GIVEN
+                    if n in inputs
+                ),
+                *files.values(),
+            ],
+            f"the {what}",
+        ),
+    )
+    # isolate reads a limit of 0 as none, and takes the time in whole
+    # milliseconds and the memory in whole kilobytes.
+    if entry.time_limit < 0.001:
+        raise PrimitiveError(
+            f"the input named time_limit of {what} is under a millisecond, "
+            "which isolate would read as no limit"
+        )
+    if entry.memory_limit_kb == 0:
+        raise PrimitiveError(
+            f"the input named memory_limit of {what} is under a kilobyte, "
+            "which isolate would read as no limit"
+        )
+    return entry
+
+
+def read_links(value: object, names: set[str], run: str) -> tuple[Link, ...]:
+    """Read `links`, a list of `"<writer> -> <reader>"`, each between two
+    programs of the run and given once. Absent, there are none."""
+    what = f"the input named links of run {run}"
+    if not isinstance(value, list):
+        raise PrimitiveError(f"{what} is not a list of links")
+    links: list[Link] = []
+    for text in value:
+        matched = LINK.fullmatch(text) if isinstance(text, str) else None
+        if matched is None:
+            raise PrimitiveError(f"{what} holds {text!r}, not <from> -> <to>")
+        link = Link(matched.group(1), matched.group(2))
+        for name in (link.writer, link.reader):
+            if name not in names:
+                raise PrimitiveError(f"{what} links {name}, not one of its programs")
+        if link.writer == link.reader:
+            raise PrimitiveError(f"{what} links {link.writer} to itself")
+        if link in links:
+            raise PrimitiveError(f"{what} gives {text} twice")
+        links.append(link)
+    return tuple(links)
+
+
+def pipe_names(item: ProgramsItem) -> dict[str, list[str]]:
+    """The named pipes in each program's working directory: for each link
+    after a program's first out, `to_<reader>`, and after its first in,
+    `from_<writer>`, in the order the links are given."""
+    names: dict[str, list[str]] = {entry.name: [] for entry in item.programs}
+    writes: set[str] = set()
+    reads: set[str] = set()
+    for link in item.links:
+        if link.writer in writes:
+            names[link.writer].append(f"to_{link.reader}")
+        writes.add(link.writer)
+        if link.reader in reads:
+            names[link.reader].append(f"from_{link.writer}")
+        reads.add(link.reader)
+    return names
+
+
+def programs_input_file(
+    root: Path, inputs: dict[str, object], name: str, what: str
+) -> Path:
+    """Resolve a file input of `what`, a program, to a path, refusing
+    anything outside `in/`."""
+    return in_file(root, inputs.get(name), f"the input named {name} of {what}")
+
+
+def programs_named_files(
+    root: Path, inputs: dict[str, object], name: str, what: str
+) -> dict[str, Path]:
+    """Read a `named_files` input of `what`, `{"files": {<name>: {"file":
+    "in/..."}}}`, as each name and its path under `in/`. Absent, there are
+    none.
+    """
+    if name not in inputs:
+        return {}
+    value = inputs[name]
+    what = f"the input named {name} of {what}"
+    if not isinstance(value, dict) or set(value) != {"files"}:
+        raise PrimitiveError(f"{what} is not named files")
+    files = value["files"]
+    if not isinstance(files, dict):
+        raise PrimitiveError(f"{what} is not named files")
+    found = {}
+    for file_name, file in files.items():
+        if len(file_name) > 255 or not FILE_NAME.fullmatch(file_name):
+            raise PrimitiveError(f"{what} names a file {file_name!r}, not a plain name")
+        found[file_name] = in_file(root, file, f"the file {file_name} of {what}")
+    return found
+
+
+def programs_positive_number(inputs: dict[str, object], name: str, what: str) -> float:
+    """Read a number input of `what` that must be above zero."""
+    value = inputs.get(name)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not 0 < value < math.inf
+    ):
+        raise PrimitiveError(
+            f"the input named {name} of {what} is not a positive number"
+        )
+    return float(value)
+
+
+def programs_arguments(inputs: dict[str, object], what: str) -> tuple[str, ...]:
+    """Read `args`, the optional text appended to the program's command line,
+    split on spaces: a run of spaces separates two arguments, and spaces at
+    either end separate nothing. There is no quoting, so no argument holds a
+    space. Absent, the program gets no arguments.
+    """
+    value = inputs.get("args")
+    if value is None:
+        return ()
+    if not isinstance(value, str):
+        raise PrimitiveError(f"the input named args of {what} is not text")
+    return tuple(part for part in value.split(" ") if part)
+
+
+def programs_run_batch(
+    root: Path, items: list[ProgramsItem]
+) -> list[dict[str, object]]:
+    """Check the step's memory holds each item's boxes side by side
+    (`check_memory`), set the step up for its boxes, capped at that memory
+    (`step_memory_kb`), then run the items one after another, in the order
+    given, each in a fresh set of boxes with fresh copies of its programs,
+    and return one outputs entry per item.
+
+    isolate's meta files and its own standard error, and the named pipes, go
+    in a folder of interact's in the container's `/tmp`, which no box sees
+    but for its own folder of pipes.
+    """
+    users = box_users()
+    most = max((len(item.programs) for item in items), default=0)
+    if most > len(users):
+        raise PrimitiveError(
+            f"a run has {most} programs, and {BOX_USERS_VARIABLE} gives "
+            f"{len(users)} box users, one for each"
+        )
+    memory_kb = step_memory_kb()
+    for item in items:
+        needed = sum(programs_box_size_kb(entry) for entry in item.programs)
+        check_memory(needed, memory_kb, item.run)
+    set_up_step(users, memory_kb)
+    scratch = Path(tempfile.mkdtemp(prefix="interact-"))
+    kinds: dict[Path, str] = {}
+    results: list[dict[str, object]] = []
+    try:
+        for item in items:
+            for entry in item.programs:
+                if entry.program not in kinds:
+                    kinds[entry.program] = programs_detect(entry.program)
+            outputs = run_programs(root, item, kinds, scratch, users)
+            results.append({"run": item.run, "outputs": outputs})
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return results
+
+
+def programs_detect(program: Path) -> str:
+    """Tell which of the three program formats a file is.
+
+    `native` is an ELF executable, `python` a zip application with a
+    `__main__.py`, `java` a jar with a manifest.
+    """
+    with program.open("rb") as stream:
+        if stream.read(4) == ELF_MAGIC:
+            return "native"
+    if zipfile.is_zipfile(program):
+        with zipfile.ZipFile(program) as archive:
+            names = set(archive.namelist())
+        if "__main__.py" in names:
+            return "python"
+        if "META-INF/MANIFEST.MF" in names:
+            return "java"
+    raise PrimitiveError(
+        "a program is not a native executable, a Python zip application or a Java jar"
+    )
+
+
+def run_programs(
+    root: Path, item: ProgramsItem, kinds: dict[Path, str], scratch: Path, users: range
+) -> dict[str, object]:
+    """Run one item's programs side by side, each in a fresh box, and return
+    its outputs: each program's facts as `<name>.<fact>`, the reports of
+    each given a manifest whose verdict is `0` as `<name>.<report>`, the
+    facts of all as the file `facts`, and the outcome, `accepted`.
+
+    Each box's folder is a tmpfs of its own, laid out as exec's: `/box/program`,
+    the copy of the program, `/box/run`, its working directory, holding its
+    named files and the links to its named pipes, `/box/tmp` and `/box/shm`,
+    and for a program given a manifest `/box/report`, read before the tmpfs
+    goes. Every box is made and filled before the first program starts.
+    """
+    out = root / "out" / str(item.number)
+    out.mkdir(parents=True, exist_ok=True)
+    pipes = scratch / "pipes" / str(item.number)
+    named = pipe_names(item)
+    with contextlib.ExitStack() as stack:
+        running: list[Running] = []
+        programs: list[ProgramsProgram] = []
+        for number, entry in enumerate(item.programs):
+            box = stack.enter_context(fresh_box(number, programs_box_size_kb(entry)))
+            each = Running(
+                entry=entry,
+                number=number,
+                kind=kinds[entry.program],
+                box=box,
+                meta=scratch / f"meta-{number}",
+                errors=scratch / f"errors-{number}",
+            )
+            programs.append(programs_prepare(entry, each.kind, box))
+            place_files(box / "run", entry.files, entry.cached)
+            for name in named[entry.name]:
+                (box / "run" / name).symlink_to(f"{PIPES}/{name}")
+            for name in BOX_FOLDERS:
+                (box / name).mkdir()
+                (box / name).chmod(0o1777)
+            if entry.manifest is not None:
+                (box / "report").mkdir()
+            each.events_fd = os.open(
+                BOX_CGROUPS / f"box-{number}" / "cgroup.events", os.O_RDONLY
+            )
+            stack.callback(os.close, each.events_fd)
+            populated(each.events_fd)
+            each.meta.unlink(missing_ok=True)
+            running.append(each)
+        stack.callback(shutil.rmtree, pipes, True)
+        make_links(item, running, pipes, users, stack)
+        started = time.monotonic()
+        for each, program in zip(running, programs, strict=True):
+            each.keeper = start(each, program, pipes, stack)
+        watch(running, started)
+        facts = {each.entry.name: program_facts(each, item) for each in running}
+    programs_write_json(out / "facts.json", facts)
+    outputs: dict[str, object] = {}
+    for name, found in facts.items():
+        outputs |= {f"{name}.{fact}": found[fact] for fact in FACTS if fact in found}
+        if found.get("verdict") == "0":
+            reports = found.get("reports", {})
+            assert isinstance(reports, dict)
+            outputs |= {f"{name}.{report}": value for report, value in reports.items()}
+    outputs["facts"] = {"file": f"out/{item.number}/facts.json"}
+    outputs["outcome"] = "accepted"
+    return outputs
+
+
+def make_links(
+    item: ProgramsItem,
+    running: list[Running],
+    pipes: Path,
+    users: range,
+    stack: contextlib.ExitStack,
+) -> None:
+    """Make each link before any box starts and give each program its ends,
+    closed with `stack`.
+
+    A program's first link out is handed to it as its standard output, and
+    its first in as its standard input; any other end is opened through a
+    named pipe in the program's folder under `pipes`, which its box sees as
+    `PIPES`. A link that is a standard stream at both ends is an anonymous
+    pipe (`os.pipe`), owned by root, which no box can reopen by a path; a
+    link that is a named pipe at either end is a FIFO, owned by the writing
+    program's box user and in the reading program's group (`PIPE_MODE`), box
+    `n`'s user being the `n`th, so each box can open its own end by its path
+    and neither can open it the other way. Every end opened here is also the
+    program's stand-in, kept after the program has its own.
+    """
+    by_name = {each.entry.name: each for each in running}
+    for each in running:
+        (pipes / each.entry.name).mkdir(mode=0o755, parents=True)
+    for number, link in enumerate(item.links):
+        writer, reader = by_name[link.writer], by_name[link.reader]
+        as_stdout = writer.ends.stdout is None
+        as_stdin = reader.ends.stdin is None
+        if as_stdout and as_stdin:
+            reading, writing = os.pipe()
+            os.set_blocking(reading, True)
+        else:
+            reading, writing = fifo_link(
+                link,
+                number,
+                writer.number,
+                reader.number,
+                as_stdout,
+                as_stdin,
+                pipes,
+                users,
+            )
+        stack.callback(close_quietly, reading)
+        stack.callback(close_quietly, writing)
+        writer.ends.stand_ins.append(writing)
+        if as_stdout:
+            writer.ends.stdout = writing
+        else:
+            writer.ends.named.append(f"to_{link.reader}")
+        reader.ends.stand_ins.append(reading)
+        if as_stdin:
+            reader.ends.stdin = reading
+        else:
+            reader.ends.named.append(f"from_{link.writer}")
+
+
+def fifo_link(
+    link: Link,
+    number: int,
+    writer_box: int,
+    reader_box: int,
+    as_stdout: bool,
+    as_stdin: bool,
+    pipes: Path,
+    users: range,
+) -> tuple[int, int]:
+    """One link that is a named pipe at an end: a FIFO owned by the writing
+    program's box user and in the reading program's group, hard-linked into
+    each program's folder under the name its box opens it by, when that end
+    is a named pipe and not a standard stream. It is opened here for the
+    stand-in, the reading end first so the writing end does not wait for a
+    reader. Returns the reading and writing descriptors."""
+    fifo = pipes / f"link-{number}"
+    os.mkfifo(fifo, 0o600)
+    os.chown(fifo, users[writer_box], users[reader_box])
+    fifo.chmod(PIPE_MODE)
+    reading = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    writing = os.open(fifo, os.O_WRONLY)
+    os.set_blocking(reading, True)
+    if not as_stdout:
+        os.link(fifo, pipes / link.writer / f"to_{link.reader}")
+    if not as_stdin:
+        os.link(fifo, pipes / link.reader / f"from_{link.writer}")
+    fifo.unlink()
+    return reading, writing
+
+
+def close_quietly(descriptor: int) -> None:
+    """Close a descriptor that may be closed already."""
+    with contextlib.suppress(OSError):
+        os.close(descriptor)
+
+
+def programs_box_size_kb(entry: Entry) -> int:
+    """The size of a program's box tmpfs, in kilobytes: its memory limit,
+    which holds what the program writes there before the size does, as every
+    page it writes is charged to the box's memory, plus the program and the
+    named files interact copies in, each to whole 4 KB pages. A cached named
+    file is not copied but bound in."""
+    named = entry.files.values()
+    copied = [entry.program, *(path for path in named if path.parent != entry.cached)]
+    return entry.memory_limit_kb + sum(
+        4 * -(-path.stat().st_size // 4096) for path in copied
+    )
+
+
+def programs_prepare(entry: Entry, kind: str, box: Path) -> ProgramsProgram:
+    """Copy the program, of format `kind`, into its box, before its clock
+    starts, executable for a native executable, since the file under `in/`
+    may not be, and readable for the others.
+
+    The program is the copy's owner while it runs, so it may change its
+    mode, times or attributes; the copy goes with the box.
+    """
+    try:
+        shutil.copyfile(entry.program, box / "program")
+    except OSError as error:
+        raise PrimitiveError(
+            f"the program {entry.name} could not be copied: {error.strerror}"
+        ) from error
+    (box / "program").chmod(0o755 if kind == "native" else 0o644)
+    return ProgramsProgram(kind, Path("/box/program"))
+
+
+def start(
+    each: Running, program: ProgramsProgram, pipes: Path, stack: contextlib.ExitStack
+) -> subprocess.Popen[bytes] | None:
+    """Start one program in its box, already made and filled, and return
+    the isolate that keeps it, or None when it could not start.
+
+    The isolate command line is exec's (`isolate_command`), for box
+    `each.number`, with the program's folder of named pipes bound read-only
+    as `PIPES`, the item folder of the step's cache its cached named files
+    are in, if any, bound read-only as `CACHE_MOUNT` (`cache_binding`), and
+    isolate's `--special-files`, which keeps the links to both in the
+    working directory where isolate would remove them. The
+    folder is in the container's `/tmp`, which a step may mount `noexec`,
+    as Docker mounts a tmpfs; in a user namespace that flag cannot be taken
+    away, so the folder is bound `noexec` too, or isolate could not bind
+    it. Standard input and
+    output are the program's first links, handed over, interact keeping its
+    own end of each as a stand-in (`Ends`); standard input is
+    `/dev/null` without one, and standard output without one is read and
+    thrown away up to `OUTPUT_LIMIT` and one byte more, as exec reads it.
+    Standard error goes nowhere.
+
+    An argument holding a NUL character and a command line too long for the
+    kernel are a program that could not start, as under exec.
+    """
+    entry = each.entry
+    stdin, stdout = each.ends.stdin, each.ends.stdout
+    bound = f"--dir={PIPES.lstrip('/')}={pipes / entry.name}:noexec"
+    command = isolate_command(
+        each.number,
+        each.meta,
+        cast(Item, entry),
+        entry.manifest is not None,
+        [bound, *cache_binding(entry.cached), "--special-files"],
+        program.command(entry),
+    )
+    if any("\0" in argument for argument in entry.args):
+        return None
+    try:
+        with each.errors.open("wb") as stderr:
+            keeper = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL if stdin is None else stdin,
+                stdout=subprocess.PIPE if stdout is None else stdout,
+                stderr=stderr,
+            )
+    except OSError as error:
+        if error.errno in REFUSED_ARGUMENTS:
+            return None
+        raise PrimitiveError(
+            f"isolate could not be started: {error.strerror}"
+        ) from None
+    stack.callback(stop_quietly, keeper)
+    if keeper.stdout is not None:
+        each.reader = threading.Thread(
+            target=throw_away, args=(keeper.stdout, each.printed), daemon=True
+        )
+        each.reader.start()
+    return keeper
+
+
+def throw_away(source: IO[bytes], printed: list[int]) -> None:
+    """Read a program's unlinked standard output into nothing, as exec reads
+    a run's, and keep in `printed` how many bytes it gave."""
+    with source, Path(os.devnull).open("wb") as nowhere:
+        printed[0] = pump(source.fileno(), nowhere, OUTPUT_LIMIT)
+
+
+def stop_quietly(keeper: subprocess.Popen[bytes]) -> None:
+    """Kill an isolate still running while an error ends the batch, and
+    reap it; the box's clean-up kills what it kept."""
+    if keeper.poll() is None:
+        keeper.kill()
+        keeper.wait()
+
+
+def watch(running: list[Running], started: float) -> None:
+    """Wait for every program to end.
+
+    Each program's ending time is when its box's cgroup empties after it
+    was seen holding a process, which `cgroup.events` tells, or failing
+    that when its isolate exits, in milliseconds from `started`, taken just
+    before the first program was started. The programs that end at one wake
+    are given the same time, and each wake a time at least 1 ms after the
+    one before, so a program that ended because another's end was let go,
+    which is always at a later wake, is always later, though both fell in
+    one millisecond. Each `cgroup.events` was read once as it was opened,
+    so it wakes a poll only on a change. When an isolate exits, its program's
+    run is read (`reap`), and if it is the first to end over a limit of its
+    own (`OVER_LIMIT`), or to end at all with `stops_others`, and nothing
+    stopped it, every program still running is stopped, `stopped_by` it
+    once isolate says it stopped it. Only then are its stand-ins closed, so
+    the others see it gone; a stopper's are held until every program has
+    ended, so none it stopped sees it gone first.
+    """
+    poller = select.poll()
+    owners: dict[int, Running] = {}
+    for each in running:
+        if each.keeper is None:
+            each.run = ProgramsRun("RE", 127, 0.0, 0, 0)
+            each.ended_at = 0
+            continue
+        each.keeper_fd = os.pidfd_open(each.keeper.pid)
+        assert each.events_fd is not None
+        poller.register(each.keeper_fd, select.POLLIN)
+        poller.register(each.events_fd, select.POLLPRI)
+        owners[each.keeper_fd] = owners[each.events_fd] = each
+    stopper = None
+    held: list[int] = []
+    now = -1
+    for each in running:
+        if each.run is not None:
+            stopper = let_go(each, running, stopper, held)
+    while owners:
+        ready = poller.poll()
+        now = max(round((time.monotonic() - started) * 1000), now + 1)
+        for descriptor, _ in ready:
+            owner = owners.get(descriptor)
+            if owner is None:
+                continue
+            each = owner
+            if descriptor == each.events_fd:
+                if populated(descriptor):
+                    each.seen = True
+                elif each.seen and each.ended_at is None:
+                    each.ended_at = now
+                continue
+            reap(each)
+            for done in (each.keeper_fd, each.events_fd):
+                assert done is not None
+                poller.unregister(done)
+                del owners[done]
+            os.close(descriptor)
+            if each.ended_at is None:
+                each.ended_at = now
+            stopper = let_go(each, running, stopper, held)
+    for stand_in in held:
+        close_quietly(stand_in)
+
+
+def let_go(
+    each: Running, running: list[Running], stopper: str | None, held: list[int]
+) -> str | None:
+    """Once a program has ended, stop the others if it is the first whose
+    ending stops them, then close its stand-ins, or put them in `held` when
+    it stopped the others; return the stopper, if any."""
+    if stopper is None and stops(each):
+        stopper = stop_others(each, running)
+        held.extend(each.ends.stand_ins)
+    else:
+        for stand_in in each.ends.stand_ins:
+            close_quietly(stand_in)
+    return stopper
+
+
+def populated(descriptor: int) -> bool:
+    """Whether a box's cgroup holds a process, from its `cgroup.events`,
+    read again from the start, which also readies it to wake the next
+    poll."""
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    lines = os.read(descriptor, 4096).decode().splitlines()
+    return "populated 1" in lines
+
+
+def stops(each: Running) -> bool:
+    """Whether a program that ended stops the others: it was not stopped
+    itself, and it ended over a limit of its own or has `stops_others`."""
+    assert each.run is not None
+    if each.run.interrupted:
+        return False
+    over = judge(cast(Run, each.run), cast(Item, each.entry), each.kind) in OVER_LIMIT
+    return over or each.entry.stops_others
+
+
+def stop_others(each: Running, running: list[Running]) -> str:
+    """Stop every program still running for `each`, by asking its isolate,
+    which stops the box and says so in its meta file, and return the
+    stopper's name."""
+    for other in running:
+        if other.run is None and other.keeper is not None:
+            other.stopped_by = each.entry.name
+            other.keeper.send_signal(signal.SIGTERM)
+    return each.entry.name
+
+
+def reap(each: Running) -> None:
+    """Read what one program did once its isolate has exited, its box still
+    there. Its `stopped_by` stands where isolate says it stopped it, and is
+    the wall clock where that stopped it."""
+    assert each.keeper is not None
+    code = each.keeper.wait()
+    if each.reader is not None:
+        each.reader.join()
+    run = finish(each, code)
+    each.run = replace(run, no_inodes=os.statvfs(each.box).f_ffree == 0)
+    if not each.run.interrupted:
+        each.stopped_by = WALL_CLOCK if each.run.wall_clock else None
+
+
+def finish(each: Running, code: int) -> ProgramsRun:
+    """What a program did, from its isolate's exit `code` and meta file, as
+    exec reads them. An isolate stopped before it could take a stop as one,
+    which kills it before its box is made, is a program stopped before it
+    ran. isolate failing itself (`XX`) is an error of the step.
+    """
+    found = read_meta(each.meta)
+    status = found.get("status", "")
+    asked = each.stopped_by is not None
+    if asked and code == -signal.SIGTERM and not found:
+        return ProgramsRun("SG", -signal.SIGKILL, 0.0, 0, 0, interrupted=True)
+    if code not in (0, 1) or status == "XX":
+        said = found.get("message") or each.errors.read_bytes()
+        raise PrimitiveError(
+            f"isolate could not run the program {each.entry.name}: "
+            f"{isolate_said(code, said)}"
+        )
+    interrupted = asked and found.get("message") == INTERRUPTED
+    if interrupted:
+        returncode = -signal.SIGKILL
+    elif "exitcode" in found:
+        returncode = int(found["exitcode"])
+    elif "exitsig" in found:
+        returncode = -int(found["exitsig"])
+    else:
+        returncode = 0 if status == "" else -9
+    return ProgramsRun(
+        status=status,
+        returncode=returncode,
+        cpu_seconds=float(found.get("time", "0")),
+        memory_kb=int(found.get("cg-mem", "0")),
+        output_bytes=each.printed[0],
+        out_of_memory=found.get("cg-oom-killed") == "1",
+        interrupted=interrupted,
+        wall_clock=status == "TO" and found.get("message") == WALL_CLOCK_MESSAGE,
+    )
+
+
+def program_facts(each: Running, item: ProgramsItem) -> dict[str, object]:
+    """One program's facts, its box still there: its time and memory, how it
+    ended, `finished` for a clean exit and otherwise its outcome as exec
+    judges a run, the signal that ended it, when it ended and what stopped
+    it; and for a program given a manifest, its report.
+
+    The report is read as exec reads one, however the program ended, so a
+    verdict written before it was stopped stands: its `verdict` as written,
+    its texts, its `reports` on a verdict of `0`, and every other file as
+    `extras`. A program that finished with a report that does not hold did
+    not judge, an error of the step, as under exec; one that did not finish
+    has its report if it holds, and none if not.
+    """
+    assert each.run is not None and each.ended_at is not None
+    run, entry = each.run, each.entry
+    outcome = judge(cast(Run, run), cast(Item, entry), each.kind)
+    time_ms = round(run.cpu_seconds * 1000)
+    if outcome == "time_limit":
+        time_ms = max(time_ms, entry.time_limit_ms)
+    facts: dict[str, object] = {
+        "time_ms": time_ms,
+        "memory_kb": run.memory_kb,
+        "ended": "finished" if outcome == "accepted" else outcome,
+    }
+    if run.returncode < 0:
+        facts["signal"] = signal_name(-run.returncode)
+    facts["ended_at"] = each.ended_at
+    if each.stopped_by is not None:
+        facts["stopped_by"] = each.stopped_by
+    if entry.manifest is None:
+        return facts
+    try:
+        report = read_report(each.box / "report", entry.manifest)
+    except ReportError as fault:
+        if outcome == "accepted":
+            raise PrimitiveError(
+                f"the report of program {entry.name} of run {item.run} {fault}"
+            ) from None
+        return facts
+    facts["verdict"] = report.verdict
+    facts |= {name: report.outputs[name] for name in TEXTS if name in report.outputs}
+    reports = {
+        name: value for name, value in report.outputs.items() if name not in TEXTS
+    }
+    if reports:
+        facts["reports"] = reports
+    if report.shown:
+        facts["extras"] = {
+            name: content.decode() for name, content in report.shown.items()
+        }
+    return facts
+
+
+def signal_name(number: int) -> str:
+    """A signal's name, such as `SIGPIPE`."""
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return f"signal {number}"
+
+
+def programs_write_json(path: Path, document: Mapping[str, object]) -> None:
     """Write a JSON file whole: to a temporary name first, then renamed. The
     temporary file is made afresh, never opened through a link a run left.
     """

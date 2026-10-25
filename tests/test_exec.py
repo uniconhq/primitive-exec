@@ -1808,6 +1808,7 @@ def cached_work(tmp_path: Path, binary: bytes, stdin: str) -> Path:
 def test_a_cached_file_is_read_through_the_steps_cache_link(tmp_path: Path) -> None:
     work = cached_work(tmp_path, b"\x7fELF", "")
     item = primitive.read_inputs(work)[0]
+    assert isinstance(item, primitive.Item)
     found = (tmp_path / "cache" / "items" / "step-k2" / "Wq81").resolve()
     assert item.files == {"train.csv": found / "train.csv"}
     assert item.cached == found
@@ -1885,7 +1886,9 @@ def test_a_cached_stdin_may_share_the_runs_item_folder(tmp_path: Path) -> None:
     document = json.loads((work / "inputs.json").read_text())
     document["batch"][0]["inputs"]["stdin"] = {"file": "cache/Wq81/input"}
     (work / "inputs.json").write_text(json.dumps(document))
-    assert primitive.read_inputs(work)[0].cached == item.resolve()
+    read = primitive.read_inputs(work)[0]
+    assert isinstance(read, primitive.Item)
+    assert read.cached == item.resolve()
 
 
 def test_a_cached_file_is_placed_as_a_link_into_the_bound_folder(

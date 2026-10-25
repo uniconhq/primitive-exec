@@ -50,7 +50,7 @@ from support import (
     step_flags,
 )
 
-collect_ignore = [] if sys.platform == "linux" else ["test_exec.py"]
+collect_ignore = [] if sys.platform == "linux" else ["test_exec.py", "test_programs.py"]
 
 
 @pytest.fixture(scope="session")
@@ -257,5 +257,46 @@ def check(schema: dict[str, Any]) -> Check:
             entries = [document["outputs"]]
         for outputs in entries:
             assert required <= set(outputs) <= set(declared) | reports, outputs
+
+    return validate
+
+
+@pytest.fixture
+def programs_check(schema: dict[str, Any]) -> Check:
+    """Validate a document against one part of the contract.
+
+    For `outputs_file`, every entry must also carry `facts`, `outcome` and,
+    for each program named in `programs`, each fact the several-programs
+    form names as required, and nothing else but the optional facts and
+    that program's `reports`, as `<name>.<report>`.
+    """
+    registry: Registry[Any] = Registry().with_resource(
+        schema["$id"], Resource.from_contents(schema)
+    )
+
+    def validate(
+        document: dict[str, Any],
+        part: str,
+        programs: dict[str, frozenset[str]] | None = None,
+    ) -> None:
+        reference = {"$ref": f"{schema['$id']}#/$defs/{part}"}
+        Draft202012Validator(reference, registry=registry).validate(document)
+        if part != "outputs_file" or "error" in document:
+            return
+        declared = declaration("programs")
+        facts = declared["inputs"]["programs"]["outputs"]
+        required = {name for name, port in facts.items() if not port.get("optional")}
+        for entry in document["batch"]:
+            outputs = entry["outputs"]
+            assert set(declared["outputs"]) == {
+                name for name in outputs if "." not in name
+            }, outputs
+            for name, reports in (programs or {}).items():
+                given = {
+                    key.partition(".")[2]
+                    for key in outputs
+                    if key.partition(".")[0] == name
+                }
+                assert required <= given <= set(facts) | reports, outputs
 
     return validate

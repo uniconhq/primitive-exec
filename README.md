@@ -1,12 +1,16 @@
 # primitive-exec
 
-The `unicon/exec` primitive, at the forge `unicon/exec@v1`: it runs one
-program under limits, feeding it a file on standard input if given and any
-arguments on its command line, and reports what the program printed, the CPU
-time and memory it used, and an outcome. It is what runs code in the
-simpler core's workflows: an entrant's program in `unicon/classic@v3`, and
-an organiser's checker or the diff script after it. It replaces
-`unicon/sandbox-run@v2`, which stays for the workflow versions that use it.
+The `unicon/exec` primitive, at the forge `unicon/exec@v1`: it runs programs
+under limits. A batch item that gives `program` runs that one program,
+feeding it a file on standard input if given and any arguments on its
+command line, and reports what the program printed, the CPU time and memory
+it used, and an outcome. A batch item that gives `programs` runs up to 8
+named programs at once, each in a box of its own under limits of its own,
+linked by pipes, and reports how each ended. It is what runs code in the
+simpler core's workflows: an entrant's program in `unicon/classic@v3`, an
+organiser's checker or the diff script after it, and the entrant and judge
+of `unicon/interactive@v1`. It replaces `unicon/sandbox-run@v2`, which stays
+for the workflow versions that use it.
 
 This repo holds the image, `ghcr.io/uniconhq/primitive-exec`, built from the
 `Dockerfile`, with [isolate](https://github.com/ioi/isolate) 2.7 built into
@@ -17,9 +21,33 @@ forge compiler reads to type-check a workflow that uses the primitive. exec
 speaks the primitive contract, `primitive.schema.json` version 6, published
 by the [runner](https://github.com/uniconhq/runner).
 
-## What it takes and returns
+## Several programs
 
-The primitive takes a batch (`batch: true`): one container runs many runs of
+The `programs` form. A batch item gives `programs`, one to eight named
+programs, and optional `links`, each `"<from> -> <to>"`. The programs of
+one item run at once, each in its own box; items still run one at a time,
+in the order given. The primitive judges nothing: a later step reads
+`facts` and decides the run.
+
+Each program takes `program`, `time_limit` and `memory_limit`, and
+optionally `files`, `args`, `manifest` and `stops_others`. A name is a
+lowercase word of at most 64 characters, and not `wall_clock`. Each
+program's facts are outputs named `<name>.time_ms`, `<name>.memory_kb`,
+`<name>.ended`, and optionally `<name>.signal`, `<name>.ended_at` and
+`<name>.stopped_by`. A program given a manifest also reports as the one
+form's program does, under `<name>.<report>` when its verdict is `0`.
+`facts` is `out/<n>/facts.json`, every program's facts by name. `outcome`
+is `accepted` when every program was started and measured.
+
+A link is a pipe made before any box starts. A program's first link out is
+its standard output and its first link in its standard input; without one,
+standard input is `/dev/null` and standard output is read and thrown away,
+up to 32 MB. Each further link is a named file, `<other>` in its working
+directory, opened for it.
+
+## One program
+
+The `one` form. The primitive takes a batch (`batch: true`): one container runs many runs of
 one step, so a hundred runs cost one container start rather than a hundred.
 Each item of the batch is keyed by its run, an id of letters, digits, `_` and
 `-` that only the forge knows the meaning of, and `outputs.json` answers in
@@ -472,8 +500,8 @@ within 10,000 to 65,000. Whoever starts the step sets it, from the step's
 job. They must be users no other step that can run at the same time on the
 machine has, and no container's user, since the process limit and the
 keyrings are per user. exec runs one box at a time and so uses the first;
-it takes a range so that a step that runs boxes side by side, as
-`interact` does, is given its users the same way. Without it, or with a
+it takes a range so that the `programs` form, which runs boxes side by
+side, is given its users the same way. Without it, or with a
 range out of bounds, exec does not start.
 
 **The step's memory** is `UNICON_STEP_MEMORY_MB`, a whole number of MB,
@@ -483,16 +511,6 @@ limit and the files copied in beside it, with the 256 MB `primitive.yaml`
 adds for the step wrapper, exec and isolate, so it holds the cleanup of a
 tree as deep as a box's inodes go. exec does not work the figure out
 again: the planner's is the one rule. Without it, exec does not start.
-
-**Its twin.** `primitive-interact`'s `src/interact.py` holds a copy of this
-box handling under the same names: the step's set-up, the box, the isolate
-command line, the report and `judge`, and the box launcher,
-`src/box-launch.c`, byte for byte. A change to one is made to the other,
-with the image's isolate stage. `tests/test_twin.py`, the same in both
-repos, checks the shared functions and the launcher against a hash both
-pin in `tests/twin.sha256`, and against interact's when a checkout of it is
-beside this one. The pin shows a change was meant for both; only the
-second check shows both have it.
 
 **The machine** needs cgroup v2 with the CPU and memory controllers, and
 the container a cgroup namespace of its own, Docker's default on cgroup v2.
@@ -572,7 +590,6 @@ src/exec.py                 exec, installed as /usr/local/bin/exec, the image's 
 src/box-launch.c            the box launcher, installed as /usr/local/bin/box-launch: the keyring and watch calls refused
 primitive.yaml              the declaration, without the image line
 tests/                      unit tests, and image tests that run it on Docker
-tests/test_twin.py          checks the functions interact copies against the hash in tests/twin.sha256
 tests/Dockerfile            the test container: the image with the tests' tools
 tests/userns.py             starts a command in a user namespace, for exec on root Docker
 ```
