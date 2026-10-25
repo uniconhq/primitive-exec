@@ -769,8 +769,8 @@ def test_a_connection_out_fails(run: Any, tmp_path: Path) -> None:
     """A box has a network namespace of its own with no way out, so a
     connection out fails though the container has a network;
     a Unix socket, which Java and Python use, works. io_uring and the
-    kernel's keyrings are refused, the keyrings by isolate's filter and our
-    patch to it."""
+    kernel's keyrings are refused, io_uring and `keyctl` by isolate's
+    filter and the keyrings by the box launcher's."""
     outputs = by_run(run([("main-1", "sockets\n")]))
     assert outputs["main-1"]["outcome"] == "accepted"
     assert printed(tmp_path / "work", outputs["main-1"]).splitlines() == [
@@ -797,13 +797,35 @@ def test_a_key_one_run_adds_is_not_there_for_the_next(run: Any, tmp_path: Path) 
 
 def test_a_run_can_watch_no_file(run: Any, tmp_path: Path) -> None:
     """A cached file is one inode in every box that binds it, so a watch on
-    it would see another grading open it: our patch refuses inotify and
-    fanotify, as isolate refuses F_NOTIFY."""
+    it would see another grading open it: the box launcher's filter
+    refuses inotify and fanotify, as isolate refuses F_NOTIFY."""
     outputs = by_run(run([("main-1", "notify\n")]))
     assert printed(tmp_path / "work", outputs["main-1"]).splitlines() == [
         "inotify_init ENOSYS",
         "inotify_init1 ENOSYS",
         "fanotify_init ENOSYS",
+    ]
+
+
+def test_a_run_cannot_take_the_launchers_filter_off(run: Any, tmp_path: Path) -> None:
+    """The box launcher's filter is on beside isolate's, under
+    `no_new_privs`, with no capability. A run cannot clear `no_new_privs`,
+    and a filter it loads allowing every call is one more filter, so the
+    keyring and inotify calls stay refused, for it and for a process it
+    starts."""
+    outputs = by_run(run([("main-1", "filter\n")]))
+    assert outputs["main-1"]["outcome"] == "accepted"
+    assert printed(tmp_path / "work", outputs["main-1"]).splitlines() == [
+        "clear no_new_privs EINVAL",
+        "allow all done",
+        "add_key ENOSYS",
+        "inotify_init1 ENOSYS",
+        "child inotify_init1 ENOSYS",
+        "NoNewPrivs 1",
+        "Seccomp 2",
+        "Seccomp_filters 3",
+        "CapPrm 0000000000000000",
+        "CapEff 0000000000000000",
     ]
 
 
@@ -1125,6 +1147,36 @@ def test_a_step_that_cannot_be_set_up_runs_nothing(
     assert not (tmp_path / "work" / "out").exists()
 
 
+def test_the_box_launchers_self_test_passes_in_a_box(boxes: None) -> None:
+    primitive.set_up_step(primitive.box_users())
+    primitive.check_launcher()
+
+
+@pytest.mark.parametrize(
+    ("launcher", "told"),
+    [
+        ("/bin/false", "Exited with error status 1"),
+        ("/usr/bin/env", "--self-test"),
+    ],
+)
+def test_a_box_launcher_that_fails_its_self_test_stops_the_step(
+    run: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    launcher: str,
+    told: str,
+) -> None:
+    """A launcher that cannot set its filter up would end every run as a
+    runtime error, its message gone with the box's standard error: the
+    step fails instead, saying what the launcher said, and no run starts."""
+    monkeypatch.setattr(primitive, "LAUNCHER", launcher)
+    result = run([("main-ok", "double\n21\n")])
+    assert set(result) == {"schema_version", "error"}
+    assert result["error"].startswith("the box launcher's self-test failed")
+    assert told in result["error"]
+    assert not (tmp_path / "work" / "out").exists()
+
+
 def test_cleanup_that_fails_after_an_error_does_not_hide_it(
     boxes: None,
     tmp_path: Path,
@@ -1142,6 +1194,7 @@ def test_cleanup_that_fails_after_an_error_does_not_hide_it(
         python_binary(tmp_path / "p", "print(1)\n").read_bytes(),
         [("main-1", "")],
     )
+    monkeypatch.setattr(primitive, "check_launcher", lambda: None)
     monkeypatch.setattr(primitive, "execute", fail)
     monkeypatch.setattr(primitive, "close_box", fail_cleanup)
     assert primitive.main(["exec", str(tmp_path)]) == 0

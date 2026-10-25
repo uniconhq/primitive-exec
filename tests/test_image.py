@@ -458,8 +458,9 @@ def test_a_run_reaches_no_network_no_io_uring_and_no_keyring(
     """A box has a network namespace of its own, so a connection out fails
     though the step container has Docker's network, as a Woodpecker step
     does; a Unix socket, which Java and Python use, works. isolate's filter
-    refuses io_uring and `keyctl`, and our patch to it `add_key` and
-    `request_key`, with ENOSYS, so a run leaves no key for a later run."""
+    refuses io_uring and `keyctl`, and the box launcher's `add_key`,
+    `request_key` and `keyctl`, with ENOSYS, so a run leaves no key for a
+    later run."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     items = [("main-1", "sockets\n"), ("main-2", "find-key\n")]
@@ -947,11 +948,13 @@ def test_the_diff_script_compares_the_largest_output_in_little_memory(
 
 
 def test_on_root_docker_the_image_refuses_to_start(
-    tmp_path: Path, run_image: RunImage
+    tmp_path: Path, run_image: RunImage, rootless: bool
 ) -> None:
     """Started as its entrypoint is, privileged under root Docker, whose user
     ID map is the identity, the step would be the machine's own root: exec
     runs nothing and says why."""
+    if rootless:
+        pytest.skip("the daemon is rootless: there is no root Docker here")
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     batch_inputs(work, binary, [("main-1", "double\n21\n")])
@@ -996,17 +999,21 @@ def test_a_hard_limit_on_open_files_too_low_for_isolate_stops_the_step(
     assert "hard limit on open files, 1024" in result["error"]
 
 
-def test_the_in_process_tests_pass_in_the_test_container(image: str) -> None:
+def test_the_in_process_tests_pass_in_the_test_container(
+    image: str, rootless: bool
+) -> None:
     """`test_exec.py` in the test container built on the image, privileged,
-    as root through `userns.py`, where every test that runs programs makes
-    its boxes as a step does and none is skipped."""
+    as root through `userns.py`, or as it is on a rootless daemon, where
+    every test that runs programs makes its boxes as a step does and none
+    is skipped."""
     tag = f"{NAME}:test-container"
     build = ["docker", "build", "--quiet", "--tag", tag, "--build-arg"]
     build += [f"IMAGE={image}", "--file", str(ROOT / "tests" / "Dockerfile")]
     subprocess.run([*build, str(ROOT)], check=True, capture_output=True)
     command = ["docker", "run", "--rm", "--privileged"]
     command += [f"--env=UNICON_BOX_USERS={BOX_USERS}"]
-    command += ["--volume", f"{ROOT}:/src:ro", tag, "python3", "tests/userns.py"]
+    command += ["--volume", f"{ROOT}:/src:ro", tag]
+    command += [] if rootless else ["python3", "tests/userns.py"]
     command += ["pytest", "-p", "no:cacheprovider", "tests/test_exec.py"]
     done = subprocess.run(command, capture_output=True, text=True, timeout=1800)
     assert done.returncode == 0, done.stdout[-6000:] + done.stderr[-2000:]

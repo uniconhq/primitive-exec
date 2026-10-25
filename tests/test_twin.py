@@ -5,7 +5,9 @@ Each function in `SHARED` is compared as its syntax tree printed again,
 with its docstring left out, the parameter one names `item` and the other
 `entry` called `item` in both, and the primitive's own name in its texts,
 `exec` or `interact`, called `PRIMITIVE`, so only what they do is compared.
-Both repos pin the same hash of those functions in `tests/twin.sha256`, so
+The box launcher, `src/box-launch.c`, is kept byte for byte the same.
+Both repos pin the same hash of those functions and the launcher in
+`tests/twin.sha256`, so
 each checks its own copy wherever it runs, its CI included. The pin shows
 that a change was meant for both, not that both have it: a change to one
 passes once that one's pin is changed. With the other repo checked out
@@ -25,6 +27,8 @@ ROOT = Path(__file__).resolve().parent.parent
 OWN = ROOT / "src" / "exec.py"
 SIBLING = ROOT.parent / "primitive-interact" / "src" / "interact.py"
 PINNED = ROOT / "tests" / "twin.sha256"
+LAUNCHER = ROOT / "src" / "box-launch.c"
+SIBLING_LAUNCHER = ROOT.parent / "primitive-interact" / "src" / "box-launch.c"
 SHARED = (
     "in_file",
     "cached_folder",
@@ -34,6 +38,7 @@ SHARED = (
     "shown_bytes",
     "check_shape",
     "set_up_step",
+    "check_launcher",
     "box_users",
     "refuse_constant",
     "check_memory",
@@ -60,10 +65,11 @@ SHARED = (
 )
 """The functions exec and interact share. The others name a run or a
 program, and read differently in the two."""
-CONSTANTS = ("STEP_MEMORY_KB", "CACHE_MOUNT")
+CONSTANTS = ("STEP_MEMORY_KB", "CACHE_MOUNT", "LAUNCHER", "LAUNCHER_CHECK_KB")
 """The module constants exec and interact share, compared as their
 assignments: the room the step keeps beside the boxes, which the forge's
-planner keeps a copy of too, and where a box sees its cached files."""
+planner keeps a copy of too, where a box sees its cached files, where
+the image installs the box launcher, and the box its self-test runs in."""
 RENAMED = {"entry": "item", "Entry": "Item"}
 """interact's names for what exec calls an item, one program of an item."""
 PRIMITIVE = re.compile(r"\b(exec|interact)\b")
@@ -110,11 +116,11 @@ def shared(path: Path) -> dict[str, str]:
     return found
 
 
-def digest(functions: dict[str, str]) -> str:
+def digest(functions: dict[str, str], launcher: bytes) -> str:
     """The hash of the shared functions and constants, in `SHARED`'s order
-    and then `CONSTANTS`'."""
+    and then `CONSTANTS`', and then of the launcher's source."""
     joined = "\n\n".join(functions[name] for name in SHARED + CONSTANTS)
-    return hashlib.sha256(joined.encode()).hexdigest()
+    return hashlib.sha256(joined.encode() + b"\n\n" + launcher).hexdigest()
 
 
 def test_every_shared_function_is_here() -> None:
@@ -124,7 +130,7 @@ def test_every_shared_function_is_here() -> None:
 def test_the_shared_functions_are_the_pinned_ones() -> None:
     """A change to a shared function is made to both repos, and the new
     hash, this test's message, pinned in both."""
-    found = digest(shared(OWN))
+    found = digest(shared(OWN), LAUNCHER.read_bytes())
     assert found == PINNED.read_text().strip(), f"the shared functions are {found}"
 
 
@@ -133,5 +139,6 @@ def test_the_shared_functions_are_the_siblings() -> None:
     if not SIBLING.is_file():
         pytest.skip("no primitive-interact checkout beside this one")
     ours, theirs = shared(OWN), shared(SIBLING)
-    for name in SHARED:
+    for name in SHARED + CONSTANTS:
         assert ours[name] == theirs[name], name
+    assert LAUNCHER.read_bytes() == SIBLING_LAUNCHER.read_bytes(), "box-launch.c"

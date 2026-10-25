@@ -69,8 +69,17 @@ def image() -> str:
     return tag
 
 
+@pytest.fixture(scope="session")
+def rootless(image: str) -> bool:
+    """Whether the daemon is rootless Docker, where a step's root is
+    already a user namespace's, so exec starts as the image's entrypoint
+    starts it rather than through `USERNS`, and there is no root Docker to
+    refuse."""
+    return "rootless" in docker("info", "--format", "{{json .SecurityOptions}}")
+
+
 @pytest.fixture
-def run_image(image: str) -> RunImage:
+def run_image(image: str, rootless: bool) -> RunImage:
     """Run the image once over a working directory and return its outputs.json.
 
     The directory is copied into a Docker volume, run there and copied back,
@@ -88,8 +97,9 @@ def run_image(image: str) -> RunImage:
         """Run the batch in `work`; `seconds`, when given, gets how long the
         step container took, from `docker run` to its exit. exec is started
         through `USERNS` unless `root_docker`, when it meets root Docker's
-        identity user ID map as the image's entrypoint does. `flags` are
-        more `docker run` flags."""
+        identity user ID map as the image's entrypoint does, or the daemon
+        is `rootless`, when the entrypoint starts it as a step's is.
+        `flags` are more `docker run` flags."""
         limits = limits or declaration()["limits"]
         volume = f"{NAME}-test-{secrets.token_hex(4)}"
         docker("volume", "create", volume)
@@ -100,7 +110,7 @@ def run_image(image: str) -> RunImage:
                 command = ["docker", "run", "--rm", *step_flags(limits)]
                 command += flags or []
                 command += ["--volume", f"{volume}:/work"]
-                if root_docker:
+                if root_docker or rootless:
                     command += [image]
                 else:
                     command += ["--volume", f"{USERNS}:/userns.py:ro"]

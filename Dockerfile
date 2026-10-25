@@ -19,26 +19,26 @@ ARG BASE_IMAGE=ghcr.io/uniconhq/primitive-base:v0.10.0
 # `docker image inspect python:3.14-slim --format '{{index .RepoDigests 0}}'`.
 FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6 AS isolate
 
-# isolate 2.7 (https://github.com/ioi/isolate), built from its tag's commit and
-# refused at any other, installed as its own `make install` does: the setuid
-# /usr/local/bin/isolate and its configuration file, which exec writes at
-# the step's start. One patch of ours, src/isolate-keyrings.patch, refuses
-# add_key and request_key where isolate refuses keyctl alone: a key one box
-# adds outlives it, and the next box of its user lists it in /proc/keys.
-# It refuses inotify and fanotify too, as isolate refuses F_NOTIFY: a watch
-# on a file boxes share, a cached file, sees another grading open it.
+# isolate 2.7 (https://github.com/ioi/isolate), built unpatched from its tag's
+# commit and refused at any other, installed as its own `make install` does:
+# the setuid /usr/local/bin/isolate and its configuration file, which exec
+# writes at the step's start. Beside it, our box launcher,
+# src/box-launch.c, linked statically: exec runs every program in a box
+# through it, and it refuses the keyring, inotify and fanotify calls isolate's
+# own filter leaves, before it runs the program (see the file).
 ARG ISOLATE_COMMIT=8f185bb37f3f23e29b33b0c7727c91c13429abe3
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates git gcc make \
        libc6-dev libcap-dev libseccomp-dev libsystemd-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
-COPY src/isolate-keyrings.patch /keyrings.patch
 RUN git clone --quiet https://github.com/ioi/isolate /src \
     && cd /src \
     && git checkout --quiet "$ISOLATE_COMMIT" \
     && test "$(git rev-parse HEAD)" = "$ISOLATE_COMMIT" \
-    && git apply /keyrings.patch \
     && make install DESTDIR=/out
+COPY src/box-launch.c /box-launch.c
+RUN gcc -O2 -Wall -Wextra -Werror -static -o /out/usr/local/bin/box-launch \
+    /box-launch.c -lseccomp
 
 
 FROM ${BASE_IMAGE}
@@ -57,7 +57,8 @@ RUN mkdir -p /usr/share/man/man1 \
     && apt-get install --yes --no-install-recommends openjdk-21-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 
-# isolate links libcap2 and libseccomp2, which the base image has.
+# isolate links libcap2 and libseccomp2, which the base image has; box-launch
+# links nothing. Every box sees it, under the /usr isolate binds into each.
 COPY --from=isolate /out/ /
 COPY --chmod=0755 src/exec.py /usr/local/bin/exec
 

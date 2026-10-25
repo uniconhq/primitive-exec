@@ -526,6 +526,42 @@ elif case == "notify":
     ):
         made = getattr(libc, name)(*args)
         print(name, "made" if made >= 0 else errno.errorcode[ctypes.get_errno()])
+elif case == "filter":
+    import ctypes, errno, platform
+
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    def said(result):
+        return "done" if result >= 0 else errno.errorcode[ctypes.get_errno()]
+
+    class Rule(ctypes.Structure):
+        _fields_ = [
+            ("code", ctypes.c_ushort),
+            ("jt", ctypes.c_ubyte),
+            ("jf", ctypes.c_ubyte),
+            ("k", ctypes.c_uint),
+        ]
+
+    class Filter(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_ushort), ("rules", ctypes.POINTER(Rule))]
+
+    # PR_SET_NO_NEW_PRIVS is 38, PR_SET_SECCOMP 22, SECCOMP_MODE_FILTER 2,
+    # and the one rule returns SECCOMP_RET_ALLOW for every call.
+    print("clear no_new_privs", said(libc.prctl(38, 0, 0, 0, 0)))
+    allow = (Rule * 1)(Rule(0x06, 0, 0, 0x7FFF0000))
+    print("allow all", said(libc.prctl(22, 2, ctypes.byref(Filter(1, allow)), 0, 0)))
+    add_key = {"x86_64": 248, "aarch64": 217}[platform.machine()]
+    print("add_key", said(libc.syscall(add_key, b"user", b"left", b"secret", 6, -3)))
+    print("inotify_init1", said(libc.inotify_init1(0)))
+    child = os.fork()
+    if child == 0:
+        os._exit(0 if libc.inotify_init1(0) >= 0 else ctypes.get_errno())
+    code = os.waitstatus_to_exitcode(os.waitpid(child, 0)[1])
+    print("child inotify_init1", errno.errorcode.get(code, code))
+    with open("/proc/self/status") as stream:
+        status = dict(line.split(":", 1) for line in stream)
+    for name in ("NoNewPrivs", "Seccomp", "Seccomp_filters", "CapPrm", "CapEff"):
+        print(name, status[name].strip())
 elif case == "cached":
     name = sys.stdin.readline().strip()
     print(os.readlink(name), open(name).read().strip())

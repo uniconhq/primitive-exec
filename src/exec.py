@@ -84,6 +84,13 @@ only `args` can make it: the contestant's input, not the step, failed.
 ELF_MAGIC = b"\x7fELF"
 
 ISOLATE = "/usr/local/bin/isolate"
+LAUNCHER = "/usr/local/bin/box-launch"
+"""The image's box launcher, from `src/box-launch.c`, which every program
+starts through, in the box, under a seccomp filter of ours beside
+isolate's: it refuses the keyring, inotify and fanotify calls, whose
+kernel objects boxes share. Every box sees it under `/usr`."""
+LAUNCHER_CHECK_KB = 64 * 1024
+"""The memory, and the tmpfs, of the box the launcher's self-test runs in."""
 ISOLATE_CONFIG = Path("/usr/local/etc/isolate")
 """Where the image's isolate reads its configuration, fixed when it is built.
 exec writes it at the step's start, with the step's own box users."""
@@ -826,7 +833,10 @@ def execute(
 
     Standard input is the `stdin` file, or `/dev/null`, opened by exec
     through a mount that is gone before the run (`open_stdin`) and handed
-    to the box, so the file itself is never in it (`hand_over`).
+    to the box (`hand_over`), so only its path under `/work/in`, which may
+    say which test it is, is hidden from the run. A cached `stdin` file is
+    in the box all the same, under its random name, in the item folder
+    bound at `CACHE_MOUNT`.
     Standard output is a pipe exec reads up to `OUTPUT_LIMIT` and one byte
     more, then closes, so output costs the box no memory and a run printing
     on past the limit dies of `SIGPIPE`; the output kept is cut to the
@@ -913,7 +923,9 @@ def isolate_command(
     `JAVA_CONFIG`, read-only, then the options in `more`, the caller's own.
     The environment holds only `PATH`, `HOME` and `TMPDIR`, both the working
     directory, `LANG=C.UTF-8`, and for a program given a manifest
-    (`reports`) `UNICON_REPORT`. Standard error goes nowhere.
+    (`reports`) `UNICON_REPORT`. Standard error goes nowhere. The program
+    starts through `LAUNCHER`, which runs it with that command line and
+    environment once its filter is on.
     """
     env = {"PATH": RUN_PATH, "HOME": "/box/run", "TMPDIR": "/box/run"}
     env["LANG"] = "C.UTF-8"
@@ -941,6 +953,7 @@ def isolate_command(
         *(f"--env={name}={value}" for name, value in env.items()),
         "--run",
         "--",
+        LAUNCHER,
         *run,
     ]
 
@@ -1283,9 +1296,10 @@ def set_up_step(users: range) -> None:
     """Set the step container up for isolate's boxes, as root, in this order:
     refuse root Docker's identity map (`check_shape`), raise the limits
     isolate inherits (`raise_limits`), give the boxes a cgroup
-    (`set_up_cgroup`) and a `/dev` (`set_up_devices`), and write isolate's
-    configuration with the step's box users. Any failure is an error of the
-    step, and nothing runs. Each step is safe to take again, so a step that
+    (`set_up_cgroup`) and a `/dev` (`set_up_devices`), write isolate's
+    configuration with the step's box users, and run the box launcher's
+    self-test (`check_launcher`). Any failure is an error of the step, and
+    nothing runs. Each step is safe to take again, so a step that
     runs exec twice, as the tests do, sets up once.
     """
     check_shape()
@@ -1303,11 +1317,58 @@ def set_up_step(users: range) -> None:
         )
         BOX_ROOT.mkdir(parents=True, exist_ok=True)
         LOCK_ROOT.mkdir(parents=True, exist_ok=True)
+        check_launcher()
     except OSError as error:
         raise PrimitiveError(
             f"the step could not be set up for its boxes, {error.filename}: "
             f"{error.strerror}; exec runs as root in a privileged container"
         ) from None
+
+
+def check_launcher() -> None:
+    """Run `LAUNCHER --self-test` once in box 0, as a run starts: it sets
+    its filter up, checks that a call the filter refuses is refused, and
+    exits 0. A run's box sends its standard error nowhere, so a launcher
+    that could not set its filter up would end every run as the program's
+    `runtime_error`; here it is an error of the step, with what the
+    launcher said."""
+    with tempfile.TemporaryDirectory(prefix="launcher-") as scratch:
+        meta = Path(scratch) / "meta"
+        with fresh_box(0, LAUNCHER_CHECK_KB):
+            done = subprocess.run(
+                [
+                    ISOLATE,
+                    "--cg",
+                    "--box-id=0",
+                    "--silent",
+                    f"--meta={meta}",
+                    "--time=5",
+                    "--wall-time=10",
+                    f"--cg-mem={LAUNCHER_CHECK_KB}",
+                    f"--dir=dev={BOX_DEV}:dev",
+                    "--run",
+                    "--",
+                    LAUNCHER,
+                    "--self-test",
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+            )
+        found = read_meta(meta)
+    if done.returncode == 0:
+        return
+    if "exitcode" in found:
+        code = int(found["exitcode"])
+    elif "exitsig" in found:
+        code = -int(found["exitsig"])
+    else:
+        code = done.returncode
+    said = done.stderr or found.get("message", "")
+    raise PrimitiveError(
+        "the box launcher's self-test failed, so no program can run under its "
+        f"filter: {isolate_said(code, said)}"
+    )
 
 
 def check_shape() -> None:

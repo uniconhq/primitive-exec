@@ -10,9 +10,9 @@ an organiser's checker or the diff script after it. It replaces
 
 This repo holds the image, `ghcr.io/uniconhq/primitive-exec`, built from the
 `Dockerfile`, with [isolate](https://github.com/ioi/isolate) 2.7 built into
-it and one patch of ours to it, `src/isolate-keyrings.patch`; exec itself,
-the Python program the image runs, `src/exec.py`, which runs every program
-in an isolate box of its own; and `primitive.yaml`, the declaration the
+it unpatched and our box launcher, `src/box-launch.c`, beside it; exec
+itself, the Python program the image runs, `src/exec.py`, which runs every
+program in an isolate box of its own; and `primitive.yaml`, the declaration the
 forge compiler reads to type-check a workflow that uses the primitive. exec
 speaks the primitive contract, `primitive.schema.json` version 6, published
 by the [runner](https://github.com/uniconhq/runner).
@@ -231,7 +231,8 @@ For each item, in order:
    read-only, before the run's clock starts. A program given a manifest also
    gets an empty `/box/report`.
 3. `isolate --cg --run` runs the copy as the box's user, in PID, IPC, mount
-   and network namespaces of the box's own, under its limits (below). The
+   and network namespaces of the box's own, under its limits (below),
+   through the box launcher (see "The box launcher"). The
    box sees `/box`, the image's `/usr`, `/bin` and `/lib` directories and,
    of `/etc`, only Java's `/etc/java-21-openjdk`, all read-only but `/box`,
    its own `/proc`, a `/tmp` and a `/dev/shm` bound from the empty
@@ -240,9 +241,11 @@ For each item, in order:
    `PATH`, `HOME` and `TMPDIR`, both `/box/run`, `LANG=C.UTF-8`, and for a
    program given a manifest `UNICON_REPORT=/box/report`. The `stdin` file,
    or `/dev/null` without one, is opened by exec and handed to the box as
-   standard input, so the file itself is not in the box. exec opens it
-   through a bind mount it removes at once, so the path the box reads for
-   it, through `/proc/self/fd/0`, is `/`, not its name. A box could open
+   standard input. A `stdin` file under `/work/in` is not in the box; a
+   cached one is, under its random name, in the item folder bound at
+   `/cache`. exec opens it through a bind mount it removes at once, so the
+   path the box reads for it, through `/proc/self/fd/0`, is `/`, not its
+   name. A box could open
    it again through `/proc/self/fd/0` as far as the file's own mode allows,
    so exec first takes write away from its group and others, and refuses a
    file one of the step's box users owns. Standard output is
@@ -305,7 +308,8 @@ than one after it, by up to its limit, and reading never ends a run at its
 memory limit. The program and the named files are read by exec, which
 copies them, so they are never charged to the box. A static C++ program
 that does nothing reports 256 to 512 KB, and Python's `print(1)` about
-3.8 MB.
+3.8 MB. The box launcher's own share is about 0.1 to 0.2 MB of that, and
+no time a run reports.
 
 The figure is the box's cgroup's own peak, not each process's: it counts
 every process together, and starts from nothing for each item, since each
@@ -340,15 +344,15 @@ the next one:
   namespace of its own, which goes with it.
 - **Keys.** The kernel's keyrings are not namespaced: a key a run added to
   its user's keyring would be there for every later run of that user, its
-  description listed in `/proc/keys`. isolate's filter refuses `keyctl`, and
-  our patch to it, `src/isolate-keyrings.patch`, refuses `add_key` and
-  `request_key` too, all with `ENOSYS`.
+  description listed in `/proc/keys`. isolate's filter refuses `keyctl`,
+  and the box launcher's refuses `add_key`, `request_key` and `keyctl`,
+  all with `ENOSYS`.
 - **Watches.** A cached file is the same inode in every box that binds it,
   across steps and gradings. isolate's filter refuses `flock`, the file
-  locks and `F_NOTIFY` on it, and our patch refuses `inotify_init`,
-  `inotify_init1` and `fanotify_init` too, with `ENOSYS`, or a watch would
-  see another grading open the file. Its link count and change time still
-  say how many steps hold it at once.
+  locks and `F_NOTIFY` on it, and the box launcher's refuses
+  `inotify_init`, `inotify_init1` and `fanotify_init`, with `ENOSYS`, or a
+  watch would see another grading open the file. Its link count and change
+  time still say how many steps hold it at once.
 - **The network.** Each box has a network namespace of its own, with no
   device but loopback, so a run reaches no network even in a container that
   has one, as a Woodpecker step does: a connection out fails with
@@ -362,12 +366,45 @@ the next one:
   links, and an empty `shm`, where each box's own `/box/shm` is bound. A box
   cannot even name a disk.
 - **Privileges.** The run is the box's user, with no capabilities, under
-  `no_new_privs`, which isolate sets, so no set-user-ID program it starts
-  gains any. It keeps the full bounding set isolate leaves it, which
-  `no_new_privs` makes worth nothing.
+  `no_new_privs`, which isolate and the box launcher set, so no set-user-ID
+  program it starts gains any. It keeps the full bounding set isolate
+  leaves it, which `no_new_privs` makes worth nothing. The launcher cannot
+  drop it: that needs `CAP_SETPCAP`, which the box's user has not.
 - **Memory pressure.** A box's memory is its own cgroup's, so a run at its
   limit is killed there, never exec, and exec refuses a batch whose runs'
   limits and copies the container could not hold.
+
+## The box launcher
+
+isolate runs every program through `/usr/local/bin/box-launch`, built from
+`src/box-launch.c` in the image's isolate stage and linked statically:
+`isolate --run -- /usr/local/bin/box-launch <program> <arguments...>`.
+Every box sees it under the `/usr` isolate binds in read-only. It sets
+`no_new_privs`, adds a seccomp filter of ours to isolate's, and then runs
+the program with `execve`, its arguments, `argv[0]` among them, and its
+environment as they were, so the program keeps the launcher's process, its
+standard streams and its box, and isolate measures it as before.
+
+The filter allows every call but `add_key`, `request_key`, `keyctl`,
+`inotify_init`, `inotify_init1` and `fanotify_init`, which it refuses with
+`ENOSYS`, as isolate refuses `keyctl` and `flock`: their kernel objects
+are not a box's own (see "Keeping runs apart"). On x86_64 it covers the
+32-bit x86 calls too, as isolate's filter does, and a call of any other
+architecture, x32 among them, kills the process. A filter cannot be taken
+off: a run cannot clear `no_new_privs`, and a filter it adds is one more,
+which every process it starts has too.
+
+isolate's own filter cannot do this: its configuration turns its fixed
+rules on and off and adds none. The image used to patch isolate for these
+calls; the launcher keeps isolate as it is released. When the launcher
+cannot set the filter up, or the program cannot start, it says so on the
+box's standard error and exits 127, as isolate does when a program cannot
+start, and the program does not run. A run's box sends its standard error
+nowhere, so that alone would end every run as the program's
+`runtime_error`. So each step first runs `box-launch --self-test` once in
+a box: it sets the filter up, checks that `inotify_init1` is refused with
+`ENOSYS`, and exits 0. When it does not, the step ends in an error, with
+what the launcher said, and no program runs.
 
 ## What a run can still learn
 
@@ -437,9 +474,10 @@ range out of bounds, exec does not start.
 
 **Its twin.** `primitive-interact`'s `src/interact.py` holds a copy of this
 box handling under the same names: the step's set-up, the box, the isolate
-command line, the report and `judge`. A change to one is made to the other,
-with the keyrings patch and the image's isolate stage. `tests/test_twin.py`,
-the same in both repos, checks the shared functions against a hash both
+command line, the report and `judge`, and the box launcher,
+`src/box-launch.c`, byte for byte. A change to one is made to the other,
+with the image's isolate stage. `tests/test_twin.py`, the same in both
+repos, checks the shared functions and the launcher against a hash both
 pin in `tests/twin.sha256`, and against interact's when a checkout of it is
 beside this one. The pin shows a change was meant for both; only the
 second check shows both have it.
@@ -456,7 +494,10 @@ machine (feature 12) should check it.
 (aarch64, Linux 7.0, cgroup v2, no AppArmor), which is root Docker, with
 the tests' `tests/userns.py` giving exec a user namespace to start in. Not
 yet run: rootless Docker under Ubuntu 24.04's AppArmor, x86_64, and the
-image tests in CI, on GitHub's root Docker.
+image tests in CI, on GitHub's root Docker. For x86_64 the box launcher
+was only cross-compiled and its filter printed: both x86_64 and 32-bit
+x86 refuse the six calls, and x32 is killed. No run has made a 32-bit
+call.
 
 ## The container's limits
 
@@ -513,9 +554,9 @@ Python or Java, is made in both repos together.
 ## Layout
 
 ```
-Dockerfile                  the image: isolate built in a stage of its own, primitive-base, OpenJDK 21 runtime
+Dockerfile                  the image: isolate and the box launcher built in a stage of their own, primitive-base, OpenJDK 21 runtime
 src/exec.py                 exec, installed as /usr/local/bin/exec, the image's command
-src/isolate-keyrings.patch  our patch to isolate: add_key and request_key refused beside keyctl
+src/box-launch.c            the box launcher, installed as /usr/local/bin/box-launch: the keyring and watch calls refused
 primitive.yaml              the declaration, without the image line
 tests/                      unit tests, and image tests that run it on Docker
 tests/test_twin.py          checks the functions interact copies against the hash in tests/twin.sha256
