@@ -507,7 +507,10 @@ def test_too_many_files_in_a_tmpfs_is_over_the_memory_limit(
     """A box's tmpfs holds 100,000 files and folders across `.`, `/tmp` and
     `/dev/shm`: a program making more is told `ENOSPC`, and interact gives
     `memory_limit`."""
-    facts = one(run, {"a": program(f"many-at {folder}", memory_limit=256)}, [])
+    # Reach the inode cap before the CPU cap, as the single-program case does.
+    facts = one(
+        run, {"a": program(f"many-at {folder}", time_limit=4, memory_limit=256)}, []
+    )
     assert facts["a"]["ended"] == "memory_limit"
 
 
