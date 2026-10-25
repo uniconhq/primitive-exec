@@ -436,17 +436,17 @@ def test_named_files_the_container_cannot_hold_are_an_error_of_the_step(
 ) -> None:
     """A run's named files are copied into its box's tmpfs, charged to the
     container beside the box's own memory: 96 MB of them with a 64 MB
-    limit do not fit a 192 MB container, and exec says so before any run,
+    limit do not fit a 256 MB container, and exec says so before any run,
     where the container's limit would kill it with no outputs at all.
     Without the files, the same container runs the batch."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
-    limits = container_limits(1.0, 64, 1) | {"memory_mb": 192}
+    limits = container_limits(1.0, 64, 1) | {"memory_mb": 256}
     items = [("main-1", "double\n21\n")]
     files = {"main-1": {"data": b"x" * (96 * 1024 * 1024)}}
     batch_inputs(tmp_path / "large", binary, items, files=files)
     refused = run_image(tmp_path / "large", limits)
     assert refused["error"].startswith("the run main-1 needs 161 MB")
-    assert "container's 192 MB leaves 128 MB" in refused["error"]
+    assert "container's 256 MB leaves 144 MB" in refused["error"]
     batch_inputs(tmp_path / "small", binary, items)
     ran = by_run(run_image(tmp_path / "small", limits))
     assert outcomes(ran) == {"main-1": "accepted"}

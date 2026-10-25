@@ -98,9 +98,14 @@ CONTAINER_MEMORY = CGROUP / "memory.max"
 """The container's memory limit in bytes, or `max` for none, which holds
 every box's memory and the copies made into the boxes' tmpfs together: the
 copies are charged to the step, not to a box."""
-STEP_MEMORY_KB = 64 * 1024
+STEP_MEMORY_KB = 112 * 1024
 """What the step needs of the container's memory beside the boxes and the
-copies: the primitive itself, isolate, and the kernel's own use."""
+copies: the image's step wrapper, unicon-step, the container's first
+process, whose peak was measured at about 35 MB with 48 MB allowed for it,
+then the primitive itself, isolate, and the kernel's own use, 64 MB."""
+CACHE_MOUNT = "/cache"
+"""Where a box sees the item folder of the step's cache that its cached
+named files are in, bound read-only."""
 CONTROLLERS = "+cpu +memory"
 BOX_DEV = Path("/run/boxdev")
 """The `/dev` every box gets in place of the container's, which in a
@@ -126,6 +131,8 @@ ROOT_DOCKER = ["0", "0", "4294967295"]
 """The first line of `/proc/self/uid_map` where the container's root is the
 machine's own, as under root Docker: every user ID maps to itself."""
 BOX = 0
+GIVEN = ("program", "stdin", "manifest")
+"""The file inputs of a run beside its named files."""
 """The box every item runs in, one after another, made afresh each time."""
 BOX_INODES = 100_000
 """The most files and folders a box's tmpfs holds. Removing them takes
@@ -236,7 +243,8 @@ class Item:
     files placed in its working directory: `files` it reads, and `loads`, code
     the program loads, such as the entrant's module a test harness imports.
     `manifest` is the reports the program declares, when it is one that
-    reports, and `self_reported` says it runs the entrant's code.
+    reports, `self_reported` says it runs the entrant's code, and `cached`
+    is the item folder of the step's cache its cached named files are in.
     """
 
     run: str
@@ -250,6 +258,7 @@ class Item:
     loads: dict[str, Path] = field(default_factory=dict)
     manifest: dict[str, Declared] | None = None
     self_reported: bool = False
+    cached: Path | None = None
 
     @property
     def wall_limit(self) -> float:
@@ -423,6 +432,19 @@ def read_item(root: Path, entry: object, number: int) -> Item:
         loads=loads,
         manifest=manifest,
         self_reported=self_reported,
+        cached=cached_folder(
+            root,
+            [
+                *(
+                    input_file(root, inputs, name, run)
+                    for name in GIVEN
+                    if name in inputs
+                ),
+                *files.values(),
+                *loads.values(),
+            ],
+            f"the run {run}",
+        ),
     )
     # isolate reads a limit of 0 as none, and takes the time in whole
     # milliseconds and the memory in whole kilobytes.
@@ -505,15 +527,54 @@ def input_file(root: Path, inputs: dict[str, object], name: str, run: str) -> Pa
 
 
 def in_file(root: Path, value: object, what: str) -> Path:
-    """Resolve one file value, `{"file": "in/..."}`, to a path under `in/`."""
+    """Resolve one file value to a path: `{"file": "in/..."}` to one under
+    `in/`, or `{"file": "cache/<item>/<name>"}`, a cached file, to one
+    straight in an item folder of the step's cache, which the step's
+    `cache` links to, wherever that is."""
     if not isinstance(value, dict) or not isinstance(value.get("file"), str):
         raise PrimitiveError(f"{what} is not a file")
-    path = (root / str(value["file"])).resolve()
-    if not path.is_relative_to((root / "in").resolve()):
+    named = str(value["file"])
+    path = (root / named).resolve()
+    if named.startswith("cache/"):
+        if path.parent.parent != (root / "cache").resolve():
+            raise PrimitiveError(f"{what} is not a cached file of an item")
+    elif not path.is_relative_to((root / "in").resolve()):
         raise PrimitiveError(f"{what} is outside in/")
     if not path.is_file():
         raise PrimitiveError(f"{what} is not in the working directory")
     return path
+
+
+def cached_folder(root: Path, files: list[Path], what: str) -> Path | None:
+    """The item folder of the step's cache that the cached ones of `files`,
+    every file `what` is given, are in, if any are: one folder, holding
+    those files and nothing else, since it is bound whole into the box
+    (`cache_binding`), where a file of another run's or program's would be
+    there to read."""
+    cache = (root / "cache").resolve()
+    folders = {path.parent for path in files if path.parent.parent == cache}
+    if len(folders) > 1:
+        raise PrimitiveError(f"{what} names cached files of more than one item")
+    if not folders:
+        return None
+    folder = folders.pop()
+    own = {path.name for path in files if path.parent == folder}
+    others = sorted({path.name for path in folder.iterdir()} - own)
+    if others:
+        raise PrimitiveError(
+            f"{what} has an item folder in the cache that also holds {others[0]!r}, "
+            "a file not its own"
+        )
+    return folder
+
+
+def cache_binding(folder: Path | None) -> list[str]:
+    """isolate's option binding an item folder of the step's cache into the
+    box as `CACHE_MOUNT`, read-only, as isolate binds by default, and never
+    executable, or none for no folder."""
+    if folder is None:
+        return []
+    return [f"--dir={CACHE_MOUNT.lstrip('/')}={folder}:noexec"]
 
 
 def named_files(
@@ -636,7 +697,7 @@ def run_item(
     out.mkdir(parents=True, exist_ok=True)
     with fresh_box(BOX, box_size_kb(item)) as box:
         program = prepare(item, kind, box)
-        place_files(box / "run", item.files | item.loads)
+        place_files(box / "run", item.files | item.loads, item.cached)
         for name in BOX_FOLDERS:
             (box / name).mkdir()
             (box / name).chmod(0o1777)
@@ -667,8 +728,9 @@ def box_size_kb(item: Item) -> int:
     holds what the run writes there before the size does, as every page it
     writes is charged to the box's memory, plus the program and the named
     files exec copies in, which are charged to exec's, each to whole 4 KB
-    pages."""
-    copied = [item.program, *item.files.values(), *item.loads.values()]
+    pages. A cached named file is not copied but bound in."""
+    named = [*item.files.values(), *item.loads.values()]
+    copied = [item.program, *(path for path in named if path.parent != item.cached)]
     return item.memory_limit_kb + sum(
         4 * -(-path.stat().st_size // 4096) for path in copied
     )
@@ -715,7 +777,7 @@ def prepare(item: Item, kind: str, box: Path) -> Program:
     return Program(kind, Path("/box/program"))
 
 
-def place_files(cwd: Path, files: dict[str, Path]) -> None:
+def place_files(cwd: Path, files: dict[str, Path], cached: Path | None) -> None:
     """Copy each named file into the run's working directory under its name,
     readable and not writable, before the run's clock starts, so the program
     opens `answer` or `input` as a plain relative path.
@@ -723,10 +785,17 @@ def place_files(cwd: Path, files: dict[str, Path]) -> None:
     Each run gets copies of its own, which go with its box, and nothing is
     read back from them, so a run that makes its copy writable again, as the
     copy's owner may, changes only what it reads itself.
+
+    A file in `cached`, the item folder of the step's cache bound into the
+    box, is not copied: its name is a link to it there, `CACHE_MOUNT`/<its
+    name>, which the run reads and cannot change.
     """
     cwd.mkdir(mode=0o755)
     for name, source in files.items():
         placed = cwd / name
+        if source.parent == cached:
+            placed.symlink_to(Path(CACHE_MOUNT) / source.name)
+            continue
         try:
             shutil.copyfile(source, placed)
         except OSError as error:
@@ -747,6 +816,14 @@ def execute(
     """Run one item's program in box `BOX`, already made and filled, by
     `isolate_command`, and return what it did.
 
+    The item folder of the step's cache its cached files are in, if any, is
+    bound read-only as `CACHE_MOUNT` (`cache_binding`). isolate's
+    `--special-files` is always given, as interact gives it: it keeps the
+    links to cached files in the working directory, where isolate would
+    remove them, and so too a link a run leaves in its report folder,
+    which is a report that does not hold, whether or not the run had a
+    cached file.
+
     Standard input is the `stdin` file, or `/dev/null`, opened by exec
     through a mount that is gone before the run (`open_stdin`) and handed
     to the box, so the file itself is never in it (`hand_over`).
@@ -766,7 +843,8 @@ def execute(
     meta = scratch / "meta"
     errors = scratch / "errors"
     meta.unlink(missing_ok=True)
-    command = isolate_command(BOX, meta, item, reports, [], program.command(item))
+    more = [*cache_binding(item.cached), "--special-files"]
+    command = isolate_command(BOX, meta, item, reports, more, program.command(item))
     if item.stdin is None:
         descriptor = os.open(os.devnull, os.O_RDONLY)
     else:

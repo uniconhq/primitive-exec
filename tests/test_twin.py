@@ -27,6 +27,8 @@ SIBLING = ROOT.parent / "primitive-interact" / "src" / "interact.py"
 PINNED = ROOT / "tests" / "twin.sha256"
 SHARED = (
     "in_file",
+    "cached_folder",
+    "cache_binding",
     "read_manifest",
     "place_files",
     "shown_bytes",
@@ -58,6 +60,10 @@ SHARED = (
 )
 """The functions exec and interact share. The others name a run or a
 program, and read differently in the two."""
+CONSTANTS = ("STEP_MEMORY_KB", "CACHE_MOUNT")
+"""The module constants exec and interact share, compared as their
+assignments: the room the step keeps beside the boxes, which the forge's
+planner keeps a copy of too, and where a box sees its cached files."""
 RENAMED = {"entry": "item", "Entry": "Item"}
 """interact's names for what exec calls an item, one program of an item."""
 PRIMITIVE = re.compile(r"\b(exec|interact)\b")
@@ -85,9 +91,17 @@ class Normalize(ast.NodeTransformer):
 
 def shared(path: Path) -> dict[str, str]:
     """Each function of `SHARED` in a source file, by name, normalized: its
-    docstring left out and `Normalize` applied, printed from its tree."""
+    docstring left out and `Normalize` applied, printed from its tree; and
+    each assignment of `CONSTANTS`, printed as it is."""
     found = {}
     for node in ast.parse(path.read_text()).body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in CONSTANTS
+        ):
+            found[node.targets[0].id] = ast.unparse(node)
         if isinstance(node, ast.FunctionDef) and node.name in SHARED:
             first = node.body[0]
             if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
@@ -97,13 +111,14 @@ def shared(path: Path) -> dict[str, str]:
 
 
 def digest(functions: dict[str, str]) -> str:
-    """The hash of the shared functions, in `SHARED`'s order."""
-    joined = "\n\n".join(functions[name] for name in SHARED)
+    """The hash of the shared functions and constants, in `SHARED`'s order
+    and then `CONSTANTS`'."""
+    joined = "\n\n".join(functions[name] for name in SHARED + CONSTANTS)
     return hashlib.sha256(joined.encode()).hexdigest()
 
 
 def test_every_shared_function_is_here() -> None:
-    assert sorted(shared(OWN)) == sorted(SHARED)
+    assert sorted(shared(OWN)) == sorted(SHARED + CONSTANTS)
 
 
 def test_the_shared_functions_are_the_pinned_ones() -> None:

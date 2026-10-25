@@ -25,6 +25,8 @@ FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae
 # the step's start. One patch of ours, src/isolate-keyrings.patch, refuses
 # add_key and request_key where isolate refuses keyctl alone: a key one box
 # adds outlives it, and the next box of its user lists it in /proc/keys.
+# It refuses inotify and fanotify too, as isolate refuses F_NOTIFY: a watch
+# on a file boxes share, a cached file, sees another grading open it.
 ARG ISOLATE_COMMIT=8f185bb37f3f23e29b33b0c7727c91c13429abe3
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates git gcc make \

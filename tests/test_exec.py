@@ -795,6 +795,18 @@ def test_a_key_one_run_adds_is_not_there_for_the_next(run: Any, tmp_path: Path) 
     ]
 
 
+def test_a_run_can_watch_no_file(run: Any, tmp_path: Path) -> None:
+    """A cached file is one inode in every box that binds it, so a watch on
+    it would see another grading open it: our patch refuses inotify and
+    fanotify, as isolate refuses F_NOTIFY."""
+    outputs = by_run(run([("main-1", "notify\n")]))
+    assert printed(tmp_path / "work", outputs["main-1"]).splitlines() == [
+        "inotify_init ENOSYS",
+        "inotify_init1 ENOSYS",
+        "fanotify_init ENOSYS",
+    ]
+
+
 def test_nothing_one_run_leaves_is_there_for_the_next(run: Any, tmp_path: Path) -> None:
     """Files a run leaves in its working directory, its `/tmp` and
     `/dev/shm`, and a mark or a time it sets on its copy of the program, are
@@ -1513,15 +1525,15 @@ def test_a_self_reported_run_that_does_not_judge_is_the_entrants(
 def test_a_link_in_the_report_folder_reads_nothing_for_the_run(
     run: Any, tmp_path: Path
 ) -> None:
-    """A link to the next run's input, a path the box cannot name, is gone
-    from the folder, as isolate removes every link a box leaves, so the
-    report misses what the link stood for, and exec reads no input for it."""
+    """A link to the next run's input, a path the box cannot name, is kept
+    in the folder, as exec always passes `--special-files`, so the report
+    does not hold, and exec reads no input through it."""
     work = tmp_path / "work"
     result = run(
         [("main-1", f"report-link\n{work}/in/3/input\n"), ("main-2", "hidden answer")],
         manifest=SCORE,
     )
-    assert "the report of run main-1 has no score" in result["error"]
+    assert "the report of run main-1 holds message, not a plain file" in result["error"]
     assert "hidden" not in json.dumps(result)
 
 
@@ -1587,7 +1599,7 @@ MB = 1024 * 1024
 
 @pytest.mark.parametrize(
     ("held", "needed_mb"),
-    [(None, 10**6), ("max\n", 10**6), (f"{256 * MB}\n", 192)],
+    [(None, 10**6), ("max\n", 10**6), (f"{256 * MB}\n", 144)],
 )
 def test_a_run_the_container_holds_is_let_through(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held: str | None, needed_mb: int
@@ -1608,10 +1620,10 @@ def test_a_run_the_container_cannot_hold_is_refused(
     memory.write_text(f"{256 * MB}\n")
     monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
     with pytest.raises(primitive.PrimitiveError) as raised:
-        primitive.check_memory(192 * 1024 + 1, "main-1")
+        primitive.check_memory(144 * 1024 + 1, "main-1")
     assert str(raised.value) == (
-        "the run main-1 needs 193 MB for its memory limits and the files copied "
-        "in beside them, and the container's 256 MB leaves 192 MB for them"
+        "the run main-1 needs 145 MB for its memory limits and the files copied "
+        "in beside them, and the container's 256 MB leaves 144 MB for them"
     )
 
 
@@ -1623,7 +1635,7 @@ def test_a_batch_with_a_run_the_container_cannot_hold_runs_nothing(
     fits but whose files do not is refused before any program runs, an
     error of the step, not a run the container's limit kills."""
     memory = tmp_path / "memory.max"
-    memory.write_text(f"{192 * MB}\n")
+    memory.write_text(f"{240 * MB}\n")
     monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
     monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
@@ -1636,3 +1648,150 @@ def test_a_batch_with_a_run_the_container_cannot_hold_runs_nothing(
     assert result["error"].startswith("the run main-2 needs 145 MB")
     assert "batch" not in result
     assert not (work / "out").exists()
+
+
+# Cached files: in the step's cache, bound into the box, never copied.
+
+
+def cached_work(tmp_path: Path, binary: bytes, stdin: str) -> Path:
+    """A working directory whose one run names `train.csv`, a cached file
+    in the item folder `Wq81` of a step folder elsewhere, which `cache`
+    links to, as the step wrapper lays it out."""
+    work = tmp_path / "work"
+    batch_inputs(work, binary, [("main-1", stdin)])
+    item = tmp_path / "cache" / "items" / "step-k2" / "Wq81"
+    item.mkdir(parents=True)
+    (item / "train.csv").write_text("1,2,3\n")
+    (item / "train.csv").chmod(0o444)
+    item.chmod(0o555)
+    (work / "cache").symlink_to(item.parent)
+    document = json.loads((work / "inputs.json").read_text())
+    named = {"train.csv": {"file": "cache/Wq81/train.csv"}}
+    document["batch"][0]["inputs"]["files"] = {"files": named}
+    (work / "inputs.json").write_text(json.dumps(document))
+    return work
+
+
+def test_a_cached_file_is_read_through_the_steps_cache_link(tmp_path: Path) -> None:
+    work = cached_work(tmp_path, b"\x7fELF", "")
+    item = primitive.read_inputs(work)[0]
+    found = (tmp_path / "cache" / "items" / "step-k2" / "Wq81").resolve()
+    assert item.files == {"train.csv": found / "train.csv"}
+    assert item.cached == found
+    program_kb = 4 * -(-item.program.stat().st_size // 4096)
+    assert primitive.box_size_kb(item) == item.memory_limit_kb + program_kb
+    assert primitive.cache_binding(item.cached) == [f"--dir=cache={found}:noexec"]
+    assert primitive.cache_binding(None) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "cache/Wq81",
+        "cache/Wq81/deeper/train.csv",
+        "cache/Wq81/../../in/1/program",
+        "cache/../in/1/program",
+        "in/../cache/Wq81/train.csv",
+        "cache/Wq81/away",
+    ],
+)
+def test_a_cached_file_not_straight_in_an_item_folder_is_refused(
+    tmp_path: Path, path: str
+) -> None:
+    work = cached_work(tmp_path, b"\x7fELF", "")
+    item = tmp_path / "cache" / "items" / "step-k2" / "Wq81"
+    item.chmod(0o755)
+    (item / "deeper").mkdir()
+    (item / "deeper" / "train.csv").write_text("x")
+    (item / "away").symlink_to(work / "in" / "1" / "program")
+    with pytest.raises(primitive.PrimitiveError) as raised:
+        primitive.in_file(work, {"file": path}, "the file")
+    assert str(raised.value) in (
+        "the file is not a cached file of an item",
+        "the file is outside in/",
+        "the file is not in the working directory",
+    )
+
+
+def test_cached_files_of_two_items_in_one_run_are_refused(tmp_path: Path) -> None:
+    work = cached_work(tmp_path, b"\x7fELF", "")
+    other = tmp_path / "cache" / "items" / "step-k2" / "Zr3"
+    other.mkdir()
+    (other / "test.csv").write_text("4\n")
+    document = json.loads((work / "inputs.json").read_text())
+    loads = {"test.csv": {"file": "cache/Zr3/test.csv"}}
+    document["batch"][0]["inputs"]["loads"] = {"files": loads}
+    (work / "inputs.json").write_text(json.dumps(document))
+    with pytest.raises(primitive.PrimitiveError) as raised:
+        primitive.read_inputs(work)
+    assert (
+        str(raised.value) == "the run main-1 names cached files of more than one item"
+    )
+
+
+def test_an_item_folder_holding_another_runs_file_is_refused(tmp_path: Path) -> None:
+    """The run's item folder is bound whole into its box, so one that also
+    holds a file not the run's own would put that file in its box."""
+    work = cached_work(tmp_path, b"\x7fELF", "")
+    item = tmp_path / "cache" / "items" / "step-k2" / "Wq81"
+    item.chmod(0o755)
+    (item / "answer").write_text("main-2's")
+    with pytest.raises(primitive.PrimitiveError) as raised:
+        primitive.read_inputs(work)
+    assert str(raised.value) == (
+        "the run main-1 has an item folder in the cache that also holds "
+        "'answer', a file not its own"
+    )
+
+
+def test_a_cached_stdin_may_share_the_runs_item_folder(tmp_path: Path) -> None:
+    work = cached_work(tmp_path, b"\x7fELF", "")
+    item = tmp_path / "cache" / "items" / "step-k2" / "Wq81"
+    item.chmod(0o755)
+    (item / "input").write_text("1\n")
+    document = json.loads((work / "inputs.json").read_text())
+    document["batch"][0]["inputs"]["stdin"] = {"file": "cache/Wq81/input"}
+    (work / "inputs.json").write_text(json.dumps(document))
+    assert primitive.read_inputs(work)[0].cached == item.resolve()
+
+
+def test_a_cached_file_is_placed_as_a_link_into_the_bound_folder(
+    tmp_path: Path,
+) -> None:
+    item = tmp_path / "Wq81"
+    item.mkdir()
+    (item / "train.csv").write_text("1")
+    (tmp_path / "answer").write_text("2")
+    cwd = tmp_path / "run"
+    files = {"data": item / "train.csv", "answer": tmp_path / "answer"}
+    primitive.place_files(cwd, files, item)
+    assert (cwd / "data").readlink() == Path("/cache/train.csv")
+    assert not (cwd / "answer").is_symlink()
+    assert (cwd / "answer").read_text() == "2"
+
+
+def test_a_cached_file_is_bound_into_the_box_read_only_and_never_copied(
+    boxes: None, tmp_path: Path
+) -> None:
+    """The run reads the file through its link to the item folder, bound
+    as `/cache`, and can neither change the file nor add one beside it.
+    What `/proc/self/mountinfo` shows of the bound folder's own path is
+    printed for the record."""
+    binary = python_binary(tmp_path / "build" / "program", PROGRAM).read_bytes()
+    work = cached_work(tmp_path, binary, "cached\ntrain.csv\n")
+    assert primitive.main(["exec", str(work)]) == 0
+    outputs = by_run(json.loads((work / "outputs.json").read_text()))["main-1"]
+    assert outputs["outcome"] == "accepted", printed(work, outputs)
+    lines = printed(work, outputs).splitlines()
+    print("\n".join(lines))
+    assert lines[0] == "/cache/train.csv 1,2,3"
+    refused = [line.split() for line in lines[1:4]]
+    assert all(r[0] == "refused" for r in refused), lines
+    assert {int(r[1]) for r in refused} <= {errno.EACCES, errno.EPERM, errno.EROFS}
+    mount = next(line.split() for line in lines if line.startswith("mount "))
+    assert mount[1].endswith("/items/step-k2/Wq81")
+    assert {"ro", "noexec"} <= set(mount[2].split(","))
+    assert lines[-1] == "listing train.csv"
+    item = tmp_path / "cache" / "items" / "step-k2" / "Wq81"
+    assert (item / "train.csv").read_text() == "1,2,3\n"
+    assert (item / "train.csv").stat().st_mode & 0o777 == 0o444

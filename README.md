@@ -62,6 +62,22 @@ it may, changes only what it reads itself. `loads` differs from `files` only in
 imports from its working directory once it puts it on `sys.path`, since it
 runs with `-I`.
 
+A named file may be **cached**, `{"file": "cache/<item>/<name>"}`: a task
+file the step wrapper fetched once into the machine's cache and linked into
+an item folder of the step's, which `/work/cache` links to (the job
+contract, `runner/schemas/job.schema.json`). It is not copied: the run's
+item folder is bound into the box read-only and not executable as
+`/cache`, and the file's name in the working directory is a link to
+`/cache/<name>`, so a large file costs the box no memory. A run's cached
+files, a cached program or `stdin` among them, are all in one item folder
+of its own that holds nothing else, or the batch is an `error`, since the
+whole folder is in its box; one straight in it, and no other path under
+`cache/`, is a cached file. A run reads
+`/proc/self/mountinfo`, which names the folder's path on the machine: the
+cache volume's, with the org's volume name, in Docker's data folder, such as
+`/docker/volumes/<volume>/_data/items/step-<random>/<item>` on Docker
+Desktop, the step and item folders' names random.
+
 **`args`** is split on spaces: a run of spaces separates two arguments, and
 spaces at either end separate nothing. There is no quoting, so no argument
 holds a space. Absent or empty, the program gets no arguments. The arguments
@@ -124,9 +140,11 @@ or a number is not a finite decimal (`nan`, `1e999`) or is outside its
 bounds; or, on any verdict, any file in the folder is not UTF-8 text
 without a NUL, since every file is shown as text, is over 64 KB, or is not
 a plain file under a plain name, links included, or there are more than
-64 files. A symbolic link the run leaves there is gone before exec reads
-the folder, since isolate removes every one a box leaves, and the box holds
-nothing of another run's to link to.
+64 files. A symbolic link the run leaves there is kept, as exec gives
+isolate `--special-files` so the links to cached files stay, and so is a
+report that does not hold, whether or not the run had a cached file; exec
+reads nothing through it, and the box holds nothing of another run's to
+link to.
 
 **Faults.** A report that does not hold, or a program given a manifest that
 crashes, exits non-zero or breaks a limit, has not judged: the step is an
@@ -325,6 +343,12 @@ the next one:
   description listed in `/proc/keys`. isolate's filter refuses `keyctl`, and
   our patch to it, `src/isolate-keyrings.patch`, refuses `add_key` and
   `request_key` too, all with `ENOSYS`.
+- **Watches.** A cached file is the same inode in every box that binds it,
+  across steps and gradings. isolate's filter refuses `flock`, the file
+  locks and `F_NOTIFY` on it, and our patch refuses `inotify_init`,
+  `inotify_init1` and `fanotify_init` too, with `ENOSYS`, or a watch would
+  see another grading open the file. Its link count and change time still
+  say how many steps hold it at once.
 - **The network.** Each box has a network namespace of its own, with no
   device but loopback, so a run reaches no network even in a container that
   has one, as a Woodpecker step does: a connection out fails with
@@ -455,7 +479,8 @@ time_limit + 3` seconds, what one run can take at most:
 Memory goes to `memory_limit + 256` MB: room for exec itself and for the
 copies of the program and the named files in the box's tmpfs, which are
 charged to exec, not the box. That room is fixed, and the copies are not:
-a run whose memory limit and copies, with 64 MB for exec and isolate, are
+a run whose memory limit and copies, with 112 MB for the step wrapper,
+exec and isolate, are
 more than the container's memory (its cgroup's `memory.max`) is an error of
 the step, said before any run of the batch starts. The container's limit
 would otherwise kill first, the step with no outputs at all, or a run,

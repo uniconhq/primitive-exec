@@ -1,5 +1,5 @@
 diff --git a/isolate.c b/isolate.c
-index 101d004..067f670 100644
+index 101d004..5a96898 100644
 --- a/isolate.c
 +++ b/isolate.c
 @@ -858,13 +858,19 @@ setup_seccomp(void)
@@ -20,6 +20,26 @@ index 101d004..067f670 100644
 +      for (unsigned int i=0; i < sizeof(key_syscalls) / sizeof(key_syscalls[0]); i++)
 +	{
 +	  err = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), key_syscalls[i], 0);
++	  if (err < 0)
++	    die("seccomp_rule_add: %s", strerror(-err));
++	}
+     }
+ 
+   /*
+@@ -905,6 +911,19 @@ setup_seccomp(void)
+       err = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(flock), 0);
+       if (err < 0)
+ 	die("seccomp_rule_add: %s", strerror(-err));
++
++      /*
++       * So can inotify and fanotify, as F_NOTIFY can: a watch on a shared
++       * inode sees every other sandbox open it. inotify_init() is not on
++       * every architecture, and libseccomp skips a rule for one it lacks.
++       */
++      static const int notify_syscalls[] = { SCMP_SYS(inotify_init), SCMP_SYS(inotify_init1), SCMP_SYS(fanotify_init) };
++      for (unsigned int i=0; i < sizeof(notify_syscalls) / sizeof(notify_syscalls[0]); i++)
++	{
++	  err = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), notify_syscalls[i], 0);
 +	  if (err < 0)
 +	    die("seccomp_rule_add: %s", strerror(-err));
 +	}

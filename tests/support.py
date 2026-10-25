@@ -21,7 +21,7 @@ SCHEMA_VERSION = 6
 SIBLING_SCHEMA = ROOT.parent / "runner" / "schemas" / "primitive.schema.json"
 SIBLING_RUNNER = ROOT.parent / "runner"
 SIBLING_COMPILE = ROOT.parent / "primitive-compile"
-SIBLING_DIFF = ROOT.parent / "deploy" / "workflows-next" / "classic" / "v3" / "diff"
+SIBLING_DIFF = ROOT.parent / "deploy" / "workflows" / "classic" / "v3" / "diff"
 USERNS = Path(__file__).resolve().parent / "userns.py"
 BOX_USERS = "60000-60009"
 """The box users the tests give exec: one step's range."""
@@ -515,6 +515,35 @@ elif case == "named":
             print("wrote", name)
         except OSError as error:
             print("refused", name, error.errno)
+elif case == "notify":
+    import ctypes, errno
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    for name, args in (
+        ("inotify_init", ()),
+        ("inotify_init1", (0,)),
+        ("fanotify_init", (0x200, 0)),
+    ):
+        made = getattr(libc, name)(*args)
+        print(name, "made" if made >= 0 else errno.errorcode[ctypes.get_errno()])
+elif case == "cached":
+    name = sys.stdin.readline().strip()
+    print(os.readlink(name), open(name).read().strip())
+    for change in (
+        lambda: open(name, "w"),
+        lambda: os.chmod(name, 0o666),
+        lambda: open("/cache/new", "w"),
+    ):
+        try:
+            change()
+            print("changed")
+        except OSError as error:
+            print("refused", error.errno)
+    for line in open("/proc/self/mountinfo"):
+        fields = line.split()
+        if fields[4] == "/cache":
+            print("mount", fields[3], fields[5])
+    print("listing", *sorted(os.listdir("/cache")))
 elif case == "spoil":
     os.chmod("answer", 0o644)
     with open("answer", "w") as stream:
