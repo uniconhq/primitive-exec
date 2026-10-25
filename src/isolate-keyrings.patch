@@ -1,0 +1,28 @@
+diff --git a/isolate.c b/isolate.c
+index 101d004..067f670 100644
+--- a/isolate.c
++++ b/isolate.c
+@@ -858,13 +858,19 @@ setup_seccomp(void)
+ 
+   /*
+    * Disable keyctl(), because it can be used to establish system-wide
+-   * persistent memory.
++   * persistent memory. So can add_key(): a key added to the user's keyring
++   * outlives the sandbox, and a later sandbox of the same user lists it,
++   * description and all, in /proc/keys. request_key() goes with them.
+    */
+   if (syscall_flags & CF_SYSCALL_KEYCTL)
+     {
+-      err = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(keyctl), 0);
+-      if (err < 0)
+-	die("seccomp_rule_add: %s", strerror(-err));
++      static const int key_syscalls[] = { SCMP_SYS(keyctl), SCMP_SYS(add_key), SCMP_SYS(request_key) };
++      for (unsigned int i=0; i < sizeof(key_syscalls) / sizeof(key_syscalls[0]); i++)
++	{
++	  err = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), key_syscalls[i], 0);
++	  if (err < 0)
++	    die("seccomp_rule_add: %s", strerror(-err));
++	}
+     }
+ 
+   /*

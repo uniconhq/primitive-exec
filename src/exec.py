@@ -21,90 +21,54 @@ and every item reports its time and memory whatever its outcome.
 `error` in `outputs.json` is kept for the cases where the primitive could not
 work at all, such as a missing input or a program in no format it runs.
 
-Each run is a fresh process in a fresh empty directory, running a fresh copy
-of the program, with every process it left behind killed, and every System V
-shared memory segment, message queue and semaphore set and every `user`
-extended attribute under the working directory it left removed, before the
-next item starts. Every run is put under
-Landlock: it may write only inside that directory, its report folder if it
-has one, and to /dev/null, read only the system's own directories, its
-program and those, and may not
-trace anything outside itself, and from Landlock ABI 6 it may not signal
-anything outside itself either. A kernel without Landlock ABI 3 is an error of
-the step: the runs are not started less confined.
+Each run goes in an isolate box of its own (https://github.com/ioi/isolate),
+made fresh for it and thrown away after it: a box user of its own, its own
+PID, IPC, mount and network namespaces, a cgroup that holds its memory and
+counts its CPU, and a tmpfs of its own as its folder, holding a fresh copy of
+the program and of its named files, and nothing of the step's. exec runs as
+root in a privileged container to make the boxes, and sets the step up for
+them first (`set_up_step`): it refuses to start on root Docker's identity
+user ID map, where its root would be the machine's own. Any failure there
+is an error of the step; no program runs outside a box.
 
 A run given a `manifest`, an organiser's program such as a checker, also gets
-an empty folder of its own outside its working directory, named in
-`$UNICON_REPORT`, and writes there one file per value it reports: `verdict`,
-`0` for accepted or `1` for a wrong answer, and each report the manifest
-declares. Its reports become outputs of their own names on `0`, and a report
-that does not hold, or a run of it that crashes or breaks a limit, is an error
-of the step, since the program did not judge; for a `self_reported` run, one
-that runs the entrant's code, it is the run's `runtime_error` or limit
-instead.
+an empty folder of its own in its box, named in `$UNICON_REPORT`, and writes
+there one file per value it reports: `verdict`, `0` for accepted or `1` for a
+wrong answer, and each report the manifest declares. Its reports become
+outputs of their own names on `0`, and a report that does not hold, or a run
+of it that crashes or breaks a limit, is an error of the step, since the
+program did not judge; for a `self_reported` run, one that runs the entrant's
+code, it is the run's `runtime_error` or limit instead.
 """
 
+import contextlib
 import ctypes
 import errno
-import functools
 import json
 import math
 import os
 import re
 import resource
 import shutil
-import signal
-import struct
 import subprocess
 import sys
 import tempfile
-import time
 import zipfile
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
-from stat import S_IMODE, S_ISDIR, S_ISLNK, S_ISREG
+from stat import S_IMODE, S_ISREG
 from typing import BinaryIO
 
 SCHEMA_VERSION = 6
 OUTPUT_LIMIT = 32 * 1024 * 1024
-POLL_SECONDS = 0.005
-RUN_ENTRIES = 100_000
-"""The most files and folders one run may make in `/tmp`, where its working
-directory is. Removing them after it takes several times what making them
-did, and none of it is on the run's clock, so a run that makes more is
-stopped for its memory, which every entry in a tmpfs takes."""
-TOTAL_SPACING = 4.0
-"""How long to wait before reading a run's total memory again, as a multiple
-of how long the last reading took. A reading walks every page the run holds,
-about 25 microseconds a megabyte where it was measured, so at 4 this
-program spends at most a fifth of its time on it however much memory the run
-holds, and the run, which shares the container's one CPU with it, keeps the
-rest.
-"""
-STRAY_SECONDS = 1.0
-"""How long a stopped run's helper has to report before its whole group is
-killed."""
-REAP_SECONDS = 5.0
-OWNER_FOLDER = 0o700
-OWNER_FILE = 0o600
-OWNER_PROGRAM = 0o700
-OOM_EVENTS = Path("/sys/fs/cgroup/memory.events")
-PIDS_MAX = Path("/sys/fs/cgroup/pids.max")
 PROCESS_LIMIT = 128
-"""The most processes and threads a run's user may have at once, `pids` in
-`primitive.yaml`, when the container's cgroup sets none lower: a Woodpecker
-step's container has no pids limit of its own."""
-CGROUP = Path("/sys/fs/cgroup")
-NO_CGROUP = (
-    "exec: this program is not alone in a cgroup of its own with cgroup v2 "
-    "memory accounting, so memory a run keeps outside its processes, in files, "
-    "pipes or sockets, is not counted against its limit"
-)
+"""The most processes and threads a run's box user may have at once
+(`RLIMIT_NPROC`), below the container's own pids limit in `primitive.yaml`,
+so a fork bomb stops at the box's limit and leaves exec and isolate room."""
 JAVA_OUT_OF_MEMORY = 3
 RUN_PATH = "/usr/local/bin:/usr/bin:/bin"
-HELPER = "/usr/local/bin/sandbox-exec"
 FILE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 """A name a named file is placed under in the run's working directory: never
 `.` or `..`, never a path, never hidden."""
@@ -112,76 +76,70 @@ NAMED_FILE_MODE = 0o444
 RUN_ID = re.compile(r"[A-Za-z0-9_-]+")
 """A run's id, which only the forge knows the meaning of. An item's output
 goes under its place in the batch, not its id."""
-REPORT_LINE = re.compile(rb"([PSLER]) (-?[0-9]{1,20}(?: -?[0-9]{1,20}){0,3})\n")
-REFUSED_BINARY = frozenset(
-    {errno.ENOEXEC, errno.ENOMEM, errno.E2BIG, errno.EINVAL, errno.ELIBBAD}
-)
-"""What the kernel answers when it will not run a native program as built: the
-contestant's program, not the step, failed.
-"""
 REFUSED_ARGUMENTS = frozenset({errno.E2BIG})
 """What the kernel answers when the command line is too long for it, which
 only `args` can make it: the contestant's input, not the step, failed.
 """
 ELF_MAGIC = b"\x7fELF"
 
-PR_SET_DUMPABLE = 4
-PR_SET_CHILD_SUBREAPER = 36
-SYS_LANDLOCK_CREATE_RULESET = 444
-SYS_LANDLOCK_ADD_RULE = 445
-LANDLOCK_CREATE_RULESET_VERSION = 1
-LANDLOCK_RULE_PATH_BENEATH = 1
-MINIMUM_LANDLOCK_ABI = 3
-"""Reads and writes can both be confined from the first Landlock ABI, Linux
-5.13, but below ABI 3, Linux 6.2, `truncate` of a file named by path is not,
-so a run could empty a file it may only read. Renaming across directories is
-confined from ABI 2, and signals from ABI 6, which a run is kept from on top.
-"""
-FS_WRITE_FILE = 1 << 1
-FS_READ_FILE = 1 << 2
-FS_READ_DIR = 1 << 3
-FS_WRITES = sum(1 << bit for bit in (1, 4, 5, 6, 7, 8, 9, 10, 11, 12))
-FS_READS = FS_READ_FILE | FS_READ_DIR
-FS_REFER = 1 << 13
-FS_TRUNCATE = 1 << 14
-READABLE_DIRECTORIES = (
-    "/usr",
-    "/bin",
-    "/sbin",
-    "/lib",
-    "/lib32",
-    "/lib64",
-    "/libx32",
-    "/etc",
-    "/proc",
-    "/sys",
-)
-"""What a run may read besides its program and its own directory: the system's
-programs, libraries and settings, which the interpreters need (Java its
-configuration under /etc, its container support /proc/self and
-/sys/fs/cgroup), and nothing under /work or /tmp. The image holds nothing
-secret there. Those that do not exist on the machine are passed over.
-"""
-READABLE_DEVICES = ("/dev/zero", "/dev/random", "/dev/urandom")
-"""Devices a run may read besides /dev/null, which it may also write."""
-SCOPE_ABSTRACT_UNIX_SOCKET = 1 << 0
-SCOPE_SIGNAL = 1 << 1
-SYSVIPC = Path("/proc/sysvipc")
-"""The kernel's tables of the System V objects in this program's IPC
-namespace, the step container's own, one line each after a header."""
-NO_SYSVIPC = (
-    "exec: this machine shows no /proc/sysvipc, so System V objects a run "
-    "leaves cannot be found and removed; a kernel without them has none to leave"
-)
-IPC_RMID = 0
-GONE = frozenset({errno.EINVAL, errno.EIDRM})
-"""What removing a System V object answers when it is already gone."""
-NO_ATTRIBUTES = frozenset({errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP})
-"""What listing or removing an attribute answers for a path that is gone, or
-on a filesystem without attributes."""
-ACL_ATTRIBUTES = frozenset({"system.posix_acl_access", "system.posix_acl_default"})
-"""The attributes a file's owner may set outside the `user` namespace with no
-capability: its access control lists, each entry naming any user ID."""
+ISOLATE = "/usr/local/bin/isolate"
+ISOLATE_CONFIG = Path("/usr/local/etc/isolate")
+"""Where the image's isolate reads its configuration, fixed when it is built.
+exec writes it at the step's start, with the step's own box users."""
+BOX_ROOT = Path("/var/local/lib/isolate")
+LOCK_ROOT = Path("/run/isolate/locks")
+CGROUP = Path("/sys/fs/cgroup")
+"""The step container's cgroup, the root of its own cgroup namespace: a
+privileged container on cgroup v2 sees its own cgroup there, writable."""
+BOX_CGROUPS = CGROUP / "isolate"
+STEP_CGROUP = CGROUP / "step"
+CONTROLLERS = "+cpu +memory"
+BOX_DEV = Path("/run/boxdev")
+"""The `/dev` every box gets in place of the container's, which in a
+privileged container holds the machine's devices, its disks among them."""
+BOX_DEVICES = ("null", "zero", "random", "urandom")
+BOX_LINKS = {
+    "fd": "/proc/self/fd",
+    "stdin": "/proc/self/fd/0",
+    "stdout": "/proc/self/fd/1",
+    "stderr": "/proc/self/fd/2",
+}
+BOX_USERS_VARIABLE = "UNICON_BOX_USERS"
+BOX_USERS = re.compile(r"([0-9]{1,9})-([0-9]{1,9})")
+FIRST_BOX_USER = 10_000
+LAST_BOX_USER = 65_000
+"""The range every step's box users lie in: above the image's system users
+and below `nobody`, and inside the 65,536 IDs a rootless Docker's user maps."""
+UID_MAP = Path("/proc/self/uid_map")
+ROOT_DOCKER = ["0", "0", "4294967295"]
+"""The first line of `/proc/self/uid_map` where the container's root is the
+machine's own, as under root Docker: every user ID maps to itself."""
+BOX = 0
+"""The box every item runs in, one after another, made afresh each time."""
+BOX_INODES = 100_000
+"""The most files and folders a box's tmpfs holds. Removing them takes
+several times what making them did, on no run's clock, so a run that fills
+them is stopped for its memory, which every entry in a tmpfs takes."""
+BOX_ERROR_LIMIT = 4096
+"""The most of isolate's own standard error an error of the step quotes."""
+ISOLATE_STACK = 256 * 1024 * 1024
+ISOLATE_OPEN_FILES = BOX_INODES + 1024
+"""The stack and open files isolate needs: after a run it gives the box's
+tree back to root by recursing into it with a folder open at each level,
+and a run may nest folders as deep as the box's inode cap. 99,990 folders
+deep took more than an 8 MB stack."""
+BOX_FOLDERS = ("tmp", "shm")
+"""The folders on the box's tmpfs that are the run's `/tmp` and `/dev/shm`,
+so they share its size and inode cap: isolate's own tmpfs for them takes
+no size or inode options, and held over a million files."""
+JAVA_CONFIG = "/etc/java-21-openjdk"
+"""The one folder of `/etc` a box sees: the Java runtime's own, where the
+links in its installation lead. The rest of the container's `/etc` names
+the container, its address and its name server."""
+WRITE_BY_OTHERS = 0o022
+MS_NOSUID = 2
+MS_NODEV = 4
+MS_BIND = 4096
 REPORT_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 """A report a manifest declares, which becomes an output of that name and a
 file of that name in the report folder."""
@@ -300,32 +258,17 @@ class Item:
 
 @dataclass(frozen=True)
 class Program:
-    """A program ready to run: its format and the file the command starts."""
+    """A program ready to run: its format and the file the command starts,
+    as the box sees it."""
 
     kind: str
     path: Path
 
-    def readable(self) -> list[Path]:
-        """What a run of this program reads besides the system's directories:
-        the program, and for Python the interpreter's own installation, which
-        is under /usr in the image. The interpreter is started by its real
-        path, outside any virtual environment this program runs in, so it
-        reads no `pyvenv.cfg` it could not be allowed.
-        """
-        if self.kind == "python":
-            return [self.path, Path(sys.base_prefix)]
-        return [self.path]
-
-    @property
-    def mode(self) -> int:
-        """The access its file's owner needs: running it too, for a native
-        program the kernel starts itself.
-        """
-        return OWNER_PROGRAM if self.kind == "native" else OWNER_FILE
-
     def command(self, item: Item) -> list[str]:
         """The command line that runs this program for one item, the item's
-        arguments last.
+        arguments last. The interpreters are the image's own, which every box
+        sees under `/usr`; Python's is started by its real path, outside any
+        virtual environment exec runs in.
         """
         if self.kind == "native":
             return [str(self.path), *item.args]
@@ -336,7 +279,7 @@ class Program:
         if java is None:
             raise PrimitiveError("this image has no Java runtime to run a jar with")
         return [
-            java,
+            os.path.realpath(java),
             f"-Xmx{max(16, int(item.memory_limit))}m",
             "-Xss64m",
             "-XX:+UseSerialGC",
@@ -351,74 +294,27 @@ class Program:
 
 @dataclass(frozen=True)
 class Run:
-    """What one run did: how it ended and what it used.
+    """What one run did, as isolate's meta file and the box's tmpfs tell it.
 
-    `returncode` is the exit code, or minus the signal that killed it.
-    `stopped` names the limit this program stopped it for, if any.
+    `status` is isolate's: empty when the program exited 0, `RE` for another
+    exit code, `SG` for a signal, `TO` for a time limit. `returncode` is the
+    exit code, or minus the signal that killed it. `memory_kb` is the peak of
+    the box's cgroup (`cg-mem`). `out_of_memory` says the kernel killed a
+    process of the box for the box's memory, and `no_inodes` that the box's
+    tmpfs had no file or folder left to give.
     """
 
+    status: str
     returncode: int
     cpu_seconds: float
-    wall_seconds: float
     memory_kb: int
     output_bytes: int
-    stopped: str | None
     out_of_memory: bool = False
+    no_inodes: bool = False
 
 
-@dataclass
-class RunMemory:
-    """The memory of one run's processes, read while the run goes on.
-
-    `peak_kb` is the highest of three readings, in kilobytes. One is the peak
-    resident memory of each process alone, which the kernel keeps itself
-    (`VmHWM`), so no process's own peak between two readings is missed. The
-    second is the resident memory of all the run's processes added up, with
-    each page several of them share divided among them (`Pss`): a child
-    forked from the program shares its parent's pages until it changes them,
-    so it is charged only for the pages it changes, while two processes that
-    each fill memory of their own are charged for both. The third is what
-    `cgroup`, the step container's, holds beyond what it held when the
-    reading began, before the run started (`held_kb`): that counts what no
-    process's pages do, the files a run keeps in its own directory, which is
-    in a tmpfs, files it deleted and keeps open, memory files, and pipe and
-    socket buffers, and only one run goes at a time. The kernel keeps no peak
-    of the second and the third, so memory held for less than the time
-    between two readings is not seen; the container's own memory limit holds
-    it.
-
-    Reading the total walks every page the run holds, so it is read only
-    when it could raise the peak, that is when the processes' resident memory
-    added up, which the total never exceeds, is above the peak: never for a
-    run of one process. It is read again only once `TOTAL_SPACING` times as
-    long as the last reading took has passed.
-    """
-
-    cgroup: Path | None = None
-    peak_kb: int = 0
-    total_due: float = 0.0
-    held_before: int | None = field(init=False, default=None)
-
-    def __post_init__(self) -> None:
-        if self.cgroup is not None:
-            self.held_before = held_kb(self.cgroup)
-
-    def read(self, processes: set[int]) -> None:
-        """Read the memory of the run's processes and raise the peak."""
-        held = held_kb(self.cgroup) if self.cgroup is not None else None
-        if held is not None and self.held_before is not None:
-            self.peak_kb = max(self.peak_kb, held - self.held_before)
-        resident: dict[int, int] = {}
-        for pid in processes:
-            highest, resident[pid] = resident_memory(pid)
-            self.peak_kb = max(self.peak_kb, highest)
-        started = time.monotonic()
-        if sum(resident.values()) <= self.peak_kb or started < self.total_due:
-            return
-        total = sum(proportional_memory(pid, kb) for pid, kb in resident.items())
-        self.peak_kb = max(self.peak_kb, total)
-        ended = time.monotonic()
-        self.total_due = ended + TOTAL_SPACING * (ended - started)
+NOT_STARTED = Run("RE", 127, 0.0, 0, 0)
+"""A run that could not start, for its command line: a `runtime_error`."""
 
 
 def main(argv: list[str]) -> int:
@@ -497,7 +393,7 @@ def read_item(root: Path, entry: object, number: int) -> Item:
         raise PrimitiveError(
             f"the run {run} is self_reported without a manifest, so it reports nothing"
         )
-    return Item(
+    item = Item(
         run=run,
         number=number,
         program=input_file(root, inputs, "program", run),
@@ -510,6 +406,19 @@ def read_item(root: Path, entry: object, number: int) -> Item:
         manifest=manifest,
         self_reported=self_reported,
     )
+    # isolate reads a limit of 0 as none, and takes the time in whole
+    # milliseconds and the memory in whole kilobytes.
+    if item.time_limit < 0.001:
+        raise PrimitiveError(
+            f"the input named time_limit of run {run} is under a millisecond, "
+            "which isolate would read as no limit"
+        )
+    if item.memory_limit_kb == 0:
+        raise PrimitiveError(
+            f"the input named memory_limit of run {run} is under a kilobyte, "
+            "which isolate would read as no limit"
+        )
+    return item
 
 
 def read_manifest(path: Path, what: str) -> dict[str, Declared]:
@@ -641,66 +550,25 @@ def arguments(inputs: dict[str, object], run: str) -> tuple[str, ...]:
 
 
 def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
-    """Run every item in order and return one outputs entry per item.
+    """Set the step up for its boxes, then run the items one after another,
+    in the order given, each in a fresh box with a fresh copy of its program,
+    and return one outputs entry per item.
 
-    This program makes itself the subreaper of everything it starts, and not
-    dumpable, so no run can trace it or open its memory or file descriptors
-    even without Landlock. It ignores SIGINT, the one signal Python would act
-    on: as the container's first process the kernel already keeps every
-    signal it has no handler for away from it, so a run cannot stop it.
+    isolate's meta file and its own standard error go in a folder of exec's
+    in the container's `/tmp`, which no box sees.
     """
-    prctl(PR_SET_CHILD_SUBREAPER, 1)
-    prctl(PR_SET_DUMPABLE, 0)
-    if own_cgroup() is None:
-        print(NO_CGROUP, file=sys.stderr)
-    if not SYSVIPC.is_dir():
-        print(NO_SYSVIPC, file=sys.stderr)
-    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    try:
-        return run_all(root, items)
-    finally:
-        signal.signal(signal.SIGINT, previous)
-
-
-def run_all(root: Path, items: list[Item]) -> list[dict[str, object]]:
-    """Run the items one after another, in the order given, each on a copy of
-    its program of its own.
-
-    A run may take this program's access away from the program under `in/`
-    and from the scratch folder its copy is in, both of which it can name, so
-    each is given back before the copy is made and before it is removed: a
-    run that could make the next copy fail would end the whole batch in an
-    error, which a run whose results are shown later could do or not by what
-    its input holds.
-
-    Nothing runs unless the kernel offers Landlock at `MINIMUM_LANDLOCK_ABI`
-    or later: without it a run could read the other runs' inputs and outputs
-    and write the files `outputs.json` is built from.
-    """
-    abi = landlock_abi()
-    if abi < MINIMUM_LANDLOCK_ABI:
-        raise PrimitiveError(
-            "this machine's kernel does not offer Landlock ABI 3, which every run "
-            "is confined with; it needs Linux 6.2 or later with Landlock enabled"
-        )
-    scratch = Path(tempfile.mkdtemp(prefix=".exec-", dir=root))
+    users = box_users()
+    set_up_step(users)
+    scratch = Path(tempfile.mkdtemp(prefix="exec-"))
     kinds: dict[Path, str] = {}
     results: list[dict[str, object]] = []
     try:
         for item in items:
-            give_back_along(root, item.program)
-            give_back(scratch)
             if item.program not in kinds:
                 kinds[item.program] = detect(item.program)
-            program = prepare(item, kinds[item.program], scratch)
-            try:
-                outputs = run_item(root, item, program, abi)
-            finally:
-                give_back(scratch)
-                program.path.unlink(missing_ok=True)
+            outputs = run_item(root, item, kinds[item.program], scratch, users)
             results.append({"run": item.run, "outputs": outputs})
     finally:
-        give_back_tree(root)
         shutil.rmtree(scratch, ignore_errors=True)
     return results
 
@@ -726,92 +594,266 @@ def detect(program: Path) -> str:
     )
 
 
-def prepare(item: Item, kind: str, scratch: Path) -> Program:
-    """Get the item's program, of format `kind`, ready to run: copied into the
-    scratch directory for this item alone, and for a native executable marked
-    executable there, since the file under `in/` may not be.
+def run_item(
+    root: Path, item: Item, kind: str, scratch: Path, users: range
+) -> dict[str, object]:
+    """Run one item, its program of format `kind`, in a fresh box and return
+    its outputs, all of them whatever the outcome: what the program printed,
+    its CPU time and its peak memory.
 
-    A run is this program's user, so it may set an attribute, a mode or a
-    time on the file it runs, which Landlock does not stop; a copy of its own,
-    removed after it, leaves none of them for the next item. The copy is made
-    before the item's clock starts, so its time is not the run's.
+    The box's folder is a tmpfs of its own, laid out as `/box/program`, the
+    copy of the program, `/box/run`, the run's working directory holding its
+    named files, `/box/tmp` and `/box/shm`, which the run sees as `/tmp` and
+    `/dev/shm` too, so the tmpfs's size and inode cap hold them, and for a
+    program given a manifest `/box/report`, its report folder, which is read
+    before the tmpfs goes.
+
+    The time is the CPU time, and on `time_limit` at least the limit: a run
+    the wall clock stopped, one that slept or waited, used little CPU.
     """
-    path = scratch / f"program-{item.number}"
+    out = root / "out" / str(item.number)
+    out.mkdir(parents=True, exist_ok=True)
+    with fresh_box(BOX, box_size_kb(item)) as box:
+        program = prepare(item, kind, box)
+        place_files(box / "run", item.files | item.loads)
+        for name in BOX_FOLDERS:
+            (box / name).mkdir()
+            (box / name).chmod(0o1777)
+        report = None
+        if item.manifest is not None:
+            report = box / "report"
+            report.mkdir()
+        reports = report is not None
+        run = execute(item, program, reports, out / "output", scratch, users)
+        run = replace(run, no_inodes=os.statvfs(box).f_ffree == 0)
+        outcome = judge(run, item, kind)
+        time_ms = round(run.cpu_seconds * 1000)
+        if outcome == "time_limit":
+            time_ms = max(time_ms, item.time_limit_ms)
+        outputs: dict[str, object] = {
+            "output": {"file": f"out/{item.number}/output"},
+            "time_ms": time_ms,
+            "memory_kb": run.memory_kb,
+            "outcome": outcome,
+        }
+        if report is not None:
+            outputs |= reported(item, outcome, report, out)
+    return outputs
+
+
+def box_size_kb(item: Item) -> int:
+    """The size of an item's box tmpfs, in kilobytes: its memory limit, which
+    holds what the run writes there before the size does, as every page it
+    writes is charged to the box's memory, plus the program and the named
+    files exec copies in, which are charged to exec's, each to whole 4 KB
+    pages."""
+    copied = [item.program, *item.files.values(), *item.loads.values()]
+    return item.memory_limit_kb + sum(
+        4 * -(-path.stat().st_size // 4096) for path in copied
+    )
+
+
+def prepare(item: Item, kind: str, box: Path) -> Program:
+    """Copy the item's program, of format `kind`, into its box, before the
+    run's clock starts, executable for a native executable, since the file
+    under `in/` may not be, and readable for the others.
+
+    The run is the copy's owner while it runs, so it may change its mode,
+    times or attributes; the copy goes with the box.
+    """
     try:
-        shutil.copyfile(item.program, path)
+        shutil.copyfile(item.program, box / "program")
     except OSError as error:
         raise PrimitiveError(
             f"the program of run {item.run} could not be copied: {error.strerror}"
         ) from error
-    if kind == "native":
-        path.chmod(0o755)
-    return Program(kind, path)
+    (box / "program").chmod(0o755 if kind == "native" else 0o644)
+    return Program(kind, Path("/box/program"))
 
 
-def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, object]:
-    """Run one item and return its outputs, all of them whatever the outcome:
-    what the program printed, its CPU time and its peak memory.
+def place_files(cwd: Path, files: dict[str, Path]) -> None:
+    """Copy each named file into the run's working directory under its name,
+    readable and not writable, before the run's clock starts, so the program
+    opens `answer` or `input` as a plain relative path.
 
-    The time is the CPU time, and on `time_limit` at least the limit: a run
-    the wall clock stopped, one that slept or waited, used little CPU. An
-    argument holding a NUL character, which no command line can carry, is a
-    run that could not start, a `runtime_error`, like a program the kernel
-    will not run.
+    Each run gets copies of its own, which go with its box, and nothing is
+    read back from them, so a run that makes its copy writable again, as the
+    copy's owner may, changes only what it reads itself.
     """
-    give_back_along(root, root / "out")
-    if item.stdin is not None:
-        give_back_along(root, item.stdin)
-    give_back_along(root, program.path, program.mode)
-    out = root / "out" / str(item.number)
-    out.mkdir(parents=True, exist_ok=True)
-    output = out / "output"
-    report = None
-    if item.manifest is not None:
-        report = Path(tempfile.mkdtemp(prefix="report-"))
-    cwd = Path(tempfile.mkdtemp(prefix="run-"))
-    settle = functools.partial(settle_run, root, cwd, output)
-    try:
-        place_files(root, cwd, item.files | item.loads)
-        descriptor = os.open(
-            output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644
+    cwd.mkdir(mode=0o755)
+    for name, source in files.items():
+        placed = cwd / name
+        try:
+            shutil.copyfile(source, placed)
+        except OSError as error:
+            raise PrimitiveError(
+                f"the named file {name} could not be placed: {error.strerror}"
+            ) from error
+        placed.chmod(NAMED_FILE_MODE)
+
+
+def execute(
+    item: Item,
+    program: Program,
+    reports: bool,
+    output: Path,
+    scratch: Path,
+    users: range,
+) -> Run:
+    """Run one item's program in box `BOX`, already made and filled, and
+    return what it did.
+
+    isolate holds every limit: CPU time over all the box's processes
+    (`--time`), the wall clock (`--wall-time`), the box's memory in its
+    cgroup, without swap (`--cg-mem`), the stack at the memory limit, and the
+    box user's processes (`--processes`). The box gets `/tmp` and `/dev/shm`
+    from its own tmpfs, the step's `/dev` of four devices, and of `/etc` only
+    `JAVA_CONFIG`, read-only. The environment holds only `PATH`, `HOME` and
+    `TMPDIR`, both the working directory, `LANG=C.UTF-8`, and for a program
+    given a manifest (`reports`) `UNICON_REPORT`.
+
+    Standard input is the `stdin` file, or `/dev/null`, opened by exec and
+    handed to the box, so the file itself is never in it (`hand_over`).
+    Standard output is a pipe exec reads up to `OUTPUT_LIMIT` and one byte
+    more, then closes, so output costs the box no memory and a run printing
+    on past the limit dies of `SIGPIPE`; the output kept is cut to the
+    limit. Standard error goes nowhere.
+
+    An argument holding a NUL character, which no command line can carry,
+    and a command line too long for the kernel, which only the item's
+    arguments can make, are a run that could not start, a `runtime_error`.
+    isolate failing itself (`XX`) is an error of the step.
+    """
+    if any("\0" in argument for argument in item.args):
+        output.write_bytes(b"")
+        return NOT_STARTED
+    meta = scratch / "meta"
+    errors = scratch / "errors"
+    meta.unlink(missing_ok=True)
+    env = {"PATH": RUN_PATH, "HOME": "/box/run", "TMPDIR": "/box/run"}
+    env["LANG"] = "C.UTF-8"
+    if reports:
+        env["UNICON_REPORT"] = "/box/report"
+    command = [
+        ISOLATE,
+        "--cg",
+        f"--box-id={BOX}",
+        "--silent",
+        f"--meta={meta}",
+        f"--time={item.time_limit}",
+        f"--wall-time={item.wall_limit}",
+        f"--cg-mem={item.memory_limit_kb}",
+        f"--stack={item.memory_limit_kb}",
+        f"--processes={PROCESS_LIMIT}",
+        f"--dir=tmp={BOX_ROOT / str(BOX) / 'box' / 'tmp'}:rw",
+        f"--dir=dev={BOX_DEV}:dev",
+        f"--dir=dev/shm={BOX_ROOT / str(BOX) / 'box' / 'shm'}:rw",
+        f"--dir={JAVA_CONFIG.lstrip('/')}",
+        "--chdir=/box/run",
+        "--stderr=/dev/null",
+        *(f"--env={name}={value}" for name, value in env.items()),
+        "--run",
+        "--",
+        *program.command(item),
+    ]
+    stdin_path = item.stdin if item.stdin is not None else Path(os.devnull)
+    with (
+        stdin_path.open("rb") as stdin,
+        errors.open("wb") as stderr,
+        output.open("wb") as stdout,
+    ):
+        if item.stdin is not None:
+            hand_over(stdin.fileno(), item, users)
+        try:
+            keeper = subprocess.Popen(
+                command, stdin=stdin, stdout=subprocess.PIPE, stderr=stderr
+            )
+        except OSError as error:
+            if error.errno in REFUSED_ARGUMENTS:
+                return NOT_STARTED
+            raise PrimitiveError(
+                f"isolate could not be started: {error.strerror}"
+            ) from None
+        with keeper:
+            assert keeper.stdout is not None
+            printed = pump(keeper.stdout.fileno(), stdout, OUTPUT_LIMIT)
+            keeper.stdout.close()
+            code = keeper.wait()
+    found = read_meta(meta)
+    status = found.get("status", "")
+    if code not in (0, 1) or status == "XX":
+        said = found.get("message") or errors.read_bytes()
+        raise PrimitiveError(
+            f"isolate could not run the program: {isolate_said(code, said)}"
         )
-        stdin_path = item.stdin if item.stdin is not None else Path(os.devnull)
-        with stdin_path.open("rb") as stdin, os.fdopen(descriptor, "wb") as stdout:
-            if any("\0" in argument for argument in item.args):
-                run = Run(127, 0.0, 0.0, 0, 0, None)
-            else:
-                run = execute(program, cwd, report, stdin, stdout, item, abi)
-    except BaseException:
-        quietly(settle)
-        raise
-    settle()
-    if run.output_bytes > OUTPUT_LIMIT:
-        os.truncate(output, OUTPUT_LIMIT)
-    outcome = judge(run, item, program.kind)
-    time_ms = round(run.cpu_seconds * 1000)
-    if outcome == "time_limit":
-        time_ms = max(time_ms, item.time_limit_ms)
-    outputs: dict[str, object] = {
-        "output": {"file": f"out/{item.number}/output"},
-        "time_ms": time_ms,
-        "memory_kb": run.memory_kb,
-        "outcome": outcome,
-    }
-    if report is not None:
-        outputs |= reported(item, outcome, report, out)
-        remove_tree(report)
-    return outputs
+    if "exitcode" in found:
+        returncode = int(found["exitcode"])
+    elif "exitsig" in found:
+        returncode = -int(found["exitsig"])
+    else:
+        returncode = 0 if status == "" else -9
+    return Run(
+        status=status,
+        returncode=returncode,
+        cpu_seconds=float(found.get("time", "0")),
+        memory_kb=int(found.get("cg-mem", "0")),
+        output_bytes=printed,
+        out_of_memory=found.get("cg-oom-killed") == "1",
+    )
 
 
-def settle_run(root: Path, cwd: Path, output: Path) -> None:
-    """Undo what a run could leave for the next, once it has ended: its
-    processes, System V objects and attributes, and its working directory,
-    in that order, so nothing is removed while a process of its lives."""
-    reap_strays()
-    sweep_sysv()
-    clear_attributes(root)
-    remove_tree(cwd)
-    give_back_along(root, output)
+def hand_over(descriptor: int, item: Item, users: range) -> None:
+    """Make the item's `stdin` file, open on `descriptor`, safe to hand to
+    the box: the box can open it again through `/proc/self/fd/0`, by the
+    file's own mode and owner, so write for its group and others is taken
+    away, and a file one of the step's box users owns, who could write it
+    whatever its mode, is an error of the step."""
+    found = os.fstat(descriptor)
+    if found.st_uid in users:
+        raise PrimitiveError(
+            f"the stdin file of run {item.run} is owned by user {found.st_uid}, "
+            "a box user, who could change it from a box"
+        )
+    if found.st_mode & WRITE_BY_OTHERS:
+        os.fchmod(descriptor, S_IMODE(found.st_mode) & ~WRITE_BY_OTHERS)
+
+
+def isolate_said(code: int, said: str | bytes) -> str:
+    """What isolate said when it failed, `said` its message or its standard
+    error, or failing that how it ended: exit `code`, or a signal when
+    negative."""
+    if isinstance(said, bytes):
+        said = said[:BOX_ERROR_LIMIT].decode("utf-8", "replace")
+    said = said.strip()
+    if said:
+        return said
+    if code < 0:
+        return f"it was killed by signal {-code} and said nothing"
+    return f"it exited with code {code} and said nothing"
+
+
+def pump(source: int, target: BinaryIO, limit: int) -> int:
+    """Copy what `source` gives into `target`, up to `limit` bytes, and
+    return how many bytes it gave, reading at most one past `limit`: a
+    reader that went on would let a run print without end."""
+    given = 0
+    while given <= limit:
+        chunk = os.read(source, min(1 << 16, limit + 1 - given))
+        if not chunk:
+            break
+        target.write(chunk[: max(0, limit - given)])
+        given += len(chunk)
+    return given
+
+
+def read_meta(path: Path) -> dict[str, str]:
+    """isolate's meta file, `key:value` a line, as keys and values; empty
+    where isolate wrote none, as when it failed before the run."""
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return {}
+    return dict(line.partition(":")[::2] for line in lines if ":" in line)
 
 
 def quietly(cleanup: Callable[[], None]) -> None:
@@ -880,7 +922,6 @@ def read_report(folder: Path, manifest: dict[str, Declared]) -> Report:
     `REPORT_TEXT_LIMIT`, more than `REPORT_FILES` of them, or anything there
     that is not a plain file under a plain name.
     """
-    give_back_tree(folder)
     files = report_files(folder)
     if "verdict" not in files:
         raise ReportError("has no verdict")
@@ -986,823 +1027,244 @@ def shown_bytes(content: bytes) -> str:
     return repr(text + "...") if len(content) > 24 else repr(text)
 
 
-def place_files(root: Path, cwd: Path, files: dict[str, Path]) -> None:
-    """Copy each named file into the run's working directory under its name,
-    readable and not writable, before the run's clock starts, so the program
-    opens `answer` or `input` as a plain relative path.
-
-    Each run gets copies of its own, removed with its directory, and nothing
-    is read back from them, so a run that makes its copy writable again, as
-    the copy's owner may, changes only what it reads itself. A source under
-    `in/` an earlier run took this program's access away from is given back
-    first, as the program is.
-    """
-    for name, source in files.items():
-        give_back_along(root, source)
-        placed = cwd / name
-        try:
-            shutil.copyfile(source, placed)
-        except OSError as error:
-            raise PrimitiveError(
-                f"the named file {name} could not be placed: {error.strerror}"
-            ) from error
-        placed.chmod(NAMED_FILE_MODE)
-
-
-def execute(
-    program: Program,
-    cwd: Path,
-    report_folder: Path | None,
-    stdin: BinaryIO,
-    stdout: BinaryIO,
-    item: Item,
-    abi: int,
-) -> Run:
-    """Start one run and watch it until it and everything it started are gone.
-
-    The program is started through `sandbox-exec`, which forks it and reports
-    its process id and, once it ends, its exit status, CPU time and peak
-    memory. Every few milliseconds every process of the run is read: their
-    CPU time together, their memory (see `RunMemory`), the wall-clock time
-    and the output size, and the program is killed as soon as one is over its
-    limit, or once it has made more than `RUN_ENTRIES` files and folders in
-    `/tmp`, for its memory. Resource limits set before the start back this
-    up: CPU time, file size, stack, and no core dumps.
-
-    The memory reported is the higher of the program's own peak, as
-    `sandbox-exec` saw it, and the highest this program read while the run
-    went on.
-
-    The CPU time reported is the program's own, as `sandbox-exec` saw it, plus
-    that of every process the run left behind, which this program reaps, so a
-    run cannot hide work in a child it never waits for. A run that kills
-    `sandbox-exec` is judged on what this program measured itself.
-
-    A command line too long for the kernel, which only the item's arguments
-    can make, is a run that could not start, judged as a native program the
-    kernel will not run is.
-
-    A run given a `report_folder` may write there too, and finds it named in
-    `UNICON_REPORT`.
-    """
-    env = {"PATH": RUN_PATH, "HOME": str(cwd), "TMPDIR": str(cwd), "LANG": "C.UTF-8"}
-    writable = [cwd]
-    if report_folder is not None:
-        env["UNICON_REPORT"] = str(report_folder)
-        writable.append(report_folder)
-    try:
-        ruleset = landlock_ruleset(writable, program.readable(), abi)
-    except OSError as error:
-        raise PrimitiveError(
-            f"the run could not be confined with Landlock: {error.strerror}"
-        ) from None
-    read_end, write_end = os.pipe()
-    passed = (write_end, ruleset)
-    memory = RunMemory(cgroup=own_cgroup())
-    entries = tmp_entries()
-    started = time.monotonic()
-    try:
-        helper = subprocess.Popen(
-            [HELPER, str(write_end), str(ruleset), *program.command(item)],
-            cwd=cwd,
-            env=env,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=subprocess.DEVNULL,
-            pass_fds=passed,
-            start_new_session=True,
-            preexec_fn=child_setup(item, process_limit()),
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        os.close(read_end)
-        if isinstance(error, OSError) and error.errno in REFUSED_ARGUMENTS:
-            return Run(127, 0.0, 0.0, 0, 0, None)
-        raise PrimitiveError(f"the program could not be started: {error}") from None
-    finally:
-        os.close(write_end)
-        os.close(ruleset)
-    os.set_blocking(read_end, False)
-    report = bytearray()
-    pid = 0
-    stopped: str | None = None
-    stopped_at = 0.0
-    killed_before = oom_kills()
-    cpu = 0.0
-    me = os.getpid()
-    while True:
-        report += drain(read_end)
-        pid = pid or parse_report(report).get("P", [0])[0]
-        done, status, _ = os.wait4(helper.pid, os.WNOHANG)
-        if done:
-            break
-        cpu, processes = sample(me, helper.pid)
-        memory.read(processes)
-        now = time.monotonic()
-        if stopped is None:
-            if cpu > item.time_limit or now - started > item.wall_limit:
-                stopped = "time"
-            elif (
-                memory.peak_kb > item.memory_limit_kb
-                or tmp_entries() - entries > RUN_ENTRIES
-            ):
-                stopped = "memory"
-            elif os.fstat(stdout.fileno()).st_size > OUTPUT_LIMIT:
-                stopped = "output"
-            if stopped:
-                stopped_at = now
-                kill(pid or -helper.pid)
-                # The run may have stopped `sandbox-exec` with SIGSTOP where
-                # Landlock does not scope signals, and a stopped helper never
-                # reaps the program; woken, it reports at once, and whatever
-                # is left goes after STRAY_SECONDS.
-                wake(helper.pid)
-        elif now - stopped_at > STRAY_SECONDS:
-            kill(-helper.pid)
-        time.sleep(POLL_SECONDS)
-    wall = time.monotonic() - started
-    helper.returncode = os.waitstatus_to_exitcode(status)
-    report += drain(read_end)
-    os.close(read_end)
-    lines = parse_report(report)
-    before_strays = children_cpu()
-    reap_strays()
-    strays = children_cpu() - before_strays
-    if "S" in lines:
-        raise PrimitiveError(
-            "the run could not be put under its system call filter: "
-            f"{os.strerror(lines['S'][0])}"
-        )
-    if "L" in lines:
-        raise PrimitiveError(
-            f"the run could not be confined with Landlock: {os.strerror(lines['L'][0])}"
-        )
-    if "E" in lines:
-        refused = lines["E"][0]
-        contestants = REFUSED_BINARY if program.kind == "native" else frozenset()
-        if refused not in contestants | REFUSED_ARGUMENTS:
-            raise PrimitiveError(
-                f"the program could not be started: {os.strerror(refused)}"
-            )
-        return Run(127, 0.0, wall, 0, 0, stopped)
-    if "R" in lines:
-        ended, user_us, system_us, maxrss_kb = lines["R"]
-        returncode = os.waitstatus_to_exitcode(ended)
-        reported = (user_us + system_us) / 1e6
-    elif os.WIFSIGNALED(status):
-        returncode, reported, maxrss_kb = -signal.SIGKILL, 0.0, 0
-    else:
-        raise PrimitiveError("a run ended without sandbox-exec reporting what it used")
-    return Run(
-        returncode=returncode,
-        cpu_seconds=max(reported + strays, cpu),
-        wall_seconds=wall,
-        memory_kb=max(maxrss_kb, memory.peak_kb),
-        output_bytes=os.fstat(stdout.fileno()).st_size,
-        stopped=stopped,
-        out_of_memory=returncode == -signal.SIGKILL and oom_kills() > killed_before,
-    )
-
-
-def drain(fd: int) -> bytes:
-    """Read whatever a non-blocking pipe holds right now."""
-    data = bytearray()
-    while True:
-        try:
-            chunk = os.read(fd, 4096)
-        except BlockingIOError:
-            break
-        if not chunk:
-            break
-        data += chunk
-    return bytes(data)
-
-
-def parse_report(report: bytes | bytearray) -> dict[str, list[int]]:
-    """The complete lines of `sandbox-exec`'s report, by tag, as their numbers.
-
-    A tag's first line counts: `sandbox-exec` writes each once. Anything that
-    is not a line it writes is passed over.
-    """
-    lines: dict[str, list[int]] = {}
-    for line in bytes(report).splitlines(keepends=True):
-        if not line.endswith(b"\n"):
-            break
-        matched = REPORT_LINE.fullmatch(line)
-        if matched is None:
-            continue
-        tag = matched.group(1).decode()
-        if tag not in lines:
-            lines[tag] = [int(number) for number in matched.group(2).split()]
-    return lines
-
-
-def children_cpu() -> float:
-    """CPU seconds of every child this program has reaped so far."""
-    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-    return usage.ru_utime + usage.ru_stime
-
-
-def process_limit() -> int:
-    """The processes a run's user may have at once: the container's own pids
-    limit, or `PROCESS_LIMIT` when it sets none or a higher one."""
-    try:
-        text = PIDS_MAX.read_text().strip()
-    except OSError:
-        return PROCESS_LIMIT
-    return min(int(text), PROCESS_LIMIT) if text.isdigit() else PROCESS_LIMIT
-
-
-def child_setup(item: Item, processes: int) -> Callable[[], None]:
-    """The function the child runs between fork and exec."""
-
-    def setup() -> None:
-        """Set the run's resource limits, put the run first in line for the
-        kernel's out-of-memory killer, and let SIGINT act again.
-
-        A POSIX message queue outlives the process that made it, as a System
-        V object does, and none can be listed to remove it, so a run may make
-        none: `RLIMIT_MSGQUEUE` at 0 gives it no bytes for one.
-        `RLIMIT_NPROC` at `processes` stops a fork bomb where the container
-        has no pids limit; it counts every process and thread of the run's
-        user, this program and `sandbox-exec` among them, so it holds only
-        where the user is the grading's own.
-        """
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        resource.setrlimit(resource.RLIMIT_MSGQUEUE, (0, 0))
-        resource.setrlimit(resource.RLIMIT_NPROC, (processes, processes))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (OUTPUT_LIMIT + 1, OUTPUT_LIMIT + 1))
-        cpu = math.ceil(item.time_limit) + 1
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
-        stack = item.memory_limit_kb * 1024
-        _, hard = resource.getrlimit(resource.RLIMIT_STACK)
-        if hard == resource.RLIM_INFINITY or stack <= hard:
-            resource.setrlimit(resource.RLIMIT_STACK, (stack, hard))
-        try:
-            Path("/proc/self/oom_score_adj").write_text("1000")
-        except OSError:
-            pass
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-
-    return setup
-
-
 def judge(run: Run, item: Item, kind: str) -> str:
-    """Give a run its outcome.
+    """Give a run its outcome, from what isolate and the box's tmpfs say, in
+    this order.
 
-    The limit the run was stopped for comes first. Otherwise the output limit,
-    the time limits and the memory limit are checked in that order against
-    what was measured and how the run ended, and any other failure is a
-    runtime error. A jar that ran out of Java heap exits with code 3, and a
-    run the kernel killed for the container's memory is over the memory
-    limit too: it held more than the container allows, between two readings
-    or where this program could not count it.
+    A run the kernel killed for the box's memory is `memory_limit`, though
+    isolate reads that as a signal too, and so is one that left its tmpfs no
+    file or folder to give: it was stopped by what its files held, as every
+    one of them takes memory. Then `TO`, isolate's for the CPU time and the
+    wall clock both, is `time_limit`. Then output over `OUTPUT_LIMIT` is
+    `output_limit`, before the signal, since a run that printed on died of
+    `SIGPIPE` when exec stopped reading. A jar that ran out of Java heap
+    exits with code 3, `memory_limit`. Any other signal or failure is a
+    runtime error.
     """
-    if run.stopped:
-        return {"time": "time_limit", "memory": "memory_limit"}.get(
-            run.stopped, "output_limit"
-        )
-    if run.returncode == -signal.SIGXFSZ or run.output_bytes > OUTPUT_LIMIT:
-        return "output_limit"
-    if (
-        run.returncode == -signal.SIGXCPU
-        or run.cpu_seconds > item.time_limit
-        or run.wall_seconds > item.wall_limit
-    ):
-        return "time_limit"
-    if (
-        run.memory_kb > item.memory_limit_kb
-        or run.out_of_memory
-        or (kind == "java" and run.returncode == JAVA_OUT_OF_MEMORY)
-    ):
+    if run.out_of_memory or run.no_inodes:
         return "memory_limit"
-    if run.returncode != 0:
+    if run.status == "TO":
+        return "time_limit"
+    if run.output_bytes > OUTPUT_LIMIT:
+        return "output_limit"
+    if kind == "java" and run.returncode == JAVA_OUT_OF_MEMORY:
+        return "memory_limit"
+    if run.status in ("RE", "SG") or run.returncode != 0:
         return "runtime_error"
     return "accepted"
 
 
-def sample(me: int, helper: int) -> tuple[float, set[int]]:
-    """The run's CPU seconds so far and the process ids of the run.
-
-    The run is every process descended from this program but `sandbox-exec`:
-    the program, whatever it started, and whatever it left behind, which comes
-    back to this program as the subreaper. Their CPU time is added up, with
-    what each has reaped of its own children.
-    """
-    parents: dict[int, int] = {}
-    ticks: dict[int, int] = {}
-    for entry in (path.name for path in Path("/proc").iterdir()):
-        if not entry.isdigit():
-            continue
-        try:
-            stat = Path(f"/proc/{entry}/stat").read_text()
-        except OSError:
-            continue
-        fields = stat[stat.rindex(")") + 2 :].split()
-        parents[int(entry)] = int(fields[1])
-        ticks[int(entry)] = sum(int(field) for field in fields[11:15])
-    run = descendants(me, parents) - {helper}
-    cpu = sum(ticks[pid] for pid in run) / os.sysconf("SC_CLK_TCK")
-    return cpu, run
-
-
-def descendants(root: int, parents: dict[int, int]) -> set[int]:
-    """Every process below `root`, from each process's parent."""
-    children: dict[int, list[int]] = {}
-    for pid, parent in parents.items():
-        children.setdefault(parent, []).append(pid)
-    found: set[int] = set()
-    waiting = list(children.get(root, []))
-    while waiting:
-        pid = waiting.pop()
-        if pid not in found:
-            found.add(pid)
-            waiting.extend(children.get(pid, []))
-    return found
-
-
-def resident_memory(pid: int) -> tuple[int, int]:
-    """A process's peak and present resident memory in kilobytes, 0 and 0 when
-    it has none.
-    """
-    try:
-        status = Path(f"/proc/{pid}/status").read_text()
-    except OSError:
-        return 0, 0
-    found = {"VmHWM": 0, "VmRSS": 0}
-    for line in status.splitlines():
-        name, _, value = line.partition(":")
-        if name in found:
-            found[name] = int(value.split()[0])
-    return found["VmHWM"], found["VmRSS"]
-
-
-def proportional_memory(pid: int, resident_kb: int) -> int:
-    """A process's resident memory in kilobytes with each page it shares
-    divided among the processes that share it (`Pss`), 0 once it has ended.
-
-    A process whose pages this program may not read, one that made itself not
-    dumpable, is counted at `resident_kb`, its whole resident memory, so it
-    cannot hide what it holds from the total.
-    """
-    try:
-        rollup = Path(f"/proc/{pid}/smaps_rollup").read_text()
-    except PermissionError:
-        return resident_kb
-    except OSError:
-        return 0
-    for line in rollup.splitlines():
-        if line.startswith("Pss:"):
-            return int(line.split()[1])
-    return 0
-
-
-def own_cgroup() -> Path | None:
-    """The cgroup that holds this program and its runs and nothing else: the
-    step container's, which sees its own cgroup as the root of its cgroup
-    namespace (the harness asks for a private one, and the socket filter
-    refuses the host's), with cgroup v2's
-    memory accounting. None anywhere else, such as a test run on a machine,
-    whose cgroup holds other processes too.
-    """
-    try:
-        lines = Path("/proc/self/cgroup").read_text().splitlines()
-    except OSError:
-        return None
-    if "0::/" not in lines or not (CGROUP / "memory.current").is_file():
-        return None
-    return CGROUP
-
-
-def held_kb(cgroup: Path) -> int | None:
-    """What the cgroup holds that a run can hold on purpose, in kilobytes:
-    everything charged to it (`memory.current`) but the pages of files on
-    disk, which the kernel takes back when it needs them (`file` in
-    `memory.stat`, less `shmem`, which it counts there too and cannot take
-    back). That is anonymous memory, files in a tmpfs, memory files, pipe and
-    socket buffers, and the kernel's own memory for the processes. Both
-    files are readable even where the cgroup is not writable; none where
-    they are missing.
-    """
-    try:
-        current = int((cgroup / "memory.current").read_text())
-        stat = (cgroup / "memory.stat").read_text()
-    except OSError, ValueError:
-        return None
-    counts = dict(line.partition(" ")[::2] for line in stat.splitlines())
-    try:
-        reclaimable = int(counts.get("file", "0")) - int(counts.get("shmem", "0"))
-    except ValueError:
-        return None
-    return (current - reclaimable) // 1024
-
-
-def oom_kills() -> int:
-    """How many processes the kernel has killed in this container for want
-    of memory, from its cgroup's `memory.events`, readable even where the
-    cgroup is not writable; 0 where there is no such file.
-    """
-    try:
-        events = OOM_EVENTS.read_text()
-    except OSError:
-        return 0
-    for line in events.splitlines():
-        name, _, count = line.partition(" ")
-        if name == "oom_kill":
-            return int(count)
-    return 0
-
-
-def wake(pid: int) -> None:
-    """Continue a process that may have been stopped."""
-    try:
-        os.kill(pid, signal.SIGCONT)
-    except ProcessLookupError, PermissionError:
-        pass
-
-
-def kill(pid: int) -> None:
-    """Kill one process, or a whole process group when `pid` is negative."""
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError, PermissionError:
-        pass
-
-
-def reap_strays() -> None:
-    """Kill and reap every process a run left behind.
-
-    This program is the subreaper of everything it starts, so a process that
-    outlived the run, even one that left its session, is one of its children.
-    """
-    deadline = time.monotonic() + REAP_SECONDS
-    while time.monotonic() < deadline:
-        for pid in child_pids():
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        try:
-            while os.waitpid(-1, os.WNOHANG)[0]:
-                pass
-        except ChildProcessError:
-            return
-        time.sleep(POLL_SECONDS)
-    raise PrimitiveError("processes left behind by a run could not be stopped")
-
-
-def sweep_sysv() -> None:
-    """Remove every System V shared memory segment, message queue and
-    semaphore set in this program's IPC namespace, once a run's processes are
-    gone, so no run finds what an earlier one left.
-
-    The step container has an IPC namespace of its own, and every run is
-    this program's user, so every object in it is one a run made and this
-    program may remove. One that cannot be removed, for any reason but being
-    gone already, is an error of the step: it would carry one run's data to
-    the next. Without `SYSVIPC` the kernel has no System V objects to leave.
-    """
-    for kind in ("shm", "msg", "sem"):
-        try:
-            lines = (SYSVIPC / kind).read_text().splitlines()[1:]
-        except FileNotFoundError:
-            continue
-        for line in lines:
-            remove_sysv(kind, int(line.split()[1]))
-
-
-def remove_sysv(kind: str, identifier: int) -> None:
-    """Remove one System V object of `kind` by its id, `IPC_RMID`."""
-    c = libc()
-    if kind == "sem":
-        result = c.semctl(identifier, 0, IPC_RMID)
-    else:
-        remove = c.shmctl if kind == "shm" else c.msgctl
-        result = remove(identifier, IPC_RMID, None)
-    if result != 0 and ctypes.get_errno() not in GONE:
+def box_users() -> range:
+    """The step's box users, from `UNICON_BOX_USERS`, `<first>-<last>`, both
+    included, which whoever starts the step sets: users no other step that
+    can run at the same time on the machine has, and no container's user,
+    all within 10,000 to 65,000. exec runs one box at a time, so it needs
+    one; it is given them all so a step that runs boxes side by side can
+    have more."""
+    text = os.environ.get(BOX_USERS_VARIABLE)
+    if text is None:
         raise PrimitiveError(
-            f"a System V object a run left, {kind} {identifier}, could not be "
-            f"removed: {os.strerror(ctypes.get_errno())}"
+            f"{BOX_USERS_VARIABLE} is not set, so exec has no box users of the "
+            "step's own to run the programs as"
+        )
+    matched = BOX_USERS.fullmatch(text)
+    if matched is None:
+        raise PrimitiveError(f"{BOX_USERS_VARIABLE} is not <first>-<last>: {text!r}")
+    first, last = int(matched.group(1)), int(matched.group(2))
+    if not FIRST_BOX_USER <= first <= last <= LAST_BOX_USER:
+        raise PrimitiveError(
+            f"{BOX_USERS_VARIABLE} is {text}, not a range within "
+            f"{FIRST_BOX_USER} to {LAST_BOX_USER}"
+        )
+    return range(first, last + 1)
+
+
+def set_up_step(users: range) -> None:
+    """Set the step container up for isolate's boxes, as root, in this order:
+    refuse root Docker's identity map (`check_shape`), raise the limits
+    isolate inherits (`raise_limits`), give the boxes a cgroup
+    (`set_up_cgroup`) and a `/dev` (`set_up_devices`), and write isolate's
+    configuration with the step's box users. Any failure is an error of the
+    step, and nothing runs. Each step is safe to take again, so a step that
+    runs exec twice, as the tests do, sets up once.
+    """
+    check_shape()
+    raise_limits()
+    try:
+        set_up_cgroup()
+        set_up_devices()
+        ISOLATE_CONFIG.write_text(
+            f"box_root = {BOX_ROOT}\n"
+            f"lock_root = {LOCK_ROOT}\n"
+            f"cg_root = {BOX_CGROUPS}\n"
+            f"first_uid = {users.start}\n"
+            f"first_gid = {users.start}\n"
+            f"num_boxes = {len(users)}\n"
+        )
+        BOX_ROOT.mkdir(parents=True, exist_ok=True)
+        LOCK_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise PrimitiveError(
+            f"the step could not be set up for its boxes, {error.filename}: "
+            f"{error.strerror}; exec runs as root in a privileged container"
+        ) from None
+
+
+def check_shape() -> None:
+    """Refuse root Docker's identity map: where the first line of
+    `/proc/self/uid_map` is exactly `0 0 4294967295`, as under root Docker,
+    a privileged step would be the machine's root. exec is meant for a
+    container whose root is a user namespace's, as under rootless Docker;
+    this check catches root Docker, not every map whose root is the
+    machine's. Without a map to read, it does not start either."""
+    try:
+        first = UID_MAP.read_text().splitlines()[0].split()
+    except OSError, IndexError:
+        first = None
+    if first is None or first == ROOT_DOCKER:
+        raise PrimitiveError(
+            "this container has root Docker's identity user ID map, where its "
+            "root is the machine's own root; exec runs only where it is a user "
+            "namespace's, as under rootless Docker"
+        )
+    if os.geteuid() != 0:
+        raise PrimitiveError(
+            "exec runs as root in a privileged container, to make its boxes"
         )
 
 
-def clear_attributes(top: Path) -> None:
-    """Remove every extended attribute in the `user` namespace from `top` and
-    everything under it, once a run's processes are gone.
-
-    A run may set one on any file or folder it can name and write, which
-    Landlock does not stop: the next item's input, `out/`, its own output.
-    Each holds a few kilobytes, as many as the filesystem allows, so a run
-    could keep work there for the next one. Its owner may also set an
-    access control list on it, and a default one on a folder, whose
-    entries name any user ID they like, so those are removed too; no other
-    namespace may be set without a capability. A run may also take this
-    program's access away from what it set one on, with `chmod`, which
-    Landlock does not stop either, so each path is given back before its
-    attributes are listed or removed, and a folder before what is in it. A
-    path that is gone, or a filesystem without attributes, is passed over;
-    an attribute that still can't be removed is a `PrimitiveError`, since
-    the next run would find it.
-    """
-    folders = [top]
-    while folders:
-        folder = folders.pop()
-        give_back(folder)
-        clear_attributes_of(folder)
-        try:
-            entries = list(os.scandir(folder))
-        except FileNotFoundError:
-            continue
-        except OSError as error:
+def raise_limits() -> None:
+    """Raise exec's own stack and open-files limits to what isolate needs,
+    `ISOLATE_STACK` and `ISOLATE_OPEN_FILES`, for isolate inherits them; a
+    box gets isolate's own limits, not these. Where the container's hard
+    limit is below that, exec does not start, rather than have isolate fail
+    on a run's deep tree and end the batch in an error."""
+    for kind, name, need in (
+        (resource.RLIMIT_STACK, "stack", ISOLATE_STACK),
+        (resource.RLIMIT_NOFILE, "open files", ISOLATE_OPEN_FILES),
+    ):
+        soft, hard = resource.getrlimit(kind)
+        if hard != resource.RLIM_INFINITY and hard < need:
             raise PrimitiveError(
-                f"a folder a run could have marked, {folder}, could not be "
-                f"listed: {error.strerror}"
-            ) from error
-        for entry in entries:
-            if entry.is_dir(follow_symlinks=False):
-                folders.append(Path(entry.path))
-            elif not entry.is_symlink():
-                give_back(Path(entry.path))
-                clear_attributes_of(Path(entry.path))
+                f"the container's hard limit on {name}, {hard}, is below the "
+                f"{need} isolate needs to give back a box's deepest tree"
+            )
+        if soft != resource.RLIM_INFINITY and soft < need:
+            resource.setrlimit(kind, (need, hard))
 
 
-def clear_attributes_of(path: Path) -> None:
-    """Remove the `user` attributes of one path, not following a link, and
-    its access control lists when this program's user owns it: no run can
-    set one on a path another user owns, and only the owner may remove it.
+def set_up_cgroup() -> None:
+    """Make the cgroup isolate puts each box's cgroup under, `isolate`, with
+    the CPU and memory controllers on. A cgroup with processes in it cannot
+    hand controllers to its children, so every process in the container's
+    cgroup first moves to `step`; one that will not, gone already, is passed
+    over."""
+    STEP_CGROUP.mkdir(exist_ok=True)
+    for pid in (CGROUP / "cgroup.procs").read_text().split():
+        with contextlib.suppress(OSError):
+            (STEP_CGROUP / "cgroup.procs").write_text(pid)
+    (CGROUP / "cgroup.subtree_control").write_text(CONTROLLERS)
+    BOX_CGROUPS.mkdir(exist_ok=True)
+    (BOX_CGROUPS / "cgroup.subtree_control").write_text(CONTROLLERS)
+
+
+def set_up_devices() -> None:
+    """Make `BOX_DEV`, the `/dev` every box gets: the container's null,
+    zero, random and urandom bound in, the `fd` and standard stream links,
+    and an empty `shm`, where each box's own `/box/shm` is bound. A box
+    then cannot even name the machine's devices."""
+    (BOX_DEV / "shm").mkdir(parents=True, exist_ok=True)
+    for name in BOX_DEVICES:
+        node = BOX_DEV / name
+        if not node.exists():
+            node.touch()
+        if not node.is_mount():
+            mount(Path("/dev") / name, node, None, MS_BIND, None)
+    for name, target in BOX_LINKS.items():
+        if not (BOX_DEV / name).is_symlink():
+            (BOX_DEV / name).symlink_to(target)
+
+
+@contextlib.contextmanager
+def fresh_box(number: int, size_kb: int) -> Iterator[Path]:
+    """Make box `number` afresh and give its folder, a tmpfs of its own of
+    `size_kb` kilobytes and `BOX_INODES` files and folders; on every way out,
+    unmount the tmpfs and clean the box up.
+
+    A tmpfs an earlier item left mounted, should its clean-up not have run,
+    is unmounted first: isolate refuses to clean a box with a mount in it,
+    and `--init` cleans first. A fresh box every item is required, not only
+    tidy: a box run twice reads the first run's peak memory and kill.
     """
+    folder = BOX_ROOT / str(number) / "box"
+    if folder.is_mount():
+        unmount(folder)
+    isolate_box(number, "--init")
     try:
-        owned = os.lstat(path).st_uid == os.geteuid()
-        names = os.listxattr(path, follow_symlinks=False)
-    except OSError as error:
-        if error.errno in NO_ATTRIBUTES:
-            return
-        raise PrimitiveError(
-            f"the attributes a run could have set on {path} could not be "
-            f"listed: {error.strerror}"
-        ) from error
-    for name in names:
-        if name.startswith("user.") or (owned and name in ACL_ATTRIBUTES):
-            try:
-                os.removexattr(path, name, follow_symlinks=False)
-            except OSError as error:
-                if error.errno in NO_ATTRIBUTES | {errno.ENODATA}:
-                    continue
-                raise PrimitiveError(
-                    f"an attribute a run set on {path} could not be removed: "
-                    f"{error.strerror}"
-                ) from error
-
-
-def give_back(path: Path, needed: int | None = None) -> None:
-    """Give this program's user back what it needs of `path`, should a run
-    have taken it away: reading and writing a file (or `needed`), and also
-    searching a folder.
-
-    A run is this program's user, so it may change the mode of anything that
-    user owns, which Landlock does not stop: its own output, `out/`, the
-    folders it can name under the working directory and, where the harness
-    lays them out as that user, `in/` and its files. Nothing here takes a
-    mode away, so a path no run touched keeps its own. A link, a path
-    another user owns and a path no longer there are left as they are, and
-    so is one that cannot be named, such as one a run built past PATH_MAX:
-    a run's paths never stop this program.
-    """
+        mount(
+            f"box-{number}",
+            folder,
+            "tmpfs",
+            MS_NOSUID | MS_NODEV,
+            f"size={size_kb}k,nr_inodes={BOX_INODES},mode=0700",
+        )
+    except BaseException:
+        quietly(lambda: isolate_box(number, "--cleanup"))
+        raise
     try:
-        status = os.lstat(path)
-        mode = status.st_mode
-        if S_ISLNK(mode) or status.st_uid != os.geteuid():
-            return
-        if needed is None:
-            needed = OWNER_FOLDER if S_ISDIR(mode) else OWNER_FILE
-        if mode & needed != needed:
-            path.chmod(S_IMODE(mode) | needed)
-    except OSError:
-        return
+        yield folder
+    except BaseException:
+        quietly(lambda: close_box(number, folder))
+        raise
+    close_box(number, folder)
 
 
-def give_back_along(root: Path, path: Path, needed: int | None = None) -> None:
-    """Give back each folder from `root` down to `path`, then `path` itself,
-    so it can be reached as well as used.
-    """
-    try:
-        inside = path.resolve().relative_to(root.resolve())
-    except ValueError:
-        inside = None
-    if inside is not None:
-        folder = root
-        for part in inside.parts[:-1]:
-            give_back(folder)
-            folder = folder / part
-        give_back(folder)
-    give_back(path, needed)
+def close_box(number: int, folder: Path) -> None:
+    """Unmount box `number`'s tmpfs, which frees all it held, and clean the
+    box up, its cgroup with it."""
+    unmount(folder)
+    isolate_box(number, "--cleanup")
 
 
-def tmp_entries() -> int:
-    """How many files and folders the filesystem of `/tmp` holds, which a
-    tmpfs counts exactly; 0 where the filesystem does not count them."""
-    status = os.statvfs(tempfile.gettempdir())
-    return status.f_files - status.f_ffree
+def isolate_box(number: int, action: str) -> None:
+    """Run `isolate --cg` on box `number` for `action`, `--init` or
+    `--cleanup`, raising on failure."""
+    done = subprocess.run(
+        [ISOLATE, "--cg", f"--box-id={number}", action],
+        capture_output=True,
+        check=False,
+    )
+    if done.returncode != 0:
+        said = isolate_said(done.returncode, done.stderr)
+        raise PrimitiveError(f"isolate {action} of box {number} failed: {said}")
 
 
-def remove_tree(top: Path) -> None:
-    """Remove `top`, a folder a run worked in, and all it holds, once the
-    run's processes are gone: see `empty_folder`. A `top` already gone is
-    passed over."""
-    if not os.path.lexists(top):
-        return
-    empty_folder(top)
-    try:
-        top.rmdir()
-    except OSError as error:
-        raise PrimitiveError(
-            f"a run's folder, {top}, could not be removed: {error.strerror}"
-        ) from error
+def mount(
+    source: Path | str, target: Path, kind: str | None, flags: int, data: str | None
+) -> None:
+    """Mount `source` on `target`, as mount(2), raising on failure."""
+    result = libc().mount(
+        os.fsencode(source),
+        os.fsencode(target),
+        None if kind is None else kind.encode(),
+        ctypes.c_ulong(flags),
+        None if data is None else data.encode(),
+    )
+    if result != 0:
+        code = ctypes.get_errno()
+        raise PrimitiveError(f"{target} could not be mounted: {os.strerror(code)}")
 
 
-def empty_folder(top: Path) -> None:
-    """Remove everything in `top`, a folder a run worked in, however deep or
-    locked the run left it, once its processes are gone.
-
-    A run may build folders deeper than any path can name and take this
-    program's access away from them with `chmod`, so nothing here goes by
-    path below `top`: each folder is given back and opened through its
-    parent's descriptor, and a folder inside one is first moved up into
-    `top`, which needs it writable, so at most two are open at once however
-    deep the run went. What cannot be removed is a `PrimitiveError`, since
-    the next run would have less room for what it leaves.
-    """
-    give_back(top)
-    try:
-        top_fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError as error:
-        raise PrimitiveError(
-            f"a run's folder, {top}, could not be opened to empty: {error.strerror}"
-        ) from error
-    moved = 0
-    try:
-        while entries := list(os.scandir(top_fd)):
-            for entry in entries:
-                if not entry.is_dir(follow_symlinks=False):
-                    os.unlink(entry.name, dir_fd=top_fd)
-                    continue
-                os.chmod(entry.name, OWNER_FOLDER, dir_fd=top_fd)
-                folder = os.open(
-                    entry.name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=top_fd,
-                )
-                try:
-                    for inner in list(os.scandir(folder)):
-                        if inner.is_dir(follow_symlinks=False):
-                            os.chmod(inner.name, OWNER_FOLDER, dir_fd=folder)
-                            moved = move_up(folder, inner.name, top_fd, moved)
-                        else:
-                            os.unlink(inner.name, dir_fd=folder)
-                finally:
-                    os.close(folder)
-                os.rmdir(entry.name, dir_fd=top_fd)
-    except OSError as error:
-        raise PrimitiveError(
-            f"what a run left in {top} could not be removed: {error.strerror}"
-        ) from error
-    finally:
-        os.close(top_fd)
-
-
-def move_up(folder: int, name: str, top: int, moved: int) -> int:
-    """Move the folder `name` in `folder` into `top` under a name of its own,
-    and return how many have been moved so far. A name the run took already
-    is passed over for the next."""
-    while True:
-        moved += 1
-        try:
-            os.rename(name, f".removed-{moved}", src_dir_fd=folder, dst_dir_fd=top)
-            return moved
-        except OSError as error:
-            if error.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOTDIR):
-                raise
-
-
-def give_back_tree(top: Path) -> None:
-    """Give back `top` and everything under it, each folder before what is in
-    it, so the harness can read every output and remove the working
-    directory, and a run's own directory can be removed.
-    """
-    folders = [top]
-    while folders:
-        folder = folders.pop()
-        give_back(folder)
-        try:
-            entries = list(os.scandir(folder))
-        except OSError:
-            continue
-        for entry in entries:
-            if entry.is_dir(follow_symlinks=False):
-                folders.append(Path(entry.path))
-            else:
-                give_back(Path(entry.path))
-
-
-def child_pids() -> list[int]:
-    """List the processes whose parent is this program."""
-    me = os.getpid()
-    children = []
-    for entry in (path.name for path in Path("/proc").iterdir()):
-        if not entry.isdigit():
-            continue
-        try:
-            stat = Path(f"/proc/{entry}/stat").read_text()
-        except OSError:
-            continue
-        if int(stat[stat.rindex(")") + 2 :].split()[1]) == me:
-            children.append(int(entry))
-    return children
+def unmount(target: Path) -> None:
+    """Unmount what is mounted on `target`, as umount(2), raising on failure."""
+    if libc().umount2(os.fsencode(target), 0) != 0:
+        code = ctypes.get_errno()
+        raise PrimitiveError(f"{target} could not be unmounted: {os.strerror(code)}")
 
 
 def libc() -> ctypes.CDLL:
-    """The C library, for prctl, the Landlock system calls and removing
-    System V objects."""
+    """The C library, for mount and umount2."""
     return ctypes.CDLL(None, use_errno=True)
-
-
-def prctl(option: int, value: int) -> None:
-    """Call prctl with one argument, raising on failure."""
-    unused = ctypes.c_ulong(0)
-    if libc().prctl(option, ctypes.c_ulong(value), unused, unused, unused) != 0:
-        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
-
-
-def syscall(number: int, *arguments: int | ctypes.Array[ctypes.c_char] | None) -> int:
-    """Make a raw system call, raising on failure."""
-    function = libc().syscall
-    function.restype = ctypes.c_long
-    converted = [ctypes.c_long(a) if isinstance(a, int) else a for a in arguments]
-    result: int = function(ctypes.c_long(number), *converted)
-    if result < 0:
-        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
-    return result
-
-
-def landlock_abi() -> int:
-    """The Landlock ABI version the kernel offers, or 0 when it has none."""
-    try:
-        return syscall(
-            SYS_LANDLOCK_CREATE_RULESET, None, 0, LANDLOCK_CREATE_RULESET_VERSION
-        )
-    except OSError:
-        return 0
-
-
-def landlock_ruleset(writable: list[Path], readable: list[Path], abi: int) -> int:
-    """A Landlock ruleset for one run that writes `writable` and reads
-    `readable`.
-
-    Writing, creating, removing and renaming are allowed under each of
-    `writable`, the working directory and a report folder if the run has
-    one, and writing to /dev/null. Reading is allowed under them, of each
-    file in `readable` and beneath each directory in it (the program, and the
-    interpreter it needs), beneath the system directories in
-    READABLE_DIRECTORIES, and of /dev/null and the devices in
-    READABLE_DEVICES, and nowhere else: not the other runs' inputs under
-    `in/`, their outputs under `out/`, nor `inputs.json`. From
-    ABI 6 a process under it also may not signal, or reach an abstract Unix
-    socket of, anything outside its own Landlock domain; from ABI 1 it may not
-    trace anything outside it. Running a file needs reading it, so only the
-    program and the system's programs can be run. Files already open, standard
-    input and output, stay usable. `sandbox-exec` enforces it on the program
-    alone, just before exec, so neither it nor this program is inside.
-    """
-    handled = FS_WRITES | FS_READS | FS_REFER | FS_TRUNCATE
-    scoped = SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL if abi >= 6 else 0
-    size = 8 if abi < 4 else 16 if abi < 6 else 24
-    attr = ctypes.create_string_buffer(
-        struct.pack("=QQQ", handled, 0, scoped)[:size], size
-    )
-    rules: list[tuple[str, int]] = [(str(path), handled) for path in writable]
-    rules += [("/dev/null", FS_READ_FILE | FS_WRITE_FILE | FS_TRUNCATE)]
-    rules += [
-        (str(path), FS_READS if path.is_dir() else FS_READ_FILE) for path in readable
-    ]
-    rules += [(path, FS_READS) for path in READABLE_DIRECTORIES if Path(path).is_dir()]
-    rules += [(path, FS_READ_FILE) for path in READABLE_DEVICES]
-    ruleset = syscall(SYS_LANDLOCK_CREATE_RULESET, attr, size, 0)
-    try:
-        for path, access in rules:
-            try:
-                parent = os.open(path, os.O_PATH | os.O_CLOEXEC)
-            except FileNotFoundError:
-                continue
-            rule = ctypes.create_string_buffer(struct.pack("=Qi", access, parent), 12)
-            try:
-                syscall(
-                    SYS_LANDLOCK_ADD_RULE, ruleset, LANDLOCK_RULE_PATH_BENEATH, rule, 0
-                )
-            finally:
-                os.close(parent)
-    except OSError:
-        os.close(ruleset)
-        raise
-    return ruleset
 
 
 def write_json(path: Path, document: dict[str, object]) -> None:

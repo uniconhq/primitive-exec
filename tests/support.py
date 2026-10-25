@@ -18,6 +18,9 @@ SCHEMA_VERSION = 6
 SIBLING_SCHEMA = ROOT.parent / "runner" / "schemas" / "primitive.schema.json"
 SIBLING_COMPILE = ROOT.parent / "primitive-compile"
 SIBLING_DIFF = ROOT.parent / "deploy" / "workflows-next" / "classic" / "v3" / "diff"
+USERNS = Path(__file__).resolve().parent / "userns.py"
+BOX_USERS = "60000-60009"
+"""The box users the tests give exec: one step's range."""
 
 RunImage = Callable[..., dict[str, Any]]
 Check = Callable[..., None]
@@ -115,6 +118,26 @@ def sandbox_flags(limits: dict[str, int]) -> list[str]:
     ]
 
 
+def step_flags(limits: dict[str, int]) -> list[str]:
+    """The docker run flags an exec step container gets: privileged, so exec
+    can make its boxes, with the declared memory, pids and CPU-time limits,
+    one CPU, the tests' box users, and the network Docker gives it, as a
+    Woodpecker step has one. Under root Docker, as on Docker Desktop and a CI
+    machine, exec refuses to start, so the tests start it through `USERNS`.
+    """
+    memory = f"{limits['memory_mb']}m"
+    cpu_seconds = math.ceil(limits["cpu_ms"] / 1000)
+    return [
+        "--privileged",
+        f"--memory={memory}",
+        f"--memory-swap={memory}",
+        f"--pids-limit={limits['pids']}",
+        f"--ulimit=cpu={cpu_seconds}:{cpu_seconds}",
+        "--cpus=1",
+        f"--env=UNICON_BOX_USERS={BOX_USERS}",
+    ]
+
+
 def open_up(work: Path) -> None:
     """Let user 65532 in the container write the working directory and read `in/`."""
     for path in [work, *work.rglob("*")]:
@@ -195,7 +218,8 @@ def batch_inputs(
 def peek_input(work: str) -> str:
     """The standard input of a `peek` run after a first run: the paths it
     tries to read, which are the other run's output and input, the step's own
-    files and directories, the rest of /tmp, and one system file.
+    files and directories, the container's own `/etc`, its own /tmp, and one
+    system file.
     """
     paths = [
         f"{work}/out/1/output",
@@ -203,22 +227,26 @@ def peek_input(work: str) -> str:
         f"{work}/inputs.json",
         f"{work}/out",
         work,
+        "/etc/resolv.conf",
         "/tmp",
-        "/etc/os-release",
+        "/usr/lib/os-release",
     ]
     return "\n".join(["peek", *paths, ""])
 
 
 def peeked(work: str) -> list[str]:
-    """What a `peek` run prints when only the system file can be read."""
+    """What a `peek` run prints in a box: none of the step's paths is there to
+    name, nor the container's `/etc`, and it lists its own /tmp and reads the
+    system file."""
     return [
-        f"refused {work}/out/1/output 13",
-        f"refused {work}/in/2/input 13",
-        f"refused {work}/inputs.json 13",
-        f"refused {work}/out 13",
-        f"refused {work} 13",
-        "refused /tmp 13",
-        "read /etc/os-release",
+        f"refused {work}/out/1/output 2",
+        f"refused {work}/in/2/input 2",
+        f"refused {work}/inputs.json 2",
+        f"refused {work}/out 2",
+        f"refused {work} 2",
+        "refused /etc/resolv.conf 2",
+        "read /tmp",
+        "read /usr/lib/os-release",
     ]
 
 
@@ -290,7 +318,10 @@ elif case == "chmod":
             os.chmod(path, 0)
         except OSError:
             pass
-    os.fchmod(1, 0)
+    try:
+        os.fchmod(1, 0)
+    except OSError:
+        pass
 elif case == "deep":
     for _ in range(17):
         os.mkdir("a" * 255)
@@ -424,19 +455,6 @@ elif case == "mark":
     os.setxattr(sys.argv[0], "user.leak", b"hidden input")
     os.utime(sys.argv[0], (1000000000, 1000000000))
     print("marked")
-elif case == "mark-paths":
-    for path in sys.stdin.read().split():
-        try:
-            os.setxattr(path, "user.cache", b"x" * 1000)
-            print("marked", path)
-        except OSError as error:
-            print("refused", path, error.errno)
-elif case == "read-paths":
-    for path in sys.stdin.read().split():
-        try:
-            print("found", path, len(os.getxattr(path, "user.cache")))
-        except OSError as error:
-            print("none", path, error.errno)
 elif case == "bury":
     megabytes = int(sys.stdin.readline())
     for _ in range(17):
@@ -457,43 +475,16 @@ elif case == "folders":
 elif case == "free":
     status = os.statvfs(".")
     print("free", status.f_bavail * status.f_frsize // 2**20)
-elif case == "acl":
-    import struct
-
-    owner, user, group, mask, other = 1, 2, 4, 0x10, 0x20
-    entries = [(owner, 6, -1), (user, 4, 4242), (user, 4, 4343), (group, 4, -1)]
-    entries += [(mask, 4, -1), (other, 4, -1)]
-    acl = struct.pack("<I", 2) + b"".join(
-        struct.pack("<HHI", tag, perm, ident & 0xFFFFFFFF)
-        for tag, perm, ident in entries
-    )
-    for path in sys.stdin.read().split():
-        names = ["system.posix_acl_access"]
-        if os.path.isdir(path):
-            names.append("system.posix_acl_default")
-        try:
-            for name in names:
-                os.setxattr(path, name, acl)
-            print("set", path)
-        except OSError as error:
-            print("refused", path, error.errno)
-elif case == "read-acl":
-    for path in sys.stdin.read().split():
-        found = [name for name in os.listxattr(path) if "posix_acl" in name]
-        print("found" if found else "none", path)
-elif case == "mark-and-lock":
-    files = ["/work/in/3/input", "/work/out/1/output"]
-    for path in files + ["/work/in/3"]:
-        os.setxattr(path, "user.cache", b"x" * 1000)
-    for path in files:
-        os.chmod(path, 0o444)
-    os.chmod("/work/in/3", 0)
-    os.chmod("/work/out", 0)
-    print("marked and locked")
 elif case == "lock-scratch":
-    os.chmod(os.path.dirname(os.path.abspath(sys.argv[0])), 0o500)
-    os.chmod(sys.argv[0], 0)
-    os.chmod("/work/in/1/program", 0)
+    for path, mode in (
+        (os.path.dirname(os.path.abspath(sys.argv[0])), 0o500),
+        (sys.argv[0], 0),
+        ("/work/in/1/program", 0),
+    ):
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
     print("locked")
 elif case == "leave-mq":
     import ctypes
@@ -531,21 +522,20 @@ elif case == "sockets":
     import ctypes
     import socket
     libc = ctypes.CDLL(None, use_errno=True)
-    families = [
-        ("AF_INET", socket.AF_INET),
-        ("AF_INET6", socket.AF_INET6),
-        ("AF_NETLINK", socket.AF_NETLINK),
-        ("AF_PACKET", socket.AF_PACKET),
-        ("AF_UNIX", socket.AF_UNIX),
-    ]
-    for name, family in families:
-        kind = socket.SOCK_RAW if family == socket.AF_PACKET else socket.SOCK_DGRAM
-        made = libc.socket(family, kind, 0)
-        print("socket", name, made >= 0 or ctypes.get_errno())
-    pair = (ctypes.c_int * 2)()
-    for name, family in (("AF_UNIX", socket.AF_UNIX), ("AF_INET", socket.AF_INET)):
-        made = libc.socketpair(family, socket.SOCK_STREAM, 0, pair)
-        print("socketpair", name, made == 0 or ctypes.get_errno())
+    for name, family, address in (
+        ("AF_INET", socket.AF_INET, ("1.1.1.1", 443)),
+        ("AF_INET6", socket.AF_INET6, ("2606:4700:4700::1111", 443)),
+    ):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as made:
+                made.settimeout(2)
+                made.connect(address)
+            print("connect", name, True)
+        except OSError as error:
+            print("connect", name, error.errno)
+    one, two = socket.socketpair()
+    one.sendall(b"x")
+    print("socketpair AF_UNIX", two.recv(1) == b"x")
     params = ctypes.create_string_buffer(120)
     ring = libc.syscall(425, 8, params)
     print("io_uring_setup", ring >= 0 or ctypes.get_errno())
@@ -558,6 +548,90 @@ elif case == "sockets":
     print("request_key", found >= 0 or ctypes.get_errno())
     session = libc.syscall(keyctl, 0, -3, 0)
     print("keyctl", session >= 0 or ctypes.get_errno())
+elif case == "find-key":
+    import ctypes
+    import platform
+    libc = ctypes.CDLL(None, use_errno=True)
+    request_key = {"x86_64": 249, "aarch64": 218}[platform.machine()]
+    found = libc.syscall(request_key, b"user", b"left", None, 0)
+    print("request_key", found >= 0 or ctypes.get_errno())
+    with open("/proc/keys") as keys:
+        print("listed", "left" in keys.read())
+elif case == "devices":
+    print("dev", sorted(os.listdir("/dev")))
+    for path in sys.stdin.read().split():
+        try:
+            os.close(os.open(path, os.O_RDONLY))
+            print("opened", path)
+        except OSError as error:
+            print("refused", path, error.errno)
+elif case == "leave-files":
+    for path in ("left", "/tmp/left", "/dev/shm/left"):
+        with open(path, "w") as stream:
+            stream.write("hidden answer")
+    print("left")
+elif case == "find-files":
+    for path in ("left", "/tmp/left", "/dev/shm/left"):
+        print(path, os.path.exists(path))
+    print("box", sorted(os.listdir("/box")))
+elif case == "fill":
+    folder = sys.stdin.readline().strip()
+    written = 0
+    with open(os.path.join(folder, "fill"), "wb") as stream:
+        while True:
+            stream.write(b"z" * 2**20)
+            stream.flush()
+            written += 1
+elif case == "files":
+    folder = sys.stdin.readline().strip() or "."
+    made = 0
+    try:
+        while True:
+            open(os.path.join(folder, f"f{made}"), "w").close()
+            made += 1
+    except OSError as error:
+        print("stopped", error.errno, made > 90000)
+elif case == "nest":
+    made = 0
+    try:
+        while True:
+            os.mkdir("d")
+            os.chdir("d")
+            made += 1
+    except OSError as error:
+        print("nested", error.errno, made > 90000)
+elif case == "append-stdin":
+    try:
+        with open("/proc/self/fd/0", "a") as again:
+            again.write("changed")
+        print("appended")
+    except OSError as error:
+        print("refused", error.errno)
+elif case == "child-memory":
+    child = os.fork()
+    if child == 0:
+        block = b"x" * (40 * 1024 * 1024)
+        time.sleep(0.5)
+        os._exit(0)
+    os.waitpid(child, 0)
+    print("waited")
+elif case == "read-input":
+    read = 0
+    while chunk := sys.stdin.buffer.read(2**20):
+        read += len(chunk)
+    print("read", round(read / 2**20))
+elif case == "fork-hold":
+    children = 0
+    try:
+        while children < 200:
+            if os.fork() == 0:
+                time.sleep(3)
+                os._exit(0)
+            children += 1
+    except OSError:
+        pass
+    print("forked", children, flush=True)
+    time.sleep(3)
 elif case == "fork-bomb":
     children = 0
     try:

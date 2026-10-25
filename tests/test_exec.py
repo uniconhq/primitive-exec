@@ -1,19 +1,21 @@
-"""The program's own logic, run in-process on Linux.
+"""The program's own logic, in-process.
 
-The runs use Python binaries on the interpreter running the tests, started
-through a `sandbox-exec` built from this checkout with the host's gcc.
+The tests of its logic run anywhere. The tests that run programs need root
+and isolate, in a privileged container entered through `userns.py`, so exec
+makes its boxes as it does in a step: they are skipped elsewhere, and
+`test_image.py` runs them in the test container `tests/Dockerfile` builds
+on the image. The runs use Python binaries on the image's interpreter.
 """
 
-import ctypes
 import errno
 import json
 import os
 import re
-import shutil
-import signal
-import subprocess
+import resource
+import stat
 import sys
 import time
+import traceback
 import zipfile
 from decimal import Decimal
 from pathlib import Path
@@ -23,6 +25,7 @@ import pytest
 
 import exec as primitive
 from support import (
+    BOX_USERS,
     PROGRAM,
     SCORE,
     batch_inputs,
@@ -35,38 +38,26 @@ from support import (
     returned_outcomes,
 )
 
-
-@pytest.fixture(scope="session")
-def helper(tmp_path_factory: pytest.TempPathFactory) -> str:
-    """`sandbox-exec` built from source."""
-    if shutil.which("gcc") is None:
-        pytest.skip("gcc is not installed")
-    built = tmp_path_factory.mktemp("helper") / "sandbox-exec"
-    source = Path(__file__).resolve().parent.parent / "src" / "sandbox-exec.c"
-    command = ["gcc", "-O2", "-Wall", "-Werror", "-o", str(built), str(source)]
-    subprocess.run(command, check=True)
-    return str(built)
-
-
-@pytest.fixture(autouse=True)
-def tables(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Stand-in System V tables, empty, so a sweep in these tests never
-    removes an object of the machine running them, which is not a step
-    container with an IPC namespace of its own. The image tests sweep the
-    real ones.
-    """
-    folder = tmp_path / "sysvipc"
-    folder.mkdir()
-    for kind in ("shm", "msg", "sem"):
-        (folder / kind).write_text(f"       key      {kind}id perms\n")
-    monkeypatch.setattr(primitive, "SYSVIPC", folder)
-    return folder
+IN_BOXES = os.environ.get("UNICON_TESTS_IN_BOXES") == "1"
+"""Set in the test container, where a test that runs programs must run:
+there a missing isolate or root fails it rather than skipping it."""
 
 
 @pytest.fixture
-def run(helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
+def boxes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give exec the tests' box users, or skip a test that runs programs
+    where exec cannot make boxes."""
+    able = sys.platform == "linux" and os.geteuid() == 0
+    if not (able and Path(primitive.ISOLATE).is_file()):
+        if IN_BOXES:
+            pytest.fail("the test container has no root with isolate")
+        pytest.skip("runs programs in isolate boxes: run in the test container")
+    monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
+
+
+@pytest.fixture
+def run(boxes: None, tmp_path: Path) -> Any:
     """Run the program over a batch of the test program's cases."""
-    monkeypatch.setattr(primitive, "HELPER", helper)
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
 
     def batch(items: list[tuple[str, str]], **options: Any) -> dict[str, Any]:
@@ -84,12 +75,11 @@ def run(helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
 def make_run(**changes: Any) -> primitive.Run:
     """A run that exited cleanly well inside every limit, with some fields changed."""
     fields: dict[str, Any] = {
+        "status": "",
         "returncode": 0,
         "cpu_seconds": 0.1,
-        "wall_seconds": 0.2,
         "memory_kb": 1000,
         "output_bytes": 10,
-        "stopped": None,
     }
     return primitive.Run(**(fields | changes))
 
@@ -107,31 +97,37 @@ def test_the_time_limit_in_milliseconds_is_rounded_up(limit: float, ms: int) -> 
     assert item.time_limit_ms == ms
 
 
+OVER = primitive.OUTPUT_LIMIT + 1
 JUDGED: list[tuple[dict[str, Any], str, str]] = [
     ({}, "native", "accepted"),
-    ({"stopped": "time"}, "native", "time_limit"),
-    ({"stopped": "memory", "returncode": -9}, "native", "memory_limit"),
-    ({"stopped": "output", "returncode": -9}, "native", "output_limit"),
-    ({"returncode": -signal.SIGXFSZ}, "native", "output_limit"),
     (
-        {"output_bytes": primitive.OUTPUT_LIMIT + 1, "returncode": 1},
+        {"status": "SG", "returncode": -9, "out_of_memory": True},
+        "native",
+        "memory_limit",
+    ),
+    ({"status": "RE", "returncode": 1, "no_inodes": True}, "native", "memory_limit"),
+    ({"no_inodes": True}, "native", "memory_limit"),
+    ({"status": "TO", "returncode": -9}, "native", "time_limit"),
+    (
+        {"status": "SG", "returncode": -13, "output_bytes": OVER},
         "python",
         "output_limit",
     ),
-    ({"cpu_seconds": 1.01}, "native", "time_limit"),
-    ({"wall_seconds": 3.5}, "native", "time_limit"),
-    ({"returncode": -signal.SIGXCPU}, "native", "time_limit"),
-    ({"memory_kb": 64 * 1024 + 1}, "native", "memory_limit"),
-    ({"returncode": 3}, "java", "memory_limit"),
-    ({"returncode": 3}, "native", "runtime_error"),
-    ({"returncode": -signal.SIGSEGV}, "native", "runtime_error"),
+    ({"output_bytes": OVER}, "native", "output_limit"),
+    ({"status": "RE", "returncode": 3}, "java", "memory_limit"),
+    ({"status": "RE", "returncode": 3}, "native", "runtime_error"),
+    ({"status": "SG", "returncode": -11}, "native", "runtime_error"),
+    ({"status": "RE", "returncode": 127}, "native", "runtime_error"),
+    ({"status": "TO", "out_of_memory": True}, "native", "memory_limit"),
+    ({"status": "TO", "output_bytes": OVER}, "native", "time_limit"),
 ]
-"""Runs and how `judge` ends each, one of every way it decides."""
+"""Runs and how `judge` ends each, one of every way it decides, and the order
+between them."""
 
 
 @pytest.mark.parametrize(("changes", "kind", "outcome"), JUDGED)
 def test_judge(changes: dict[str, Any], kind: str, outcome: str) -> None:
-    """The stop reason first, then output, time and memory, then the exit."""
+    """Memory first, then time, then output, then how the program ended."""
     assert primitive.judge(make_run(**changes), ITEM, kind) == outcome
 
 
@@ -203,6 +199,8 @@ def test_detect(tmp_path: Path) -> None:
         ({"stdin": {"file": "in/none"}}, "stdin of run main-1 is not in the working"),
         ({"stdin": "in/2/input"}, "stdin of run main-1 is not a file"),
         ({"args": 3}, "args of run main-1 is not text"),
+        ({"time_limit": 0.0009}, "time_limit of run main-1 is under a millisecond"),
+        ({"memory_limit": 0.0005}, "memory_limit of run main-1 is under a kilobyte"),
     ],
 )
 def test_inputs_it_cannot_use_are_an_error(
@@ -231,29 +229,6 @@ def test_a_limit_too_large_to_be_a_number_is_an_error(tmp_path: Path) -> None:
     assert primitive.main(["exec", str(tmp_path)]) == 0
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert "memory_limit of run main-1 is not a positive number" in result["error"]
-
-
-def test_cleanup_that_fails_after_an_error_does_not_hide_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    def fail(*_: object) -> None:
-        raise primitive.PrimitiveError("the first error")
-
-    def fail_cleanup(*_: object) -> None:
-        raise primitive.PrimitiveError("the cleanup error")
-
-    batch_inputs(
-        tmp_path,
-        python_binary(tmp_path / "p", "print(1)\n").read_bytes(),
-        [("main-1", "")],
-    )
-    monkeypatch.setattr(primitive, "landlock_abi", lambda: 6)
-    monkeypatch.setattr(primitive, "execute", fail)
-    monkeypatch.setattr(primitive, "remove_tree", fail_cleanup)
-    assert primitive.main(["exec", str(tmp_path)]) == 0
-    result = json.loads((tmp_path / "outputs.json").read_text())
-    assert result["error"] == "the first error"
-    assert "the cleanup error" in capsys.readouterr().err
 
 
 def test_a_version_5_batch_is_an_error(tmp_path: Path) -> None:
@@ -292,23 +267,6 @@ def test_items_must_be_for_distinct_runs(
     assert message in json.loads((tmp_path / "outputs.json").read_text())["error"]
 
 
-def test_a_run_without_stdin_reads_nothing(
-    helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """With no `stdin`, standard input is empty, as `/dev/null` is."""
-    monkeypatch.setattr(primitive, "HELPER", helper)
-    program = python_binary(tmp_path / "build" / "program", PROGRAM).read_bytes()
-    work = tmp_path / "work"
-    batch_inputs(work, program, [("main-1", "")])
-    document = json.loads((work / "inputs.json").read_text())
-    del document["batch"][0]["inputs"]["stdin"]
-    (work / "inputs.json").write_text(json.dumps(document))
-    primitive.main(["exec", str(work)])
-    outputs = by_run(json.loads((work / "outputs.json").read_text()))["main-1"]
-    assert outputs["outcome"] == "accepted"
-    assert printed(work, outputs) == ""
-
-
 @pytest.mark.parametrize(
     ("value", "message"),
     [
@@ -345,6 +303,121 @@ def test_a_name_in_both_files_and_loads_is_an_error(tmp_path: Path) -> None:
     assert "names solution.py in both files and loads" in result["error"]
 
 
+@pytest.mark.parametrize(
+    ("given", "users"),
+    [("60000-60009", range(60000, 60010)), ("10000-10000", range(10000, 10001))],
+)
+def test_the_box_users_are_the_steps_range(
+    monkeypatch: pytest.MonkeyPatch, given: str, users: range
+) -> None:
+    monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, given)
+    assert primitive.box_users() == users
+
+
+@pytest.mark.parametrize(
+    ("given", "message"),
+    [
+        (None, "UNICON_BOX_USERS is not set"),
+        ("60000", "is not <first>-<last>"),
+        ("60000-", "is not <first>-<last>"),
+        (" 60000-60009", "is not <first>-<last>"),
+        ("-1-5", "is not <first>-<last>"),
+        ("9999-10005", "not a range within 10000 to 65000"),
+        ("64999-65001", "not a range within 10000 to 65000"),
+        ("60009-60000", "not a range within 10000 to 65000"),
+    ],
+)
+def test_box_users_it_cannot_use_are_an_error(
+    monkeypatch: pytest.MonkeyPatch, given: str | None, message: str
+) -> None:
+    if given is None:
+        monkeypatch.delenv(primitive.BOX_USERS_VARIABLE, raising=False)
+    else:
+        monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, given)
+    with pytest.raises(primitive.PrimitiveError, match=re.escape(message)):
+        primitive.box_users()
+
+
+@pytest.mark.parametrize("first", ["0 0 4294967295", "  0   0 4294967295  ", ""])
+def test_root_dockers_identity_map_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    """The step's root is the machine's own where every user ID maps to
+    itself, and exec does not start; nor where it cannot read the map."""
+    uid_map = tmp_path / "uid_map"
+    uid_map.write_text(f"{first}\n" if first else "")
+    monkeypatch.setattr(primitive, "UID_MAP", uid_map)
+    with pytest.raises(primitive.PrimitiveError, match="machine's own root"):
+        primitive.check_shape()
+
+
+def test_a_rootless_map_passes_as_root_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uid_map = tmp_path / "uid_map"
+    uid_map.write_text(
+        "         0       1000          1\n         1     100000      65536\n"
+    )
+    monkeypatch.setattr(primitive, "UID_MAP", uid_map)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    primitive.check_shape()
+    monkeypatch.setattr(os, "geteuid", lambda: 65532)
+    with pytest.raises(primitive.PrimitiveError, match="runs as root"):
+        primitive.check_shape()
+
+
+def test_on_root_docker_nothing_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole batch is an error, before any of the step is touched."""
+    uid_map = tmp_path / "uid_map"
+    uid_map.write_text("0 0 4294967295\n")
+    monkeypatch.setattr(primitive, "UID_MAP", uid_map)
+    monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
+
+    def touched() -> None:
+        raise AssertionError("the cgroup was set up")
+
+    monkeypatch.setattr(primitive, "set_up_cgroup", touched)
+    work = tmp_path / "work"
+    binary = python_binary(tmp_path / "p", "print(1)\n").read_bytes()
+    batch_inputs(work, binary, [("main-1", "")])
+    primitive.main(["exec", str(work)])
+    result = json.loads((work / "outputs.json").read_text())
+    assert set(result) == {"schema_version", "error"}
+    assert "machine's own root" in result["error"]
+    assert not (work / "out").exists()
+
+
+def box_user_processes() -> list[int]:
+    """The processes of the tests' box users that are left, from /proc."""
+    first, last = (int(user) for user in BOX_USERS.split("-"))
+    found = []
+    for entry in Path("/proc").iterdir():
+        try:
+            status = (entry / "status").read_text()
+        except OSError:
+            continue
+        uids = next(line for line in status.splitlines() if line.startswith("Uid:"))
+        if first <= int(uids.split()[1]) <= last:
+            found.append(int(entry.name))
+    return found
+
+
+def test_a_run_without_stdin_reads_nothing(boxes: None, tmp_path: Path) -> None:
+    """With no `stdin`, standard input is empty, as `/dev/null` is."""
+    program = python_binary(tmp_path / "build" / "program", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    batch_inputs(work, program, [("main-1", "")])
+    document = json.loads((work / "inputs.json").read_text())
+    del document["batch"][0]["inputs"]["stdin"]
+    (work / "inputs.json").write_text(json.dumps(document))
+    primitive.main(["exec", str(work)])
+    outputs = by_run(json.loads((work / "outputs.json").read_text()))["main-1"]
+    assert outputs["outcome"] == "accepted"
+    assert printed(work, outputs) == ""
+
+
 def test_named_files_are_in_the_working_directory_and_cannot_be_written(
     run: Any, tmp_path: Path
 ) -> None:
@@ -373,7 +446,7 @@ def test_a_program_loads_code_from_its_working_directory(
 
 
 def test_a_run_that_removes_or_changes_its_named_files_changes_no_later_run(
-    run: Any, tmp_path: Path
+    boxes: None, tmp_path: Path
 ) -> None:
     """A run owns its copies, so it may make one writable or remove it; the
     next run that names the same file under `in/` still gets it whole."""
@@ -392,7 +465,7 @@ def test_a_run_that_removes_or_changes_its_named_files_changes_no_later_run(
     assert printed(work, outputs["main-2"]) == "answer 0o444 3 42\n"
 
 
-def test_a_binary_in_no_known_format_is_an_error(tmp_path: Path) -> None:
+def test_a_binary_in_no_known_format_is_an_error(boxes: None, tmp_path: Path) -> None:
     """A program exec cannot run is the step failing, not the contestant."""
     batch_inputs(tmp_path, b"#!/bin/sh\n", [("main-1", "")])
     primitive.main(["exec", str(tmp_path)])
@@ -403,7 +476,7 @@ def test_a_binary_in_no_known_format_is_an_error(tmp_path: Path) -> None:
 def test_every_outcome(run: Any, tmp_path: Path) -> None:
     """One batch reaches each outcome, keeps each output and measures each run,
     answering in the batch's order under each item's run, with each output
-    under the item's place in the batch.
+    under the item's place in the batch, and leaves no box behind.
     """
     runs = ["samples-ok", "main-spin", "main-sleep", "main-grow", "main-fail"]
     cases = ["double\n21\n", "spin\n", "sleep\n", "grow\n", "fail\n"]
@@ -429,9 +502,10 @@ def test_every_outcome(run: Any, tmp_path: Path) -> None:
         assert isinstance(entry["time_ms"], int)
         assert isinstance(entry["memory_kb"], int)
         assert entry["memory_kb"] > 0
-    assert outputs["main-grow"]["memory_kb"] > 64 * 1024
+    assert outputs["main-grow"]["memory_kb"] >= 64 * 1024
     assert outputs["samples-ok"]["memory_kb"] < 64 * 1024
-    assert not list(work.glob(".exec-*"))
+    assert not os.path.ismount(primitive.BOX_ROOT / str(primitive.BOX) / "box")
+    assert not (primitive.BOX_ROOT / str(primitive.BOX)).exists()
 
 
 def test_a_run_stopped_at_its_time_limit_reports_at_least_the_limit(
@@ -503,80 +577,59 @@ def test_args_no_command_line_can_carry_are_a_runtime_error(
 
 
 def test_output_over_the_limit(run: Any, tmp_path: Path) -> None:
-    """Printing too much is an output limit, and the output is cut at the limit."""
-    result = run([("main-flood", "flood\n")], time_limit=10)
-    assert by_run(result)["main-flood"]["outcome"] == "output_limit"
+    """Printing too much is an output limit, and the output is cut at the
+    limit. The output goes to exec through a pipe, so 32 MB of it costs a
+    64 MB box nothing of its memory."""
+    result = run([("main-flood", "flood\n")], time_limit=10, memory_limit=64)
+    outputs = by_run(result)["main-flood"]
+    assert outputs["outcome"] == "output_limit"
+    assert outputs["memory_kb"] < 32 * 1024
     output = tmp_path / "work" / "out" / "1" / "output"
     assert output.stat().st_size == primitive.OUTPUT_LIMIT
 
 
 def test_processes_left_behind_are_killed(run: Any) -> None:
-    """A process a run leaves behind, even in its own session, is killed."""
+    """A process a run leaves behind, even in its own session, goes with the
+    box's PID namespace when the program ends."""
+    started = time.monotonic()
     result = run([("main-linger", "linger\n")])
     assert by_run(result)["main-linger"]["outcome"] == "accepted"
-    assert primitive.child_pids() == []
+    assert time.monotonic() - started < 10
+    assert box_user_processes() == []
 
 
-def test_runs_write_only_their_own_directory(run: Any, tmp_path: Path) -> None:
-    """A run cannot write the working directory or the rest of /tmp."""
+def test_runs_write_only_their_own_box(run: Any, tmp_path: Path) -> None:
+    """A run cannot name the working directory; its `/tmp` is its box's own,
+    not the container's."""
     work = tmp_path / "work"
-    run([("main-escape", f"escape\n{work}\n")])
-    lines = (work / "out" / "1" / "output").read_text().splitlines()
-    assert lines == [
-        f"refused {work}/escaped 13",
-        f"refused {work}/inputs.json 13",
-        "refused /tmp/escaped 13",
+    outputs = by_run(run([("main-escape", f"escape\n{work}\n")]))
+    assert printed(work, outputs["main-escape"]).splitlines() == [
+        f"refused {work}/escaped 2",
+        f"refused {work}/inputs.json 2",
+        "wrote /tmp/escaped",
         "cwd ['here']",
     ]
+    assert not Path("/tmp/escaped").exists()
 
 
-def test_a_run_that_kills_its_launcher_is_a_runtime_error(
-    run: Any, tmp_path: Path
-) -> None:
-    """From Landlock ABI 6 the run may not signal `sandbox-exec` at all; below
-    it, killing `sandbox-exec` leaves no report and the run is judged on what
-    the program measured itself. Either way it is the run's own runtime
-    error, never an error of the step.
+def test_a_run_that_signals_the_box_keeper_is_refused(run: Any, tmp_path: Path) -> None:
+    """The program's parent is isolate's, outside its user, so killing it is
+    refused, and the run is its own runtime error, never an error of the step.
     """
     result = run([("main-parricide", "parricide\n"), ("main-ok", "double\n21\n")])
     outputs = by_run(result)
     assert outputs["main-parricide"]["outcome"] == "runtime_error"
     assert outputs["main-ok"]["outcome"] == "accepted"
     said = printed(tmp_path / "work", outputs["main-parricide"]).splitlines()
-    if primitive.landlock_abi() >= 6:
-        assert said == [f"refused {errno.EPERM}"]
+    assert said == [f"refused {errno.EPERM}"]
 
 
-def test_a_run_that_stops_its_launcher_is_still_ended_on_time(run: Any) -> None:
-    """A binary that sends SIGSTOP to `sandbox-exec`, where Landlock lets it,
-    and then spins is stopped at its time limit, and the whole item is over
-    within a second or so of that, not after a long wait for the helper.
-    """
+def test_a_run_that_tries_to_stop_its_parent_is_still_ended_on_time(run: Any) -> None:
     started = time.monotonic()
     result = run([("main-freeze", "freeze\n")], time_limit=0.5)
     elapsed = time.monotonic() - started
     assert by_run(result)["main-freeze"]["outcome"] == "time_limit"
     assert elapsed < 4
-
-
-def test_a_run_the_kernel_killed_for_memory_is_over_the_memory_limit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    events = tmp_path / "memory.events"
-    events.write_text("low 0\nhigh 0\nmax 3\noom 1\noom_kill 2\n")
-    monkeypatch.setattr(primitive, "OOM_EVENTS", events)
-    item = primitive.Item(
-        "main-x",
-        1,
-        tmp_path / "binary",
-        tmp_path / "input",
-        time_limit=1.0,
-        memory_limit=64,
-    )
-    run = primitive.Run(-9, 0.1, 0.2, 1000, 0, None, out_of_memory=True)
-
-    assert primitive.oom_kills() == 2
-    assert primitive.judge(run, item, "native") == "memory_limit"
 
 
 def test_work_in_a_child_counts_against_the_time_limit(run: Any) -> None:
@@ -591,7 +644,7 @@ def test_memory_in_a_child_counts_against_the_memory_limit(run: Any) -> None:
     result = run([("main-hidden-memory", "hidden-memory\n")], memory_limit=64)
     outputs = by_run(result)
     assert outputs["main-hidden-memory"]["outcome"] == "memory_limit"
-    assert outputs["main-hidden-memory"]["memory_kb"] > 64 * 1024
+    assert outputs["main-hidden-memory"]["memory_kb"] >= 64 * 1024
 
 
 def test_memory_spread_over_processes_is_added_up(run: Any) -> None:
@@ -601,7 +654,7 @@ def test_memory_spread_over_processes_is_added_up(run: Any) -> None:
     result = run([("main-split", "split-memory\n")], time_limit=3, memory_limit=64)
     outputs = by_run(result)
     assert outputs["main-split"]["outcome"] == "memory_limit"
-    assert outputs["main-split"]["memory_kb"] > 64 * 1024
+    assert outputs["main-split"]["memory_kb"] >= 64 * 1024
 
 
 def test_a_forked_child_is_not_charged_again_for_what_it_shares(run: Any) -> None:
@@ -618,94 +671,69 @@ def test_a_forked_child_is_not_charged_again_for_what_it_shares(run: Any) -> Non
     assert shared["memory_kb"] < alone["memory_kb"] + 4 * 1024
 
 
-def test_what_the_cgroup_holds_beyond_the_start_of_a_run_counts(tmp_path: Path) -> None:
-    """Everything charged to the run's cgroup beyond what it held when the
-    reading began counts, but for pages of files on disk; files in a tmpfs,
-    which the cgroup counts as file pages too, count.
+def test_memory_held_and_memory_in_a_child_read_as_held(run: Any) -> None:
+    """A program holding 40 MB reads within 10% of 40 MB over one holding
+    nothing, its interpreter's own; a child holding 40 MB counts the same.
     """
-    (tmp_path / "memory.current").write_text(str(910 * 2**20))
-    (tmp_path / "memory.stat").write_text(
-        f"anon {10 * 2**20}\nfile {900 * 2**20}\nshmem 0\n"
-    )
-    memory = primitive.RunMemory(cgroup=tmp_path)
-    (tmp_path / "memory.current").write_text(str(84 * 2**20))
-    (tmp_path / "memory.stat").write_text(
-        f"anon {20 * 2**20}\nfile {60 * 2**20}\nshmem {50 * 2**20}\nsock {4 * 2**20}\n"
-    )
-
-    memory.read(set())
-
-    assert memory.peak_kb == (84 - 10 - 10) * 1024
+    items = [
+        ("main-base", "double\n21\n"),
+        ("main-alone", "hold-memory\n"),
+        ("main-child", "child-memory\n"),
+    ]
+    outputs = by_run(run(items, time_limit=3, memory_limit=128))
+    base = outputs["main-base"]["memory_kb"]
+    for test in ("main-alone", "main-child"):
+        assert outputs[test]["outcome"] == "accepted"
+        held = outputs[test]["memory_kb"] - base
+        assert abs(held - 40 * 1024) <= 4 * 1024, (test, held)
 
 
-def test_a_cgroup_with_no_memory_accounting_adds_no_reading(tmp_path: Path) -> None:
-    memory = primitive.RunMemory(cgroup=tmp_path / "absent")
-
-    memory.read(set())
-
-    assert (memory.held_before, memory.peak_kb) == (None, 0)
-
-
-def test_a_run_outside_a_cgroup_of_its_own_is_warned_about(
-    run: Any, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("cached", [False, True], ids=["cold", "cached"])
+def test_reading_a_large_input_counts_what_the_box_reads_in(
+    run: Any, tmp_path: Path, cached: bool
 ) -> None:
-    """A test machine's cgroup holds other processes too, so its memory is
-    not read, and the program says so.
-    """
-    assert primitive.own_cgroup() is None
-
-    outputs = by_run(run([("main-ok", "double\n21\n")]))
-
-    assert outputs["main-ok"]["outcome"] == "accepted"
-    assert primitive.NO_CGROUP in capsys.readouterr().err
-
-
-def test_the_total_is_read_only_when_it_could_raise_the_peak(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reading the processes' total walks every page they hold, so it is
-    skipped while their resident memory added up is not above the peak, and
-    read again only after `TOTAL_SPACING` times its own cost has passed.
-    """
-    resident = {1: (30_000, 30_000)}
-    read: list[int] = []
-
-    def proportional(pid: int, resident_kb: int) -> int:
-        read.append(pid)
-        return resident_kb
-
-    monkeypatch.setattr(primitive, "resident_memory", resident.__getitem__)
-    monkeypatch.setattr(primitive, "proportional_memory", proportional)
-    memory = primitive.RunMemory()
-    memory.read({1})
-    assert (memory.peak_kb, read) == (30_000, [])
-    resident[2] = (40_000, 40_000)
-    memory.read({1, 2})
-    assert (memory.peak_kb, sorted(read)) == (70_000, [1, 2])
-    memory.total_due = float("inf")
-    memory.read({1, 2})
-    assert len(read) == 2
-    memory.total_due = 0.0
-    resident.update({1: (30_000, 10_000), 2: (40_000, 10_000)})
-    memory.read({1, 2})
-    assert (memory.peak_kb, len(read)) == (70_000, 2)
+    """A program that reads a 200 MB input and holds little: the box's cgroup
+    is charged the page cache its reads bring in, up to its limit, which it
+    takes back from the file's pages and does not kill for. So `memory_kb`
+    for such a run is near the limit when the file was not in memory yet,
+    and the interpreter's own when it was, read in by another process. The
+    run is `accepted` either way."""
+    work = tmp_path / "work"
+    binary = python_binary(tmp_path / "b" / "p", PROGRAM).read_bytes()
+    items = [("main-base", "double\n21\n"), ("main-read", "")]
+    batch_inputs(work, binary, items, time_limit=5, memory_limit=64)
+    with (work / "in" / "3" / "input").open("wb") as stream:
+        stream.write(b"read-input\n")
+        for _ in range(200):
+            stream.write(os.urandom(2**20))
+        stream.flush()
+        os.fsync(stream.fileno())
+        if cached:
+            with (work / "in" / "3" / "input").open("rb") as again:
+                while again.read(2**20):
+                    pass
+        else:
+            os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    primitive.main(["exec", str(work)])
+    outputs = by_run(json.loads((work / "outputs.json").read_text()))
+    read, base = outputs["main-read"], outputs["main-base"]
+    assert read["outcome"] == "accepted"
+    assert printed(work, read) == "read 200\n"
+    if cached:
+        assert read["memory_kb"] < base["memory_kb"] + 8 * 1024
+    else:
+        assert read["memory_kb"] > 56 * 1024
 
 
 def test_a_native_binary_the_kernel_will_not_run_is_a_runtime_error(
-    helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    boxes: None, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(primitive, "HELPER", helper)
     batch_inputs(tmp_path, b"\x7fELF" + bytes(60), [("main-1", "")])
     primitive.main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     outputs = by_run(result)["main-1"]
     assert outputs["outcome"] == "runtime_error"
-    assert (outputs["time_ms"], outputs["memory_kb"]) == (0, 0)
-
-
-def test_the_report_reads_only_the_lines_sandbox_exec_writes() -> None:
-    report = b"P 12\nR 0 5 6 7\nR 0 0 0 0\nZ 1\n\xff\nE x\nR 1"
-    assert primitive.parse_report(report) == {"P": [12], "R": [0, 5, 6, 7]}
+    assert outputs["time_ms"] < 100
 
 
 def test_a_json_file_is_written_whole_past_a_planted_link(tmp_path: Path) -> None:
@@ -721,9 +749,9 @@ def test_a_json_file_is_written_whole_past_a_planted_link(tmp_path: Path) -> Non
 def test_a_run_reads_neither_another_runs_files_nor_the_steps(
     run: Any, tmp_path: Path
 ) -> None:
-    """A later run cannot read an earlier run's output or input, the step's
-    own files, or list the working directory or /tmp, so nothing one test
-    leaves reaches the next; the system's files it can.
+    """A later run cannot name an earlier run's output or input, the step's
+    own files, or the working directory, so nothing one test leaves reaches
+    the next; the system's files it can read.
     """
     work = str(tmp_path / "work")
     result = run([("main-first", "double\n21\n"), ("main-peek", peek_input(work))])
@@ -734,214 +762,365 @@ def test_a_run_reads_neither_another_runs_files_nor_the_steps(
     assert lines == peeked(work)
 
 
-@pytest.mark.parametrize("abi", [0, 2], ids=["none", "below-truncate"])
-def test_without_landlock_nothing_runs(
-    run: Any, monkeypatch: pytest.MonkeyPatch, abi: int
-) -> None:
-    """A kernel without Landlock, with Landlock turned off, or with an ABI
-    below 3, which cannot keep a run from truncating a file it may only
-    read, is an error of the step, never a run left less confined.
-    """
-    monkeypatch.setattr(primitive, "landlock_abi", lambda: abi)
-    result = run([("main-ok", "double\n21\n")])
-    assert set(result) == {"schema_version", "error"}
-    assert "Landlock ABI 3" in result["error"]
-    assert "Linux 6.2" in result["error"]
-
-
-def test_a_ruleset_the_kernel_refuses_is_an_error(
-    run: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def refuse(directory: Path, readable: list[Path], abi: int) -> int:
-        raise OSError(1, "Operation not permitted")
-
-    monkeypatch.setattr(primitive, "landlock_ruleset", refuse)
-    result = run([("main-ok", "double\n21\n")])
-    assert "could not be confined with Landlock" in result["error"]
-
-
-def test_the_launcher_starts_nothing_without_a_ruleset(helper: str) -> None:
-    """`sandbox-exec` refuses to run a binary it has no Landlock ruleset for."""
-    read_end, write_end = os.pipe()
-    done = subprocess.run(
-        [helper, str(write_end), "-1", "/bin/true"], pass_fds=(write_end,)
-    )
-    os.close(write_end)
-    report = os.read(read_end, 64)
-    os.close(read_end)
-    assert done.returncode == 2
-    assert primitive.parse_report(report) == {"L": [errno.EBADF]}
-
-
-def test_the_sweep_removes_every_object_the_kernel_lists(
-    tables: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    (tables / "shm").write_text(
-        "       key      shmid perms\n"
-        "  1592590336          5   600\n"
-        "           0          9  1600\n"
-    )
-    (tables / "sem").write_text("       key      semid perms\n  0   7   600\n")
-    removed: list[tuple[str, int]] = []
-    monkeypatch.setattr(
-        primitive, "remove_sysv", lambda kind, ident: removed.append((kind, ident))
-    )
-    primitive.sweep_sysv()
-    assert removed == [("shm", 5), ("shm", 9), ("sem", 7)]
-
-
-def test_an_object_already_gone_is_passed_over() -> None:
-    primitive.remove_sysv("shm", 2**31 - 1)
-    primitive.remove_sysv("msg", 2**31 - 1)
-    primitive.remove_sysv("sem", 2**31 - 1)
-
-
-def test_an_object_that_cannot_be_removed_is_an_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A segment left behind would carry one run's data to the next."""
-
-    class Refusing:
-        @staticmethod
-        def shmctl(*_: object) -> int:
-            ctypes.set_errno(errno.EPERM)
-            return -1
-
-    monkeypatch.setattr(primitive, "libc", Refusing)
-    with pytest.raises(primitive.PrimitiveError, match="shm 5, could not be removed"):
-        primitive.remove_sysv("shm", 5)
-
-
-def test_an_attribute_on_a_locked_file_or_folder_is_removed(tmp_path: Path) -> None:
-    """A run that marks a path and then takes its access away, which Landlock
-    does not stop, still has its mark removed."""
-    folder = tmp_path / "in" / "3"
-    folder.mkdir(parents=True)
-    marked = folder / "input"
-    marked.write_text("hidden")
-    os.setxattr(marked, "user.cache", b"x")
-    os.setxattr(folder, "user.cache", b"x")
-    marked.chmod(0o444)
-    folder.chmod(0)
-    primitive.clear_attributes(tmp_path)
-    assert os.listxattr(folder) == []
-    assert os.listxattr(marked) == []
-
-
-def test_an_attribute_that_cannot_be_removed_is_an_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """One left behind would carry a run's data to the next."""
-    os.setxattr(tmp_path, "user.cache", b"x")
-
-    def refuse(*_: object, **__: object) -> None:
-        raise PermissionError(errno.EPERM, "Operation not permitted")
-
-    monkeypatch.setattr(os, "removexattr", refuse)
-    with pytest.raises(primitive.PrimitiveError, match="could not be removed"):
-        primitive.clear_attributes(tmp_path)
-
-
-def test_a_path_gone_or_without_attributes_is_passed_over(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def unsupported(*_: object, **__: object) -> None:
-        raise OSError(errno.ENOTSUP, "Operation not supported")
-
-    monkeypatch.setattr(os, "listxattr", unsupported)
-    primitive.clear_attributes(tmp_path)
-    primitive.clear_attributes(tmp_path / "gone")
-
-
-@pytest.mark.parametrize(
-    ("pids", "limit"), [("64\n", 64), ("4096\n", 128), ("max\n", 128), (None, 128)]
-)
-def test_the_process_limit_is_the_containers_or_the_declarations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pids: str | None, limit: int
-) -> None:
-    path = tmp_path / "pids.max"
-    if pids is not None:
-        path.write_text(pids)
-    monkeypatch.setattr(primitive, "PIDS_MAX", path)
-    assert primitive.process_limit() == limit
-
-
-def test_a_filter_that_cannot_be_installed_is_an_error(
-    run: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """`sandbox-exec` reports a filter the kernel refuses and starts nothing;
-    the run is not started unfiltered."""
-    refusing = tmp_path / "refusing-helper"
-    refusing.write_text(
-        f"#!{os.path.realpath(sys.executable)}\nimport os, sys\n"
-        f"os.write(int(sys.argv[1]), b'S {errno.EINVAL}\\n')\nsys.exit(127)\n"
-    )
-    refusing.chmod(0o755)
-    monkeypatch.setattr(primitive, "HELPER", str(refusing))
-    result = run([("main-ok", "double\n21\n")])
-    assert set(result) == {"schema_version", "error"}
-    assert "could not be put under its system call filter" in result["error"]
-
-
-def test_the_launcher_filters_sockets(helper: str, tmp_path: Path) -> None:
-    """`sandbox-exec` refuses an internet socket to what it starts and lets
-    a Unix one through."""
-    script = (
-        "import socket\n"
-        "for family in (socket.AF_INET, socket.AF_UNIX):\n"
-        "    try:\n"
-        "        socket.socket(family, socket.SOCK_DGRAM).close()\n"
-        "        print('made', family.name)\n"
-        "    except OSError as error:\n"
-        "        print('refused', family.name, error.errno)\n"
-    )
-    python = os.path.realpath(sys.executable)
-    read_end, write_end = os.pipe()
-    ruleset = primitive.landlock_ruleset([tmp_path], [Path(sys.base_prefix)], 3)
-    done = subprocess.run(
-        [helper, str(write_end), str(ruleset), python, "-I", "-c", script],
-        pass_fds=(write_end, ruleset),
-        capture_output=True,
-        text=True,
-    )
-    os.close(write_end)
-    os.close(ruleset)
-    os.close(read_end)
-    assert done.stdout.splitlines() == [
-        f"refused AF_INET {errno.EPERM}",
-        "made AF_UNIX",
+def test_a_connection_out_fails(run: Any, tmp_path: Path) -> None:
+    """A box has a network namespace of its own with no way out, so a
+    connection out fails though the container has a network;
+    a Unix socket, which Java and Python use, works. io_uring and the
+    kernel's keyrings are refused, the keyrings by isolate's filter and our
+    patch to it."""
+    outputs = by_run(run([("main-1", "sockets\n")]))
+    assert outputs["main-1"]["outcome"] == "accepted"
+    assert printed(tmp_path / "work", outputs["main-1"]).splitlines() == [
+        f"connect AF_INET {errno.ENETUNREACH}",
+        f"connect AF_INET6 {errno.ENETUNREACH}",
+        "socketpair AF_UNIX True",
+        f"io_uring_setup {errno.ENOSYS}",
+        f"add_key {errno.ENOSYS}",
+        f"request_key {errno.ENOSYS}",
+        f"keyctl {errno.ENOSYS}",
     ]
 
 
-def test_a_machine_without_system_v_tables_warns_and_runs(
-    run: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
+def test_a_key_one_run_adds_is_not_there_for_the_next(run: Any, tmp_path: Path) -> None:
+    """The keyrings are not namespaced: a key added to the box user's own
+    keyring would outlive the box. A run can add none, and the next finds
+    none, nor lists one in /proc/keys."""
+    outputs = by_run(run([("main-add", "sockets\n"), ("main-find", "find-key\n")]))
+    assert printed(tmp_path / "work", outputs["main-find"]).splitlines() == [
+        f"request_key {errno.ENOSYS}",
+        "listed False",
+    ]
+
+
+def test_nothing_one_run_leaves_is_there_for_the_next(run: Any, tmp_path: Path) -> None:
+    """Files a run leaves in its working directory, its `/tmp` and
+    `/dev/shm`, and a mark or a time it sets on its copy of the program, are
+    gone for the next run, which finds a box of only its own program and
+    working directory."""
+    items = [
+        ("main-leave", "leave-files\n"),
+        ("main-mark", "mark\n"),
+        ("main-find", "find-files\n"),
+        ("main-read", "read-mark\n"),
+    ]
+    outputs = by_run(run(items))
+    work = tmp_path / "work"
+    assert printed(work, outputs["main-leave"]) == "left\n"
+    assert printed(work, outputs["main-mark"]) == "marked\n"
+    assert printed(work, outputs["main-find"]).splitlines() == [
+        "left False",
+        "/tmp/left False",
+        "/dev/shm/left False",
+        "box ['program', 'run', 'shm', 'tmp']",
+    ]
+    assert printed(work, outputs["main-read"]) == "no attribute\ntime fresh\n"
+
+
+def test_a_fork_bomb_stops_at_the_process_limit(run: Any, tmp_path: Path) -> None:
+    """A run stops at 128 processes of its box user, and the next run starts
+    with none of them left."""
+    items = [("main-bomb", "fork-bomb\n"), ("main-next", "double\n21\n")]
+    outputs = by_run(run(items))
+    assert printed(tmp_path / "work", outputs["main-bomb"]) == "stopped 11 True\n"
+    assert printed(tmp_path / "work", outputs["main-next"]) == "42\n"
+    assert box_user_processes() == []
+
+
+@pytest.mark.parametrize("kind", ["shm", "msg", "sem"])
+def test_a_run_finds_no_system_v_object_an_earlier_run_left(
+    run: Any, tmp_path: Path, kind: str
 ) -> None:
-    monkeypatch.setattr(primitive, "SYSVIPC", tmp_path / "missing")
-    outputs = by_run(run([("main-ok", "double\n21\n")]))
-    assert outputs["main-ok"]["outcome"] == "accepted"
-    assert primitive.NO_SYSVIPC in capsys.readouterr().err
+    """Each box has an IPC namespace of its own, gone with it."""
+    items = [
+        ("main-leave", f"leave-sysv\n{kind} 3\n"),
+        ("main-find", f"find-sysv\n{kind}\n"),
+    ]
+    outputs = by_run(run(items))
+    assert printed(tmp_path / "work", outputs["main-leave"]) == f"made {kind} 3\n"
+    assert printed(tmp_path / "work", outputs["main-find"]) == f"found {kind} 0\n"
 
 
-def test_a_sweep_with_nothing_to_remove_takes_under_a_millisecond() -> None:
-    started = time.perf_counter()
-    for _ in range(1000):
-        primitive.sweep_sysv()
-    assert time.perf_counter() - started < 1.0
-
-
-def test_each_item_runs_a_copy_of_the_binary_of_its_own(
+def test_a_run_finds_no_posix_message_queue_an_earlier_run_left(
     run: Any, tmp_path: Path
 ) -> None:
-    """An attribute or a time one run sets on the file it runs, which Landlock
-    does not stop, is gone for the next.
-    """
-    outputs = by_run(run([("main-mark", "mark\n"), ("main-read", "read-mark\n")]))
+    """A POSIX queue belongs to the IPC namespace too: a run may make one,
+    and the next finds none."""
+    outputs = by_run(run([("main-leave", "leave-mq\n"), ("main-find", "find-mq\n")]))
+    assert printed(tmp_path / "work", outputs["main-leave"]) == "made 0\n"
+    assert printed(tmp_path / "work", outputs["main-find"]) == f"none {errno.ENOENT}\n"
+
+
+def test_a_box_cannot_open_a_block_device(run: Any, tmp_path: Path) -> None:
+    """A privileged container's /dev holds the machine's devices; a box's
+    /dev holds four devices and the standard links, so the machine's disks
+    cannot even be named."""
+    devices = sorted(
+        str(path)
+        for path in Path("/dev").iterdir()
+        if stat.S_ISBLK(path.stat().st_mode)
+    )
+    assert devices, "the test container shows no block device to try"
+    paths = " ".join([*devices[:4], "/dev/mem", "/dev/kmsg"])
+    outputs = by_run(run([("main-1", f"devices\n{paths}\n")]))
+    lines = printed(tmp_path / "work", outputs["main-1"]).splitlines()
+    assert lines[0] == (
+        "dev ['fd', 'null', 'random', 'shm', 'stderr', 'stdin', 'stdout', "
+        "'urandom', 'zero']"
+    )
+    assert lines[1:] == [f"refused {path} {errno.ENOENT}" for path in paths.split()]
+
+
+@pytest.mark.parametrize("folder", [".", "/tmp", "/dev/shm"])
+def test_a_run_writing_past_its_memory_is_over_the_memory_limit(
+    run: Any, folder: str
+) -> None:
+    """Every page a run writes to its box's tmpfs, its `/tmp` or `/dev/shm`
+    is charged to its memory, so filling one ends at the memory limit, never
+    the container's disk or memory."""
+    outputs = by_run(run([("main-fill", f"fill\n{folder}\n")], memory_limit=64))
+    assert outputs["main-fill"]["outcome"] == "memory_limit"
+
+
+@pytest.mark.parametrize("folder", [".", "/tmp", "/dev/shm"])
+def test_a_run_making_too_many_files_is_over_the_memory_limit(
+    run: Any, tmp_path: Path, folder: str
+) -> None:
+    """The box's tmpfs holds 100,000 files and folders, its `/tmp` and
+    `/dev/shm` among them: a run making more is told `ENOSPC`, and exec,
+    which finds none free after it, gives `memory_limit`; one that makes
+    fewer is judged as ever."""
+    items = [("main-many", f"files\n{folder}\n"), ("main-few", "folders\n1000\n")]
+    outputs = by_run(run(items, time_limit=4, memory_limit=512))
+    assert printed(tmp_path / "work", outputs["main-many"]) == "stopped 28 True\n"
+    assert outputs["main-many"]["outcome"] == "memory_limit"
+    assert outputs["main-few"]["outcome"] == "accepted"
+
+
+def test_a_tree_as_deep_as_the_box_holds_is_given_back(
+    run: Any, tmp_path: Path
+) -> None:
+    """isolate gives the box's tree back to root after a run with a folder
+    open at each level, so exec raises the stack and open-files limits it
+    inherits: a run nesting folders until the box has no inode left ends
+    `memory_limit`, and the batch goes on. The image test runs it under a
+    low soft limit on open files."""
+    items = [("main-deep", "nest\n"), ("main-next", "folders\n10\n")]
+    outputs = by_run(run(items, time_limit=20, memory_limit=512))
+    assert printed(tmp_path / "work", outputs["main-deep"]) == "nested 28 True\n"
+    assert outputs["main-deep"]["outcome"] == "memory_limit"
+    assert outputs["main-next"]["outcome"] == "accepted"
+
+
+@pytest.mark.parametrize(
+    ("kind", "name"),
+    [
+        (resource.RLIMIT_STACK, "stack"),
+        (resource.RLIMIT_NOFILE, "open files"),
+    ],
+)
+def test_a_hard_limit_below_what_isolate_needs_stops_the_step(
+    monkeypatch: pytest.MonkeyPatch, kind: int, name: str
+) -> None:
+    real = resource.getrlimit
+
+    def low(asked: int) -> tuple[int, int]:
+        return (1024, 1024) if asked == kind else real(asked)
+
+    monkeypatch.setattr(resource, "getrlimit", low)
+    monkeypatch.setattr(resource, "setrlimit", lambda *_: None)
+    with pytest.raises(primitive.PrimitiveError, match=f"hard limit on {name}, 1024"):
+        primitive.raise_limits()
+
+
+def test_the_soft_limits_isolate_inherits_are_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits = {
+        resource.RLIMIT_STACK: (8 << 20, resource.RLIM_INFINITY),
+        resource.RLIMIT_NOFILE: (1024, 524288),
+    }
+    made: dict[int, tuple[int, int]] = {}
+    monkeypatch.setattr(resource, "getrlimit", limits.__getitem__)
+    monkeypatch.setattr(resource, "setrlimit", made.__setitem__)
+    primitive.raise_limits()
+    assert made == {
+        resource.RLIMIT_STACK: (
+            primitive.ISOLATE_STACK,
+            resource.RLIM_INFINITY,
+        ),
+        resource.RLIMIT_NOFILE: (primitive.ISOLATE_OPEN_FILES, 524288),
+    }
+
+
+def test_a_stdin_file_others_can_write_is_not_changed_by_a_run(
+    boxes: None, tmp_path: Path
+) -> None:
+    """The box can open its standard input again through `/proc/self/fd/0`
+    by the file's own mode, so exec takes write away from group and others
+    first: a run given a 0666 input cannot append to it for a later run, or
+    a later step, to read."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
-    assert printed(work, outputs["main-mark"]) == "marked\n"
-    assert printed(work, outputs["main-read"]) == "no attribute\ntime fresh\n"
+    batch_inputs(
+        work, binary, [("main-1", "append-stdin\n"), ("main-2", "folders\n10\n")]
+    )
+    for path in work.rglob("*"):
+        path.chmod(0o777 if path.is_dir() else 0o666)
+    assert primitive.main(["exec", str(work)]) == 0
+    outputs = by_run(json.loads((work / "outputs.json").read_text()))
+    assert printed(work, outputs["main-1"]) == f"refused {errno.EACCES}\n"
+    stdin = work / "in" / "2" / "input"
+    assert stdin.read_text() == "append-stdin\n"
+    assert stat.S_IMODE(stdin.stat().st_mode) == 0o644
+
+
+def test_a_stdin_file_a_box_user_owns_is_an_error(boxes: None, tmp_path: Path) -> None:
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    batch_inputs(work, binary, [("main-1", "folders\n10\n")])
+    os.chown(work / "in" / "2" / "input", 60000, 60000)
+    assert primitive.main(["exec", str(work)]) == 0
+    result = json.loads((work / "outputs.json").read_text())
+    assert set(result) == {"schema_version", "error"}
+    assert (
+        "stdin file of run main-1 is owned by user 60000, a box user" in result["error"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "said", "told"),
+    [
+        (2, b"Cannot open directory d: Too many open files\n", "Cannot open directory"),
+        (-11, b"", "killed by signal 11"),
+        (2, b"  \n", "exited with code 2"),
+    ],
+)
+def test_what_isolate_said_when_it_failed(code: int, said: bytes, told: str) -> None:
+    assert told in primitive.isolate_said(code, said)
+
+
+def exec_apart(work: Path, users: str, group: str) -> int:
+    """Start exec over `work` in a child that is a step container of its own
+    as far as exec can tell, in the tests' user namespace, as every step of
+    a rootless Docker is: a cgroup namespace rooted at `group`, and its own
+    mounts for the cgroup, `/run`, the box root and isolate's
+    configuration. Return the child's process ID."""
+    cgroup = primitive.CGROUP / group
+    cgroup.mkdir(exist_ok=True)
+    child = os.fork()
+    if child:
+        return child
+    try:
+        (cgroup / "cgroup.procs").write_text(str(os.getpid()))
+        os.unshare(os.CLONE_NEWNS | os.CLONE_NEWCGROUP)
+        primitive.mount("none", Path("/"), None, (1 << 14) | (1 << 18), None)
+        # The container's cgroup mount came from a more privileged mount
+        # namespace and cannot be unmounted here, so a tmpfs goes over it
+        # first, and the namespace's own cgroup over that.
+        primitive.mount("tmpfs", primitive.CGROUP, "tmpfs", 0, None)
+        primitive.mount("cgroup2", primitive.CGROUP, "cgroup2", 0, None)
+        for folder in ("/run", "/var/local/lib", "/usr/local/etc"):
+            primitive.mount("tmpfs", Path(folder), "tmpfs", 0, "mode=0755")
+        os.environ[primitive.BOX_USERS_VARIABLE] = users
+        primitive.main(["exec", str(work)])
+    except BaseException:
+        traceback.print_exc()
+        os._exit(1)
+    os._exit(0)
+
+
+@pytest.mark.parametrize(
+    ("users", "apart"),
+    [(("60000-60000", "60100-60100"), True), (("60000-60000", "60000-60000"), False)],
+    ids=["distinct", "shared"],
+)
+def test_two_steps_at_once_share_a_process_count_only_on_the_same_users(
+    boxes: None, tmp_path: Path, users: tuple[str, str], apart: bool
+) -> None:
+    """`RLIMIT_NPROC` counts each user's processes across the user
+    namespace, every step of one rootless Docker, so two steps given
+    distinct box users each fork up to their limit at once, and two given
+    the same one share it."""
+    primitive.set_up_step(primitive.box_users())
+    binary = python_binary(tmp_path / "b" / "p", PROGRAM).read_bytes()
+    works = []
+    for number in range(2):
+        work = tmp_path / f"work-{number}"
+        batch_inputs(work, binary, [("main-1", "fork-hold\n")], time_limit=2)
+        works.append(work)
+    children = [
+        exec_apart(work, given, f"apart-{number}")
+        for number, (work, given) in enumerate(zip(works, users, strict=True))
+    ]
+    for child in children:
+        assert os.waitstatus_to_exitcode(os.waitpid(child, 0)[1]) == 0
+    forked = []
+    for work in works:
+        outputs = by_run(json.loads((work / "outputs.json").read_text()))["main-1"]
+        forked.append(int(printed(work, outputs).split()[1]))
+    for number in range(2):
+        cgroup = primitive.CGROUP / f"apart-{number}"
+        for inner in ("isolate", "step"):
+            (cgroup / inner).rmdir()
+        cgroup.rmdir()
+    if apart:
+        assert min(forked) >= primitive.PROCESS_LIMIT - 8, forked
+    else:
+        assert sum(forked) <= primitive.PROCESS_LIMIT + 8, forked
+
+
+def test_a_box_a_dead_step_left_mounted_does_not_stop_the_next(
+    run: Any, tmp_path: Path
+) -> None:
+    """A step killed in the middle of an item leaves its box initialised and
+    its tmpfs mounted; the next item unmounts it and starts afresh."""
+    primitive.set_up_step(primitive.box_users())
+    primitive.isolate_box(primitive.BOX, "--init")
+    folder = primitive.BOX_ROOT / str(primitive.BOX) / "box"
+    primitive.mount("box-0", folder, "tmpfs", 0, "size=1m")
+    (folder / "left").write_text("hidden answer")
+    outputs = by_run(run([("main-find", "find-files\n")]))
+    assert outputs["main-find"]["outcome"] == "accepted"
+    assert "box ['program', 'run', 'shm', 'tmp']" in printed(
+        tmp_path / "work", outputs["main-find"]
+    )
+
+
+def test_a_step_that_cannot_be_set_up_runs_nothing(
+    run: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(primitive, "STEP_CGROUP", Path("/proc/no-such/step"))
+    result = run([("main-ok", "double\n21\n")])
+    assert set(result) == {"schema_version", "error"}
+    assert "could not be set up for its boxes" in result["error"]
+    assert not (tmp_path / "work" / "out").exists()
+
+
+def test_cleanup_that_fails_after_an_error_does_not_hide_it(
+    boxes: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail(*_: object) -> None:
+        raise primitive.PrimitiveError("the first error")
+
+    def fail_cleanup(*_: object) -> None:
+        raise primitive.PrimitiveError("the cleanup error")
+
+    batch_inputs(
+        tmp_path,
+        python_binary(tmp_path / "p", "print(1)\n").read_bytes(),
+        [("main-1", "")],
+    )
+    monkeypatch.setattr(primitive, "execute", fail)
+    monkeypatch.setattr(primitive, "close_box", fail_cleanup)
+    assert primitive.main(["exec", str(tmp_path)]) == 0
+    result = json.loads((tmp_path / "outputs.json").read_text())
+    assert result["error"] == "the first error"
+    assert "the cleanup error" in capsys.readouterr().err
+    monkeypatch.undo()
+    primitive.close_box(primitive.BOX, primitive.BOX_ROOT / "0" / "box")
 
 
 def write_manifest(tmp_path: Path, document: object) -> Path:
@@ -1206,8 +1385,8 @@ def test_a_program_given_a_manifest_reports_through_its_folder(
 
 
 def test_each_run_reports_into_a_fresh_folder(run: Any, tmp_path: Path) -> None:
-    """The folder is outside the run's working directory, and what one run
-    left in its folder is not there for the next."""
+    """The folder is outside the run's working directory, in its box, and
+    what one run left in its folder is not there for the next."""
     manifest = {"reports": {"score": {"optional": True}}}
     result = run(
         [("main-1", "report\nverdict 0\nnotes left"), ("main-2", "report-where\n")],
@@ -1277,14 +1456,15 @@ def test_a_self_reported_run_that_does_not_judge_is_the_entrants(
 def test_a_link_in_the_report_folder_reads_nothing_for_the_run(
     run: Any, tmp_path: Path
 ) -> None:
-    """A link to the next run's input, which the run may not read, is a
-    fault, and exec does not read the input for it."""
+    """A link to the next run's input, a path the box cannot name, is gone
+    from the folder, as isolate removes every link a box leaves, so the
+    report misses what the link stood for, and exec reads no input for it."""
     work = tmp_path / "work"
     result = run(
         [("main-1", f"report-link\n{work}/in/3/input\n"), ("main-2", "hidden answer")],
         manifest=SCORE,
     )
-    assert "the report of run main-1 holds message, not a plain file" in result["error"]
+    assert "the report of run main-1 has no score" in result["error"]
     assert "hidden" not in json.dumps(result)
 
 
@@ -1311,8 +1491,8 @@ def test_a_manifest_or_self_report_it_cannot_use_is_an_error(
 def test_a_hard_link_into_the_report_folder_is_refused(
     run: Any, tmp_path: Path
 ) -> None:
-    """Landlock refuses a link from outside the run's own folders, so a run
-    cannot hand exec the next run's input to read for it."""
+    """The next run's input is not in the box to link to, so a run cannot
+    hand exec the next run's input to read for it."""
     work = tmp_path / "work"
     result = run(
         [

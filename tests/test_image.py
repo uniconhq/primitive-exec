@@ -1,4 +1,5 @@
-"""The image, run on Docker under the harness's sandbox flags.
+"""The image, run on Docker as an exec step container is: privileged, as
+root, through `userns.py` (see `conftest.py`).
 
 Most Python binaries are built here as zip applications whose `__main__.py` is
 the program itself; native and Java binaries, and one Python binary with
@@ -10,6 +11,7 @@ binary format.
 import errno
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -18,7 +20,10 @@ import pytest
 import yaml
 
 from support import (
+    BOX_USERS,
+    NAME,
     PROGRAM,
+    ROOT,
     SCORE,
     SIBLING_DIFF,
     Check,
@@ -94,7 +99,6 @@ def run_batch(
     time_limit: float = 1.0,
     memory_limit: float = 64,
     args: dict[str, str] | None = None,
-    owned: bool = False,
     files: dict[str, dict[str, bytes]] | None = None,
     loads: dict[str, dict[str, bytes]] | None = None,
 ) -> dict[str, dict[str, Any]]:
@@ -103,7 +107,7 @@ def run_batch(
         work, binary, items, time_limit, memory_limit, args, files=files, loads=loads
     )
     limits = container_limits(time_limit, memory_limit, len(items))
-    return by_run(run_image(work, limits, owned=owned))
+    return by_run(run_image(work, limits))
 
 
 def outcomes(outputs: dict[str, dict[str, Any]]) -> dict[str, object]:
@@ -114,7 +118,7 @@ def outcomes(outputs: dict[str, dict[str, Any]]) -> dict[str, object]:
 def test_python_runs_reach_every_outcome(
     tmp_path: Path, run_image: RunImage, check: Check
 ) -> None:
-    """One batch in the sandbox reaches each outcome, keeps each output and
+    """One batch in boxes reaches each outcome, keeps each output and
     reports the time and memory of each, the time at least the limit for a
     run stopped by the CPU limit or by the wall clock.
     """
@@ -183,7 +187,8 @@ def test_output_over_the_limit_is_cut(tmp_path: Path, run_image: RunImage) -> No
 
 
 def test_runs_are_kept_apart(tmp_path: Path, run_image: RunImage) -> None:
-    """A run writes only its own directory, and nothing it leaves reaches the next."""
+    """A run cannot name `/work`, writes only its own box, sees only its own
+    processes, and nothing it leaves reaches the next."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     items = [
@@ -200,26 +205,25 @@ def test_runs_are_kept_apart(tmp_path: Path, run_image: RunImage) -> None:
         "main-census": "accepted",
     }
     assert printed(work, outputs["main-escape"]).splitlines() == [
-        "refused /work/escaped 13",
-        "refused /work/inputs.json 13",
-        "refused /tmp/escaped 13",
+        "refused /work/escaped 2",
+        "refused /work/inputs.json 2",
+        "wrote /tmp/escaped",
         "cwd ['here']",
     ]
-    assert printed(work, outputs["main-census"]) == "3\n"
+    assert printed(work, outputs["main-census"]) == "1\n"
 
 
 def test_a_run_that_takes_away_its_files_modes_faults_nothing(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """A run may change the modes of the files and folders its user owns, as
-    the harness lays them out: the working directory, `in/` and the next
-    run's input, `out/` and its own output among them; each is given back
-    after it, so the next run and the harness still read and write them.
+    """A run cannot name the working directory, `in/` or `out/` to change
+    their modes, nor change the mode of its standard output, a pipe of
+    exec's, so the next run and the harness still read and write them.
     """
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     items = [("main-chmod", "chmod\n/work\n"), ("main-next", "double\n21\n")]
-    outputs = run_batch(run_image, work, binary, items, owned=True)
+    outputs = run_batch(run_image, work, binary, items)
     assert outcomes(outputs) == {"main-chmod": "accepted", "main-next": "accepted"}
     assert printed(work, outputs["main-chmod"]) == "changed\n"
     assert printed(work, outputs["main-next"]) == "42\n"
@@ -241,9 +245,9 @@ def test_a_run_that_leaves_a_path_past_path_max_faults_nothing(
 def test_a_run_reads_nothing_another_run_left(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """In the sandbox, a later run cannot read an earlier run's output or its
-    input, the step's own files, or list /work or /tmp; the system's files
-    it can.
+    """In a box, a later run cannot name an earlier run's output or its
+    input, the step's own files, or /work; its own /tmp it lists, and the
+    system's files it reads.
     """
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
@@ -259,8 +263,8 @@ def test_a_run_finds_no_system_v_object_an_earlier_run_left(
     tmp_path: Path, run_image: RunImage, kind: str
 ) -> None:
     """A shared memory segment, a message queue or a semaphore set one run
-    makes is removed before the next, which could otherwise read in it what
-    the first was given.
+    makes goes with its box's IPC namespace, before the next, which could
+    otherwise read in it what the first was given.
     """
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
@@ -293,65 +297,28 @@ def test_a_run_finds_no_mark_an_earlier_run_set_on_the_binary(
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     items = [("main-mark", "mark\n"), ("main-read", "read-mark\n")]
-    outputs = run_batch(run_image, work, binary, items, owned=True)
+    outputs = run_batch(run_image, work, binary, items)
     assert printed(work, outputs["main-mark"]) == "marked\n"
     assert printed(work, outputs["main-read"]) == "no attribute\ntime fresh\n"
 
 
-def test_a_run_finds_no_attribute_an_earlier_run_set_on_a_file_it_named(
+def test_a_run_finds_nothing_an_earlier_run_left_in_its_box(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """An extended attribute is no place to keep work for the next test:
-    one set on the next item's input, on `out/` or on the run's own output,
-    files it can name and write though Landlock keeps it from reading
-    them, is gone for the next run."""
+    """Files a run leaves in its working directory, its `/tmp` and
+    `/dev/shm` go with its box: the next finds a box of only its own program,
+    working directory and empty `/tmp` and `/dev/shm`."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
-    paths = "/work/in/3/input /work/out /work/out/1/output"
-    items = [
-        ("main-mark", f"mark-paths\n{paths}\n"),
-        ("main-read", f"read-paths\n{paths}\n"),
-    ]
+    items = [("main-leave", "leave-files\n"), ("main-find", "find-files\n")]
     outputs = run_batch(run_image, work, binary, items)
-    marked = printed(work, outputs["main-mark"]).splitlines()
-    assert [line.split()[0] for line in marked] == ["marked", "marked", "marked"]
-    found = printed(work, outputs["main-read"]).splitlines()
-    assert [line.split()[0] for line in found] == ["none", "none", "none"]
-
-
-def test_a_run_that_locks_what_it_marked_leaves_no_attribute(
-    tmp_path: Path, run_image: RunImage
-) -> None:
-    """A run that takes the access away from what it marked, a file by
-    `chmod 0444` and a folder by `chmod 0`, still leaves nothing for the next
-    run: each path is given back before its attributes are removed."""
-    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
-    work = tmp_path / "work"
-    paths = "/work/in/3/input /work/out/1/output /work/in/3"
-    items = [
-        ("main-mark", "mark-and-lock\n"),
-        ("main-read", f"read-paths\n{paths}\n"),
+    assert printed(work, outputs["main-leave"]) == "left\n"
+    assert printed(work, outputs["main-find"]).splitlines() == [
+        "left False",
+        "/tmp/left False",
+        "/dev/shm/left False",
+        "box ['program', 'run', 'shm', 'tmp']",
     ]
-    outputs = run_batch(run_image, work, binary, items, owned=True)
-    assert outcomes(outputs) == {"main-mark": "accepted", "main-read": "accepted"}
-    assert printed(work, outputs["main-mark"]) == "marked and locked\n"
-    found = printed(work, outputs["main-read"]).splitlines()
-    assert [line.split()[0] for line in found] == ["none", "none", "none"]
-
-
-def test_a_run_finds_no_access_control_list_an_earlier_run_set(
-    tmp_path: Path, run_image: RunImage
-) -> None:
-    """An access control list, whose entries name any user ID, holds as much
-    as an attribute: one set on the next item's input, and an access and a
-    default one on `out/`, are gone for the next run."""
-    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
-    work = tmp_path / "work"
-    paths = "/work/in/3/input /work/out"
-    items = [("main-set", f"acl\n{paths}\n"), ("main-read", f"read-acl\n{paths}\n")]
-    outputs = run_batch(run_image, work, binary, items, owned=True)
-    assert printed(work, outputs["main-set"]).split()[::2] == ["set"] * 2
-    assert printed(work, outputs["main-read"]).split()[::2] == ["none"] * 2
 
 
 def test_a_run_that_buries_files_past_path_max_leaves_the_next_its_room(
@@ -359,7 +326,7 @@ def test_a_run_that_buries_files_past_path_max_leaves_the_next_its_room(
 ) -> None:
     """A run that writes 20 MB in a folder deeper than any path can name, and
     takes the access to it away, does not keep that room from the next: each
-    later run finds as much of `/tmp` free as the first did."""
+    later run finds as much of its box free as the first did."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     items = [
@@ -378,9 +345,10 @@ def test_a_run_that_buries_files_past_path_max_leaves_the_next_its_room(
 def test_a_run_that_makes_too_many_folders_is_over_its_memory(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """Removing them would take longer than making them, on no clock, so a
-    run is stopped once it has made `RUN_ENTRIES`, though it is far under
-    its memory limit; one that makes fewer is not."""
+    """A box's tmpfs holds 100,000 files and folders, so a run that makes
+    more fails with `ENOSPC`, and exec, finding none free after it, gives
+    `memory_limit`, though the run is far under its memory limit; one that
+    makes fewer does not."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     items = [("main-many", "folders\n150000\n"), ("main-few", "folders\n1000\n")]
@@ -391,36 +359,37 @@ def test_a_run_that_makes_too_many_folders_is_over_its_memory(
 def test_a_run_that_locks_its_own_copy_does_not_stop_the_next(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """A run can name its copy of the binary, the scratch folder it is in and
-    the binary under `in/`, and take this program's access to them away; the
-    next item still gets its copy, so no run can end the batch in an error."""
+    """A run can take the access away from its copy of the binary and the
+    box folder it is in, though not from the binary under `in/`, which it
+    cannot name; the next item still gets a box and a copy of its own, so no
+    run can end the batch in an error."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     items = [("main-lock", "lock-scratch\n"), ("main-next", "double\n21\n")]
-    outputs = run_batch(run_image, work, binary, items, owned=True)
+    outputs = run_batch(run_image, work, binary, items)
     assert outcomes(outputs) == {"main-lock": "accepted", "main-next": "accepted"}
     assert printed(work, outputs["main-lock"]) == "locked\n"
     assert printed(work, outputs["main-next"]) == "42\n"
 
 
-def test_a_run_can_make_no_posix_message_queue(
+def test_a_run_finds_no_posix_message_queue_an_earlier_run_left(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """A POSIX queue outlives its process and none can be listed to remove,
-    so a run is given no bytes for one, and the next run finds none."""
+    """A POSIX queue belongs to the box's IPC namespace: a run may make one,
+    and the next run finds none."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     items = [("main-leave", "leave-mq\n"), ("main-find", "find-mq\n")]
     outputs = run_batch(run_image, work, binary, items)
     assert outcomes(outputs) == {"main-leave": "accepted", "main-find": "accepted"}
-    assert printed(work, outputs["main-leave"]).split()[0] == "refused"
+    assert printed(work, outputs["main-leave"]) == "made 0\n"
     assert printed(work, outputs["main-find"]) == f"none {errno.ENOENT}\n"
 
 
-def test_named_files_are_placed_read_only_in_the_sandbox(
+def test_named_files_are_placed_read_only_in_a_box(
     tmp_path: Path, run_image: RunImage, check: Check
 ) -> None:
-    """In the sandbox, as the harness lays `in/` out: the program sees exactly
+    """In a box, as the harness lays `in/` out: the program sees exactly
     its named files and its loads, by name, and cannot open one to write."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
@@ -431,7 +400,7 @@ def test_named_files_are_placed_read_only_in_the_sandbox(
         work, binary, items, files=files, loads=loads | {"main-2": loads["main-1"]}
     )
     check(json.loads((work / "inputs.json").read_text()), "inputs_file")
-    result = run_image(work, container_limits(1.0, 64, len(items)), owned=True)
+    result = run_image(work, container_limits(1.0, 64, len(items)))
     check(result, "outputs_file")
     outputs = by_run(result)
     assert printed(work, outputs["main-1"]).splitlines() == [
@@ -462,33 +431,33 @@ def test_a_large_named_file_costs_the_run_no_time(
     assert heavy[1] <= plain[1] + 30, (plain, heavy)
 
 
-def test_a_run_reaches_no_network_socket_no_io_uring_and_no_keyring(
+def test_a_run_reaches_no_network_no_io_uring_and_no_keyring(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """The filter `sandbox-exec` installs refuses every socket but a Unix one,
-    io_uring and the kernel's keyrings, with EPERM, so a run reaches no
-    network whatever the container was given and leaves no key for a later
-    run; a Unix socket, which Java and Python use, works.
-    Docker's own seccomp profile is off here, so the refusals are the
-    filter's."""
+    """A box has a network namespace of its own, so a connection out fails
+    though the step container has Docker's network, as a Woodpecker step
+    does; a Unix socket, which Java and Python use, works. isolate's filter
+    refuses io_uring and `keyctl`, and our patch to it `add_key` and
+    `request_key`, with ENOSYS, so a run leaves no key for a later run."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
-    batch_inputs(work, binary, [("main-1", "sockets\n")])
-    limits = container_limits(1.0, 64, 1)
-    outputs = by_run(run_image(work, limits, unconfined=True))
-    assert outcomes(outputs) == {"main-1": "accepted"}
+    items = [("main-1", "sockets\n"), ("main-2", "find-key\n")]
+    outputs = run_batch(run_image, work, binary, items)
+    assert outcomes(outputs) == {"main-1": "accepted", "main-2": "accepted"}
+    # Linux's ENETUNREACH and ENOSYS, which the host running the tests may
+    # number otherwise.
     assert printed(work, outputs["main-1"]).splitlines() == [
-        f"socket AF_INET {errno.EPERM}",
-        f"socket AF_INET6 {errno.EPERM}",
-        f"socket AF_NETLINK {errno.EPERM}",
-        f"socket AF_PACKET {errno.EPERM}",
-        "socket AF_UNIX True",
+        "connect AF_INET 101",
+        "connect AF_INET6 101",
         "socketpair AF_UNIX True",
-        f"socketpair AF_INET {errno.EPERM}",
-        f"io_uring_setup {errno.EPERM}",
-        f"add_key {errno.EPERM}",
-        f"request_key {errno.EPERM}",
-        f"keyctl {errno.EPERM}",
+        "io_uring_setup 38",
+        "add_key 38",
+        "request_key 38",
+        "keyctl 38",
+    ]
+    assert printed(work, outputs["main-2"]).splitlines() == [
+        "request_key 38",
+        "listed False",
     ]
 
 
@@ -496,8 +465,8 @@ def test_a_fork_bomb_stops_at_the_process_limit_without_a_pids_limit(
     tmp_path: Path, run_image: RunImage
 ) -> None:
     """Under a container pids limit far above `pids`, as a Woodpecker step
-    has, a run still stops at 128 processes of its user, and the next run
-    starts, its leftovers reaped."""
+    has, a run still stops at 128 processes of its box user, and the next
+    run starts, its leftovers gone with its box."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     items = [("main-bomb", "fork-bomb\n"), ("main-next", "double\n21\n")]
@@ -513,12 +482,10 @@ def test_a_fork_bomb_stops_at_the_process_limit_without_a_pids_limit(
 def test_a_hostile_run_cannot_reach_the_program_that_watches_it(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """In the sandbox: signalling the launcher is refused from Landlock ABI 6
-    and killing it below that is the run's own runtime error, either way
-    without a traceback whose cost could reach the time limit on a busy
-    machine, work and memory hidden in a child still count, the launcher's descriptors
-    and the program's memory cannot be opened, and SIGINT does not stop the
-    program.
+    """In a box: killing its parent, isolate's, is refused and the run's own
+    runtime error, work and memory hidden in a child still count, isolate's
+    descriptors and memory cannot even be named, and SIGINT to the box's first
+    process does nothing.
     """
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
@@ -545,8 +512,8 @@ def test_a_hostile_run_cannot_reach_the_program_that_watches_it(
         [],
     )
     assert printed(work, outputs["main-prying"]).splitlines() == [
-        "refused 13",
-        "refused 13",
+        f"refused {errno.ENOENT}",
+        f"refused {errno.ENOENT}",
     ]
     interrupted = printed(work, outputs["main-interrupt"]).splitlines()
     assert interrupted[-1] == "still here"
@@ -554,7 +521,7 @@ def test_a_hostile_run_cannot_reach_the_program_that_watches_it(
 
 
 def test_memory_is_the_whole_runs(tmp_path: Path, run_image: RunImage) -> None:
-    """In the sandbox, two processes holding 40 MB each are over a 64 MB limit
+    """In a box, two processes holding 40 MB each are over a 64 MB limit
     together, also when both make themselves not dumpable so their pages
     cannot be read, and a child forked from a binary holding 40 MB is not
     charged again for the pages it shares with it.
@@ -581,7 +548,7 @@ def test_memory_is_the_whole_runs(tmp_path: Path, run_image: RunImage) -> None:
 
 
 def test_memory_kept_in_files_counts(tmp_path: Path, run_image: RunImage) -> None:
-    """In the sandbox, memory a run keeps outside its processes is memory:
+    """In a box, memory a run keeps outside its processes is memory:
     24 MB held and 48 MB more written to files in its own directory, to files
     it deleted and keeps open, to memory files with no path at all, or left
     in pipes or sockets, is over a 64 MB limit, while 40 MB held beside a
@@ -660,7 +627,8 @@ def test_a_native_run_reads_nothing_another_run_left(
         "/work/out/1/output",
         "/work/in/2/input",
         "/work/inputs.json",
-        "/etc/os-release",
+        "/etc/resolv.conf",
+        "/usr/lib/os-release",
     ]
     items = [("main-first", "double 21"), ("main-peek", " ".join(["peek", *paths]))]
     outputs = run_batch(run_image, work, binary, items)
@@ -670,14 +638,15 @@ def test_a_native_run_reads_nothing_another_run_left(
         "refused /work/out/1/output",
         "refused /work/in/2/input",
         "refused /work/inputs.json",
-        "read /etc/os-release",
+        "refused /etc/resolv.conf",
+        "read /usr/lib/os-release",
     ]
 
 
 def test_c_binaries_from_compile(
     tmp_path: Path, run_image: RunImage, compiled: Compiled
 ) -> None:
-    """A C binary from compile runs under the sandbox's rules."""
+    """A C binary from compile runs in a box."""
     binary = compiled("c", "main.c", C)
     work = tmp_path / "work"
     items = [("main-1", "21\n"), ("main-2", "-4\n")]
@@ -729,7 +698,7 @@ def test_python_binaries_from_compile(
     assert printed(work, outputs["main-2"]) == "-8 a b\n"
 
 
-def test_python_args_in_the_sandbox(tmp_path: Path, run_image: RunImage) -> None:
+def test_python_args_in_a_box(tmp_path: Path, run_image: RunImage) -> None:
     """`args` reaches a Python binary's command line split on spaces, each
     item its own, and a binary without them gets none.
     """
@@ -950,3 +919,69 @@ def test_the_diff_script_compares_the_largest_output_in_little_memory(
     outputs = by_run(run_image(work, limits))["case-1"]
     assert (outputs["outcome"], outputs["score"]) == ("accepted", 1)
     assert outputs["memory_kb"] < 32 * 1024
+
+
+def test_on_root_docker_the_image_refuses_to_start(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """Started as its entrypoint is, privileged under root Docker, whose user
+    ID map is the identity, the step would be the machine's own root: exec
+    runs nothing and says why."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    batch_inputs(work, binary, [("main-1", "double\n21\n")])
+    result = run_image(work, container_limits(1.0, 64, 1), root_docker=True)
+    assert set(result) == {"schema_version", "error"}
+    assert "machine's own root" in result["error"]
+    assert not (work / "out").exists()
+
+
+LOW_OPEN_FILES = ["--ulimit=nofile=1024:524288", "--ulimit=stack=8388608:-1"]
+"""Docker Desktop's stack and a low soft limit on open files, under which
+isolate, giving a deep tree back, ran out of both before exec raised them."""
+
+
+def test_a_tree_as_deep_as_the_box_holds_ends_only_its_own_run(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """A run nesting folders until its box has no inode left, about 99,990
+    deep, under a soft limit of 1,024 open files and an 8 MB stack: isolate,
+    which gives the tree back with a folder open at each level, gets the
+    limits exec raised, so the run ends `memory_limit` and the batch goes
+    on, rather than isolate failing and the whole batch with it."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [("main-deep", "nest\n"), ("main-next", "folders\n10\n")]
+    batch_inputs(work, binary, items, time_limit=20, memory_limit=512)
+    limits = container_limits(20, 512, len(items))
+    outputs = by_run(run_image(work, limits, flags=LOW_OPEN_FILES))
+    assert printed(work, outputs["main-deep"]) == "nested 28 True\n"
+    assert outcomes(outputs) == {"main-deep": "memory_limit", "main-next": "accepted"}
+
+
+def test_a_hard_limit_on_open_files_too_low_for_isolate_stops_the_step(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    batch_inputs(work, binary, [("main-1", "folders\n10\n")])
+    limits = container_limits(1.0, 64, 1)
+    result = run_image(work, limits, flags=["--ulimit=nofile=1024:1024"])
+    assert set(result) == {"schema_version", "error"}
+    assert "hard limit on open files, 1024" in result["error"]
+
+
+def test_the_in_process_tests_pass_in_the_test_container(image: str) -> None:
+    """`test_exec.py` in the test container built on the image, privileged,
+    as root through `userns.py`, where every test that runs programs makes
+    its boxes as a step does and none is skipped."""
+    tag = f"{NAME}:test-container"
+    build = ["docker", "build", "--quiet", "--tag", tag, "--build-arg"]
+    build += [f"IMAGE={image}", "--file", str(ROOT / "tests" / "Dockerfile")]
+    subprocess.run([*build, str(ROOT)], check=True, capture_output=True)
+    command = ["docker", "run", "--rm", "--privileged"]
+    command += [f"--env=UNICON_BOX_USERS={BOX_USERS}"]
+    command += ["--volume", f"{ROOT}:/src:ro", tag, "python3", "tests/userns.py"]
+    command += ["pytest", "-p", "no:cacheprovider", "tests/test_exec.py"]
+    done = subprocess.run(command, capture_output=True, text=True, timeout=1800)
+    assert done.returncode == 0, done.stdout[-6000:] + done.stderr[-2000:]
