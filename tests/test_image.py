@@ -431,6 +431,27 @@ def test_a_large_named_file_costs_the_run_no_time(
     assert heavy[1] <= plain[1] + 30, (plain, heavy)
 
 
+def test_named_files_the_container_cannot_hold_are_an_error_of_the_step(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """A run's named files are copied into its box's tmpfs, charged to the
+    container beside the box's own memory: 96 MB of them with a 64 MB
+    limit do not fit a 192 MB container, and exec says so before any run,
+    where the container's limit would kill it with no outputs at all.
+    Without the files, the same container runs the batch."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    limits = container_limits(1.0, 64, 1) | {"memory_mb": 192}
+    items = [("main-1", "double\n21\n")]
+    files = {"main-1": {"data": b"x" * (96 * 1024 * 1024)}}
+    batch_inputs(tmp_path / "large", binary, items, files=files)
+    refused = run_image(tmp_path / "large", limits)
+    assert refused["error"].startswith("the run main-1 needs 161 MB")
+    assert "container's 192 MB leaves 128 MB" in refused["error"]
+    batch_inputs(tmp_path / "small", binary, items)
+    ran = by_run(run_image(tmp_path / "small", limits))
+    assert outcomes(ran) == {"main-1": "accepted"}
+
+
 def test_a_run_reaches_no_network_no_io_uring_and_no_keyring(
     tmp_path: Path, run_image: RunImage
 ) -> None:
@@ -855,15 +876,19 @@ DIFF_CASES = [
     (b"yes\n", b"yes\n\n  \n", True),
     (b"", b"\n\n", True),
     (b"", b"", True),
+    (b" 1 2 3\n", b"1 2 3\n", True),
+    (b"1  2 3\n", b"1 2 3\n", True),
+    (b"a\n\nb\n", b"a\nb\n", True),
+    (b"\n\nyes\n", b"yes\n", True),
+    (b"1\n2\n3\n", b"1 2 3\n", True),
     (b"1 2 3\n", b"1 2 4\n", False),
-    (b" 1 2 3\n", b"1 2 3\n", False),
-    (b"1  2 3\n", b"1 2 3\n", False),
-    (b"a\n\nb\n", b"a\nb\n", False),
     (b"a\n", b"a\nb\n", False),
     (b"", b"0\n", False),
-    (b"\n\nyes\n", b"yes\n", False),
+    (b"12 3\n", b"1 23\n", False),
 ]
-"""diff-check@v2's cases, each an output, an answer and whether they match."""
+"""diff-check@v2's cases and two more, each an output, an answer and whether
+they match by words, as classic@v3 compares: leading whitespace, inner
+spacing and blank lines, which counted for diff-check, count no more."""
 
 
 def diff_script() -> tuple[str, dict[str, Any]]:
@@ -876,12 +901,12 @@ def diff_script() -> tuple[str, dict[str, Any]]:
     return (folder / "diff.py").read_text(), manifest
 
 
-def test_the_diff_script_judges_as_diff_check_did(
+def test_the_diff_script_compares_words(
     tmp_path: Path, run_image: RunImage, compiled: Compiled, check: Check
 ) -> None:
-    """Run through exec in manifest mode, the script gives each of
-    diff-check's cases the outcome diff-check gave, with a score of 1 on a
-    match."""
+    """Run through exec in manifest mode, the script gives each case
+    accepted with a score of 1 when the words match, and wrong_answer with
+    no score when they do not."""
     source, manifest = diff_script()
     binary = compiled("python", "diff.py", source)
     work = tmp_path / "work"

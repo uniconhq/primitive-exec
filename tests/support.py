@@ -121,9 +121,11 @@ def sandbox_flags(limits: dict[str, int]) -> list[str]:
 def step_flags(limits: dict[str, int]) -> list[str]:
     """The docker run flags an exec step container gets: privileged, so exec
     can make its boxes, with the declared memory, pids and CPU-time limits,
-    one CPU, the tests' box users, and the network Docker gives it, as a
-    Woodpecker step has one. Under root Docker, as on Docker Desktop and a CI
-    machine, exec refuses to start, so the tests start it through `USERNS`.
+    one CPU, a `/tmp` mounted `noexec`, `nosuid` and `nodev`, as Docker
+    mounts the harness's, the tests' box users, and the network Docker
+    gives it, as a Woodpecker step has one. Under root Docker, as on Docker
+    Desktop and a CI machine, exec refuses to start, so the tests start it
+    through `USERNS`.
     """
     memory = f"{limits['memory_mb']}m"
     cpu_seconds = math.ceil(limits["cpu_ms"] / 1000)
@@ -134,6 +136,7 @@ def step_flags(limits: dict[str, int]) -> list[str]:
         f"--pids-limit={limits['pids']}",
         f"--ulimit=cpu={cpu_seconds}:{cpu_seconds}",
         "--cpus=1",
+        "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
         f"--env=UNICON_BOX_USERS={BOX_USERS}",
     ]
 
@@ -607,6 +610,8 @@ elif case == "append-stdin":
         print("appended")
     except OSError as error:
         print("refused", error.errno)
+elif case == "stdin-path":
+    print(os.readlink("/proc/self/fd/0"), sys.stdin.read().strip())
 elif case == "child-memory":
     child = os.fork()
     if child == 0:

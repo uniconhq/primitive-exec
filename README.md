@@ -222,7 +222,9 @@ For each item, in order:
    `PATH`, `HOME` and `TMPDIR`, both `/box/run`, `LANG=C.UTF-8`, and for a
    program given a manifest `UNICON_REPORT=/box/report`. The `stdin` file,
    or `/dev/null` without one, is opened by exec and handed to the box as
-   standard input, so the file itself is not in the box. A box could open
+   standard input, so the file itself is not in the box. exec opens it
+   through a bind mount it removes at once, so the path the box reads for
+   it, through `/proc/self/fd/0`, is `/`, not its name. A box could open
    it again through `/proc/self/fd/0` as far as the file's own mode allows,
    so exec first takes write away from its group and others, and refuses a
    file one of the step's box users owns. Standard output is
@@ -340,7 +342,8 @@ the next one:
   gains any. It keeps the full bounding set isolate leaves it, which
   `no_new_privs` makes worth nothing.
 - **Memory pressure.** A box's memory is its own cgroup's, so a run at its
-  limit is killed there, never exec.
+  limit is killed there, never exec, and exec refuses a batch whose runs'
+  limits and copies the container could not hold.
 
 ## What a run can still learn
 
@@ -353,6 +356,13 @@ still carry:
 - **The clock:** how long the runs before it took, against a time it can
   read, such as its standard input's, a file the harness wrote before the
   batch began.
+- **The path its standard input was opened at,** which a box reads through
+  `/proc/self/fd/0`: a `stdin` file's path under `/work/in` could say
+  which test it is. exec opens the file through a mount that is gone
+  before the run starts, so the path a run reads is `/`. The names the
+  step gives the files under `/work/in` and in the machine's cache are
+  kept random as well (#509), so a path that leaks some other way tells
+  nothing either.
 - **What the machine counts:** `/proc` in a box is its own for processes,
   but the machine-wide counters in it are not. `/proc/stat` counts every
   process the machine started since it booted, so a run reads how many the
@@ -369,8 +379,8 @@ none comes before one whose results entrants see sooner.
 
 exec runs as root in a privileged container, which it needs to make its
 boxes, and only where that root is a user namespace's, as under rootless
-Docker: the shape stage 4's phase 4.1 picked for every step that runs code,
-provisionally (#509). At its start, before any item, it:
+Docker: the shape picked for every step that runs code, provisionally
+(#509). At its start, before any item, it:
 
 1. refuses root Docker's identity map, where a privileged container is the
    machine's own root: the first line of `/proc/self/uid_map` exactly `0 0
@@ -393,20 +403,22 @@ provisionally (#509). At its start, before any item, it:
 Any failure is an `error` of the step, and no program runs outside a box.
 
 **The box users** are `UNICON_BOX_USERS`, `<first>-<last>`, both included,
-within 10,000 to 65,000. Whoever starts the step sets it: the wrapper of
-phase 4.8, from the step's job. They must be users no other step that can
-run at the same time on the machine has, and no container's user, since
-the process limit and the keyrings are per user. exec runs one box at a
-time and so uses the first; it takes a range so that a step that runs boxes
-side by side, as `interact` does, is given its users the same way. Without
-it, or with a range out of bounds, exec does not start.
+within 10,000 to 65,000. Whoever starts the step sets it, from the step's
+job. They must be users no other step that can run at the same time on the
+machine has, and no container's user, since the process limit and the
+keyrings are per user. exec runs one box at a time and so uses the first;
+it takes a range so that a step that runs boxes side by side, as
+`interact` does, is given its users the same way. Without it, or with a
+range out of bounds, exec does not start.
 
 **Its twin.** `primitive-interact`'s `src/interact.py` holds a copy of this
-box handling under the same names and in the same order: `box_users`,
-`set_up_step` and what it calls, `fresh_box`, `close_box`, `isolate_box`,
-`mount` and `unmount`, `pump`, `read_meta`, `isolate_said`, the isolate
+box handling under the same names: the step's set-up, the box, the isolate
 command line, the report and `judge`. A change to one is made to the other,
-with the keyrings patch and the image's isolate stage.
+with the keyrings patch and the image's isolate stage. `tests/test_twin.py`,
+the same in both repos, checks the shared functions against a hash both
+pin in `tests/twin.sha256`, and against interact's when a checkout of it is
+beside this one. The pin shows a change was meant for both; only the
+second check shows both have it.
 
 **The machine** needs cgroup v2 with the CPU and memory controllers, and
 the container a cgroup namespace of its own, Docker's default on cgroup v2.
@@ -427,9 +439,9 @@ image tests in CI, on GitHub's root Docker.
 `limits` in `primitive.yaml` are per run: 2 s of time and CPU, 256 MB of
 memory, 160 processes, 64 MB of output and no GPUs, with no network
 (`network: false`). The 160 processes are the box's 128 and room for exec
-and isolate. `limits_from` raises them from each run's own limits so the
-container never dies before the box's own limit does, and they are raised
-for every run, since every run has a `time_limit`. Time and CPU go to `2 ×
+and isolate. `limits_from` raises them from each run's own limits, so the
+box's own limit is the one a run meets, and they are raised for every run,
+since every run has a `time_limit`. Time and CPU go to `2 ×
 time_limit + 3` seconds, what one run can take at most:
 
 - the wall-clock limit, `2 × time_limit + 1` seconds, which a run that
@@ -442,10 +454,16 @@ time_limit + 3` seconds, what one run can take at most:
 
 Memory goes to `memory_limit + 256` MB: room for exec itself and for the
 copies of the program and the named files in the box's tmpfs, which are
-charged to exec, not the box. The `forge` repo's compiler adds up time and
-CPU over the runs of the batch when it writes the plan. A box's processes
-inherit the container's `RLIMIT_CPU`, when it sets one, which is above the
-run's own limit, so isolate's limit is the one that stops a run.
+charged to exec, not the box. That room is fixed, and the copies are not:
+a run whose memory limit and copies, with 64 MB for exec and isolate, are
+more than the container's memory (its cgroup's `memory.max`) is an error of
+the step, said before any run of the batch starts. The container's limit
+would otherwise kill first, the step with no outputs at all, or a run,
+which isolate reads as the run's own `memory_limit`. Whoever sizes the
+step must count the files it copies. The `forge` repo's compiler adds up
+time and CPU over the runs of the batch when it writes the plan. A box's
+processes inherit the container's `RLIMIT_CPU`, when it sets one, which is
+above the run's own limit, so isolate's limit is the one that stops a run.
 
 ## The program format
 
@@ -474,6 +492,7 @@ src/exec.py                 exec, installed as /usr/local/bin/exec, the image's 
 src/isolate-keyrings.patch  our patch to isolate: add_key and request_key refused beside keyctl
 primitive.yaml              the declaration, without the image line
 tests/                      unit tests, and image tests that run it on Docker
+tests/test_twin.py          checks the functions interact copies against the hash in tests/twin.sha256
 tests/Dockerfile            the test container: the image with the tests' tools
 tests/userns.py             starts a command in a user namespace, for exec on root Docker
 ```

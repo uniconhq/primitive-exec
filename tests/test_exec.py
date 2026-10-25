@@ -977,6 +977,20 @@ def test_a_stdin_file_others_can_write_is_not_changed_by_a_run(
     assert stat.S_IMODE(stdin.stat().st_mode) == 0o644
 
 
+def test_a_run_reads_its_stdin_file_but_not_its_name(
+    boxes: None, tmp_path: Path
+) -> None:
+    """The path a box reads for its standard input is `/`, not the file's
+    under `/work/in`, which may say which test it is."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    batch_inputs(work, binary, [("main-1", "stdin-path\nrest\n")])
+    assert primitive.main(["exec", str(work)]) == 0
+    outputs = by_run(json.loads((work / "outputs.json").read_text()))
+    assert printed(work, outputs["main-1"]) == "/ rest\n"
+    assert not primitive.STDIN_MOUNT.is_mount()
+
+
 def test_a_stdin_file_a_box_user_owns_is_an_error(boxes: None, tmp_path: Path) -> None:
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
@@ -1241,7 +1255,7 @@ def test_a_wrong_verdict_shows_its_reports_unchecked(tmp_path: Path) -> None:
         {"verdict": b"1", "score": b"oops", "message": b"wrong on line 2"},
     )
     report = primitive.read_report(folder, DIFF)
-    assert not report.accepted
+    assert report.verdict == "1"
     assert report.outputs == {"message": "wrong on line 2"}
     assert report.shown == {"score": b"oops"}
 
@@ -1259,7 +1273,6 @@ def test_an_outcome_word_is_a_verdict_and_shows_its_reports_unchecked(
     )
     report = primitive.read_report(folder, DIFF)
     assert report.verdict == word
-    assert not report.accepted
     assert report.outputs == {"label": "slow"}
     assert report.shown == {"score": b"oops"}
     assert primitive.verdict_outcome(report.verdict) == word
@@ -1567,3 +1580,59 @@ def test_a_hard_link_into_the_report_folder_is_refused(
     assert outputs["outcome"] == "accepted"
     assert "message" not in outputs
     assert "extras" not in outputs
+
+
+MB = 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    ("held", "needed_mb"),
+    [(None, 10**6), ("max\n", 10**6), (f"{256 * MB}\n", 192)],
+)
+def test_a_run_the_container_holds_is_let_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held: str | None, needed_mb: int
+) -> None:
+    """With no limit on the container, or room for the run's memory limit,
+    its copies and the step's own, the run goes ahead."""
+    memory = tmp_path / "memory.max"
+    if held is not None:
+        memory.write_text(held)
+    monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
+    primitive.check_memory(needed_mb * 1024, "main-1")
+
+
+def test_a_run_the_container_cannot_hold_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = tmp_path / "memory.max"
+    memory.write_text(f"{256 * MB}\n")
+    monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
+    with pytest.raises(primitive.PrimitiveError) as raised:
+        primitive.check_memory(192 * 1024 + 1, "main-1")
+    assert str(raised.value) == (
+        "the run main-1 needs 193 MB for its memory limits and the files copied "
+        "in beside them, and the container's 256 MB leaves 192 MB for them"
+    )
+
+
+def test_a_batch_with_a_run_the_container_cannot_hold_runs_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The named files are counted with the memory limit, since they are
+    copied into the box's tmpfs, charged to the step: so a run whose limit
+    fits but whose files do not is refused before any program runs, an
+    error of the step, not a run the container's limit kills."""
+    memory = tmp_path / "memory.max"
+    memory.write_text(f"{192 * MB}\n")
+    monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
+    monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    files = {"main-2": {"data": b"x" * (80 * MB)}}
+    items = [("main-1", "double\n21\n"), ("main-2", "double\n21\n")]
+    batch_inputs(work, binary, items, files=files)
+    assert primitive.main(["exec", str(work)]) == 0
+    result = json.loads((work / "outputs.json").read_text())
+    assert result["error"].startswith("the run main-2 needs 145 MB")
+    assert "batch" not in result
+    assert not (work / "out").exists()

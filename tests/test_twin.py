@@ -1,0 +1,122 @@
+"""exec and interact each keep a copy of the same box and report handling,
+which must not drift apart: a change to one is made to the other.
+
+Each function in `SHARED` is compared as its syntax tree printed again,
+with its docstring left out, the parameter one names `item` and the other
+`entry` called `item` in both, and the primitive's own name in its texts,
+`exec` or `interact`, called `PRIMITIVE`, so only what they do is compared.
+Both repos pin the same hash of those functions in `tests/twin.sha256`, so
+each checks its own copy wherever it runs, its CI included. The pin shows
+that a change was meant for both, not that both have it: a change to one
+passes once that one's pin is changed. With the other repo checked out
+beside this one, the two are compared function by function too, which
+shows they agree and says which one differs. The tests read the files and
+need no box.
+"""
+
+import ast
+import hashlib
+import re
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+OWN = ROOT / "src" / "exec.py"
+SIBLING = ROOT.parent / "primitive-interact" / "src" / "interact.py"
+PINNED = ROOT / "tests" / "twin.sha256"
+SHARED = (
+    "in_file",
+    "read_manifest",
+    "place_files",
+    "shown_bytes",
+    "check_shape",
+    "set_up_step",
+    "box_users",
+    "refuse_constant",
+    "check_memory",
+    "isolate_command",
+    "isolate_said",
+    "pump",
+    "read_meta",
+    "read_report",
+    "report_files",
+    "folder_files",
+    "read_capped",
+    "report_text",
+    "report_number",
+    "judge",
+    "raise_limits",
+    "set_up_cgroup",
+    "set_up_devices",
+    "fresh_box",
+    "close_box",
+    "isolate_box",
+    "mount",
+    "unmount",
+    "libc",
+)
+"""The functions exec and interact share. The others name a run or a
+program, and read differently in the two."""
+RENAMED = {"entry": "item", "Entry": "Item"}
+"""interact's names for what exec calls an item, one program of an item."""
+PRIMITIVE = re.compile(r"\b(exec|interact)\b")
+"""The primitive's own name, as its messages give it."""
+
+
+class Normalize(ast.NodeTransformer):
+    """Rename interact's `entry` to exec's `item`, as a name and as a
+    parameter, and the primitive's name in a text to `PRIMITIVE`."""
+
+    def visit_Name(self, node: ast.Name) -> ast.Name:
+        node.id = RENAMED.get(node.id, node.id)
+        return node
+
+    def visit_arg(self, node: ast.arg) -> ast.arg:
+        node.arg = RENAMED.get(node.arg, node.arg)
+        self.generic_visit(node)
+        return node
+
+    def visit_Constant(self, node: ast.Constant) -> ast.Constant:
+        if isinstance(node.value, str):
+            node.value = PRIMITIVE.sub("PRIMITIVE", node.value)
+        return node
+
+
+def shared(path: Path) -> dict[str, str]:
+    """Each function of `SHARED` in a source file, by name, normalized: its
+    docstring left out and `Normalize` applied, printed from its tree."""
+    found = {}
+    for node in ast.parse(path.read_text()).body:
+        if isinstance(node, ast.FunctionDef) and node.name in SHARED:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                node.body = node.body[1:] or [ast.Pass()]
+            found[node.name] = ast.unparse(Normalize().visit(node))
+    return found
+
+
+def digest(functions: dict[str, str]) -> str:
+    """The hash of the shared functions, in `SHARED`'s order."""
+    joined = "\n\n".join(functions[name] for name in SHARED)
+    return hashlib.sha256(joined.encode()).hexdigest()
+
+
+def test_every_shared_function_is_here() -> None:
+    assert sorted(shared(OWN)) == sorted(SHARED)
+
+
+def test_the_shared_functions_are_the_pinned_ones() -> None:
+    """A change to a shared function is made to both repos, and the new
+    hash, this test's message, pinned in both."""
+    found = digest(shared(OWN))
+    assert found == PINNED.read_text().strip(), f"the shared functions are {found}"
+
+
+def test_the_shared_functions_are_the_siblings() -> None:
+    """Skipped without the other repo checked out beside this one."""
+    if not SIBLING.is_file():
+        pytest.skip("no primitive-interact checkout beside this one")
+    ours, theirs = shared(OWN), shared(SIBLING)
+    for name in SHARED:
+        assert ours[name] == theirs[name], name

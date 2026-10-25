@@ -94,11 +94,21 @@ CGROUP = Path("/sys/fs/cgroup")
 privileged container on cgroup v2 sees its own cgroup there, writable."""
 BOX_CGROUPS = CGROUP / "isolate"
 STEP_CGROUP = CGROUP / "step"
+CONTAINER_MEMORY = CGROUP / "memory.max"
+"""The container's memory limit in bytes, or `max` for none, which holds
+every box's memory and the copies made into the boxes' tmpfs together: the
+copies are charged to the step, not to a box."""
+STEP_MEMORY_KB = 64 * 1024
+"""What the step needs of the container's memory beside the boxes and the
+copies: the primitive itself, isolate, and the kernel's own use."""
 CONTROLLERS = "+cpu +memory"
 BOX_DEV = Path("/run/boxdev")
 """The `/dev` every box gets in place of the container's, which in a
 privileged container holds the machine's devices, its disks among them."""
 BOX_DEVICES = ("null", "zero", "random", "urandom")
+STDIN_MOUNT = Path("/run/boxstdin")
+"""Where exec opens a run's `stdin` file: bound there, opened, and unbound
+at once, so the path of the open file is `/`, never its own."""
 BOX_LINKS = {
     "fd": "/proc/self/fd",
     "stdin": "/proc/self/fd/0",
@@ -141,6 +151,7 @@ WRITE_BY_OTHERS = 0o022
 MS_NOSUID = 2
 MS_NODEV = 4
 MS_BIND = 4096
+MNT_DETACH = 2
 REPORT_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 """A report a manifest declares, which becomes an output of that name and a
 file of that name in the report folder."""
@@ -216,11 +227,6 @@ class Report:
     verdict: str
     outputs: dict[str, object]
     shown: dict[str, bytes]
-
-    @property
-    def accepted(self) -> bool:
-        """Whether the verdict is `0`, under which the reports count."""
-        return self.verdict == "0"
 
 
 @dataclass(frozen=True)
@@ -562,14 +568,17 @@ def arguments(inputs: dict[str, object], run: str) -> tuple[str, ...]:
 
 
 def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
-    """Set the step up for its boxes, then run the items one after another,
-    in the order given, each in a fresh box with a fresh copy of its program,
-    and return one outputs entry per item.
+    """Check the container holds each item's box (`check_memory`), set the
+    step up for its boxes, then run the items one after another, in the
+    order given, each in a fresh box with a fresh copy of its program, and
+    return one outputs entry per item.
 
     isolate's meta file and its own standard error go in a folder of exec's
     in the container's `/tmp`, which no box sees.
     """
     users = box_users()
+    for item in items:
+        check_memory(box_size_kb(item), item.run)
     set_up_step(users)
     scratch = Path(tempfile.mkdtemp(prefix="exec-"))
     kinds: dict[Path, str] = {}
@@ -665,6 +674,29 @@ def box_size_kb(item: Item) -> int:
     )
 
 
+def check_memory(needed_kb: int, run: str) -> None:
+    """Refuse run `run`, before any program of the batch runs, when
+    `needed_kb`, its boxes' memory limits and the files copied into their
+    tmpfs, and `STEP_MEMORY_KB` are more than the container's memory. The
+    container's limit would otherwise kill first: a program, which isolate
+    reads as the box's own kill, a `memory_limit` that was not the
+    program's, or the step itself, which then writes no outputs at all."""
+    try:
+        text = CONTAINER_MEMORY.read_text().strip()
+    except FileNotFoundError:
+        return
+    if text == "max":
+        return
+    held_kb = int(text) // 1024
+    if needed_kb + STEP_MEMORY_KB > held_kb:
+        raise PrimitiveError(
+            f"the run {run} needs {math.ceil(needed_kb / 1024)} MB for its "
+            "memory limits and the files copied in beside them, and the "
+            f"container's {held_kb // 1024} MB leaves "
+            f"{max(0, held_kb - STEP_MEMORY_KB) // 1024} MB for them"
+        )
+
+
 def prepare(item: Item, kind: str, box: Path) -> Program:
     """Copy the item's program, of format `kind`, into its box, before the
     run's clock starts, executable for a native executable, since the file
@@ -712,24 +744,16 @@ def execute(
     scratch: Path,
     users: range,
 ) -> Run:
-    """Run one item's program in box `BOX`, already made and filled, and
-    return what it did.
+    """Run one item's program in box `BOX`, already made and filled, by
+    `isolate_command`, and return what it did.
 
-    isolate holds every limit: CPU time over all the box's processes
-    (`--time`), the wall clock (`--wall-time`), the box's memory in its
-    cgroup, without swap (`--cg-mem`), the stack at the memory limit, and the
-    box user's processes (`--processes`). The box gets `/tmp` and `/dev/shm`
-    from its own tmpfs, the step's `/dev` of four devices, and of `/etc` only
-    `JAVA_CONFIG`, read-only. The environment holds only `PATH`, `HOME` and
-    `TMPDIR`, both the working directory, `LANG=C.UTF-8`, and for a program
-    given a manifest (`reports`) `UNICON_REPORT`.
-
-    Standard input is the `stdin` file, or `/dev/null`, opened by exec and
-    handed to the box, so the file itself is never in it (`hand_over`).
+    Standard input is the `stdin` file, or `/dev/null`, opened by exec
+    through a mount that is gone before the run (`open_stdin`) and handed
+    to the box, so the file itself is never in it (`hand_over`).
     Standard output is a pipe exec reads up to `OUTPUT_LIMIT` and one byte
     more, then closes, so output costs the box no memory and a run printing
     on past the limit dies of `SIGPIPE`; the output kept is cut to the
-    limit. Standard error goes nowhere.
+    limit.
 
     An argument holding a NUL character, which no command line can carry,
     and a command line too long for the kernel, which only the item's
@@ -742,35 +766,13 @@ def execute(
     meta = scratch / "meta"
     errors = scratch / "errors"
     meta.unlink(missing_ok=True)
-    env = {"PATH": RUN_PATH, "HOME": "/box/run", "TMPDIR": "/box/run"}
-    env["LANG"] = "C.UTF-8"
-    if reports:
-        env["UNICON_REPORT"] = "/box/report"
-    command = [
-        ISOLATE,
-        "--cg",
-        f"--box-id={BOX}",
-        "--silent",
-        f"--meta={meta}",
-        f"--time={item.time_limit}",
-        f"--wall-time={item.wall_limit}",
-        f"--cg-mem={item.memory_limit_kb}",
-        f"--stack={item.memory_limit_kb}",
-        f"--processes={PROCESS_LIMIT}",
-        f"--dir=tmp={BOX_ROOT / str(BOX) / 'box' / 'tmp'}:rw",
-        f"--dir=dev={BOX_DEV}:dev",
-        f"--dir=dev/shm={BOX_ROOT / str(BOX) / 'box' / 'shm'}:rw",
-        f"--dir={JAVA_CONFIG.lstrip('/')}",
-        "--chdir=/box/run",
-        "--stderr=/dev/null",
-        *(f"--env={name}={value}" for name, value in env.items()),
-        "--run",
-        "--",
-        *program.command(item),
-    ]
-    stdin_path = item.stdin if item.stdin is not None else Path(os.devnull)
+    command = isolate_command(BOX, meta, item, reports, [], program.command(item))
+    if item.stdin is None:
+        descriptor = os.open(os.devnull, os.O_RDONLY)
+    else:
+        descriptor = open_stdin(item.stdin)
     with (
-        stdin_path.open("rb") as stdin,
+        os.fdopen(descriptor, "rb") as stdin,
         errors.open("wb") as stderr,
         output.open("wb") as stdout,
     ):
@@ -812,6 +814,71 @@ def execute(
         output_bytes=printed,
         out_of_memory=found.get("cg-oom-killed") == "1",
     )
+
+
+def isolate_command(
+    number: int,
+    meta: Path,
+    item: Item,
+    reports: bool,
+    more: list[str],
+    run: list[str],
+) -> list[str]:
+    """The isolate command line that runs `run`, one program, in box
+    `number`, already made and filled, writing its meta file to `meta`.
+
+    isolate holds every limit: CPU time over all the box's processes
+    (`--time`), the wall clock (`--wall-time`), the box's memory in its
+    cgroup, without swap (`--cg-mem`), the stack at the memory limit, and the
+    box user's processes (`--processes`). The box gets `/tmp` and `/dev/shm`
+    from its own tmpfs, the step's `/dev` of four devices, and of `/etc` only
+    `JAVA_CONFIG`, read-only, then the options in `more`, the caller's own.
+    The environment holds only `PATH`, `HOME` and `TMPDIR`, both the working
+    directory, `LANG=C.UTF-8`, and for a program given a manifest
+    (`reports`) `UNICON_REPORT`. Standard error goes nowhere.
+    """
+    env = {"PATH": RUN_PATH, "HOME": "/box/run", "TMPDIR": "/box/run"}
+    env["LANG"] = "C.UTF-8"
+    if reports:
+        env["UNICON_REPORT"] = "/box/report"
+    box = BOX_ROOT / str(number) / "box"
+    return [
+        ISOLATE,
+        "--cg",
+        f"--box-id={number}",
+        "--silent",
+        f"--meta={meta}",
+        f"--time={item.time_limit}",
+        f"--wall-time={item.wall_limit}",
+        f"--cg-mem={item.memory_limit_kb}",
+        f"--stack={item.memory_limit_kb}",
+        f"--processes={PROCESS_LIMIT}",
+        f"--dir=tmp={box / 'tmp'}:rw",
+        f"--dir=dev={BOX_DEV}:dev",
+        f"--dir=dev/shm={box / 'shm'}:rw",
+        f"--dir={JAVA_CONFIG.lstrip('/')}",
+        *more,
+        "--chdir=/box/run",
+        "--stderr=/dev/null",
+        *(f"--env={name}={value}" for name, value in env.items()),
+        "--run",
+        "--",
+        *run,
+    ]
+
+
+def open_stdin(path: Path) -> int:
+    """Open a run's `stdin` file through `STDIN_MOUNT`, bound there and
+    unbound once open. A box reads the path its standard input was opened
+    at through `/proc/self/fd/0`, and the file's own path under `/work/in`
+    may say which test it is; the path of a file opened through a mount
+    that is gone is `/`."""
+    STDIN_MOUNT.touch()
+    mount(path, STDIN_MOUNT, None, MS_BIND, None)
+    try:
+        return os.open(STDIN_MOUNT, os.O_RDONLY)
+    finally:
+        unmount(STDIN_MOUNT, MNT_DETACH)
 
 
 def hand_over(descriptor: int, item: Item, users: range) -> None:
@@ -1310,9 +1377,10 @@ def mount(
         raise PrimitiveError(f"{target} could not be mounted: {os.strerror(code)}")
 
 
-def unmount(target: Path) -> None:
-    """Unmount what is mounted on `target`, as umount(2), raising on failure."""
-    if libc().umount2(os.fsencode(target), 0) != 0:
+def unmount(target: Path, flags: int = 0) -> None:
+    """Unmount what is mounted on `target`, as umount2(2) with `flags`,
+    raising on failure."""
+    if libc().umount2(os.fsencode(target), flags) != 0:
         code = ctypes.get_errno()
         raise PrimitiveError(f"{target} could not be unmounted: {os.strerror(code)}")
 
