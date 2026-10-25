@@ -250,13 +250,16 @@ def check(schema: dict[str, Any]) -> Check:
     """Validate a document against one part of the contract.
 
     For `outputs_file`, every entry must also carry each output the
-    declaration names as required, and nothing it does not name.
+    declaration names as required, and nothing it does not name but the
+    `reports` of the manifest it was given.
     """
     registry: Registry[Any] = Registry().with_resource(
         schema["$id"], Resource.from_contents(schema)
     )
 
-    def validate(document: dict[str, Any], part: str) -> None:
+    def validate(
+        document: dict[str, Any], part: str, reports: frozenset[str] = frozenset()
+    ) -> None:
         reference = {"$ref": f"{schema['$id']}#/$defs/{part}"}
         Draft202012Validator(reference, registry=registry).validate(document)
         if part != "outputs_file" or "error" in document:
@@ -268,6 +271,6 @@ def check(schema: dict[str, Any]) -> Check:
         else:
             entries = [document["outputs"]]
         for outputs in entries:
-            assert required <= set(outputs) <= set(declared), outputs
+            assert required <= set(outputs) <= set(declared) | reports, outputs
 
     return validate

@@ -3,6 +3,7 @@ description: Runs a program once under limits and records its output, time and m
 schema_version: 6
 batch: true
 network: false
+outputs_from: manifest
 limits: {time_ms: 2000, cpu_ms: 2000, memory_mb: 256, pids: 128, output_mb: 64, gpus: 0}
 limits_from:
   time_ms: {input: time_limit, scale: 2000, add: 3000}
@@ -28,6 +29,15 @@ inputs:
     runs: true
     optional: true
     description: Code the program loads, placed as files are, such as the module a test harness imports.
+  manifest:
+    type: file
+    runs: false
+    optional: true
+    description: The reports the program declares, its program.yaml as JSON, when it is one that reports, such as a checker.
+  self_reported:
+    type: boolean
+    optional: true
+    description: True when the program given a manifest runs the entrant's code, so a report that does not hold is the entrant's runtime error, not a fault.
   args:
     type: text
     optional: true
@@ -52,11 +62,28 @@ outputs:
     better: lower
     at_least: 0
     description: The most memory the program used, in kilobytes.
+  label:
+    type: text
+    optional: true
+    description: A finer name for the outcome, from a program given a manifest.
+  message:
+    type: text
+    optional: true
+    description: A message shown with the run, from a program given a manifest.
+  staff_message:
+    type: text
+    optional: true
+    description: A message only staff see, from a program given a manifest.
+  extras:
+    type: folder
+    optional: true
+    description: Every other file a program given a manifest reported, shown with the run and never a column.
   outcome:
     type: outcome
     description: How the program's run ended.
     outcomes:
-      accepted: the program finishes within its limits
+      accepted: the program finishes within its limits, and given a manifest reports a verdict of 0
+      wrong_answer: the program given a manifest reports a verdict of 1
       time_limit: it runs out of time
       memory_limit: it uses more memory than allowed
       output_limit: it prints more than allowed

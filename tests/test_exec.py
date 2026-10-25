@@ -8,12 +8,14 @@ import ctypes
 import errno
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import time
 import zipfile
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ import pytest
 import exec as primitive
 from support import (
     PROGRAM,
+    SCORE,
     batch_inputs,
     by_run,
     declaration,
@@ -66,15 +69,9 @@ def run(helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     monkeypatch.setattr(primitive, "HELPER", helper)
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
 
-    def batch(
-        items: list[tuple[str, str]],
-        args: dict[str, str] | None = None,
-        files: dict[str, dict[str, bytes]] | None = None,
-        loads: dict[str, dict[str, bytes]] | None = None,
-        **limits: float,
-    ) -> dict[str, Any]:
+    def batch(items: list[tuple[str, str]], **options: Any) -> dict[str, Any]:
         work = tmp_path / "work"
-        batch_inputs(work, binary, items, args=args, files=files, loads=loads, **limits)
+        batch_inputs(work, binary, items, **options)
         assert primitive.main(["exec", str(work)]) == 0
         document: dict[str, Any] = json.loads(
             (work / "outputs.json").read_text(encoding="utf-8")
@@ -139,17 +136,19 @@ def test_judge(changes: dict[str, Any], kind: str, outcome: str) -> None:
 
 
 def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
-    """The outcome port's outcomes are exactly the ones `judge` gives, each
-    with a line saying when, for the workflow editor's drawer.
+    """The outcome port's outcomes are exactly the ones `judge` gives and a
+    report's verdict, each with a line saying when, for the workflow editor's
+    drawer.
     """
     reported = {
         primitive.judge(make_run(**changes), ITEM, kind) for changes, kind, _ in JUDGED
-    }
+    } | {primitive.verdict_outcome(accepted) for accepted in (True, False)}
 
     outcomes = declaration()["outputs"]["outcome"]["outcomes"]
 
     assert list(outcomes) == [
         "accepted",
+        "wrong_answer",
         "time_limit",
         "memory_limit",
         "output_limit",
@@ -160,13 +159,17 @@ def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
 
 
 def test_the_declaration_says_every_outcome_judge_can_give() -> None:
-    """The declared outcomes are every one `judge` can return, read from its
-    source rather than from the runs `JUDGED` picks, so a new way to an
-    outcome needs its line too.
+    """The declared outcomes are every one `judge`, a report's verdict and
+    a self-reported run's fault can give, read from their source rather than
+    from the runs `JUDGED` picks, so a new way to an outcome needs its line
+    too.
     """
     outcomes = declaration()["outputs"]["outcome"]["outcomes"]
 
-    assert set(outcomes) == returned_outcomes(primitive.judge)
+    found = returned_outcomes(primitive.judge) | returned_outcomes(
+        primitive.verdict_outcome
+    )
+    assert set(outcomes) == found | returned_outcomes(primitive.reported)
 
 
 def test_detect(tmp_path: Path) -> None:
@@ -856,7 +859,7 @@ def test_the_launcher_filters_sockets(helper: str, tmp_path: Path) -> None:
     )
     python = os.path.realpath(sys.executable)
     read_end, write_end = os.pipe()
-    ruleset = primitive.landlock_ruleset(tmp_path, [Path(sys.base_prefix)], 3)
+    ruleset = primitive.landlock_ruleset([tmp_path], [Path(sys.base_prefix)], 3)
     done = subprocess.run(
         [helper, str(write_end), str(ruleset), python, "-I", "-c", script],
         pass_fds=(write_end, ruleset),
@@ -901,3 +904,387 @@ def test_each_item_runs_a_copy_of_the_binary_of_its_own(
     work = tmp_path / "work"
     assert printed(work, outputs["main-mark"]) == "marked\n"
     assert printed(work, outputs["main-read"]) == "no attribute\ntime fresh\n"
+
+
+def write_manifest(tmp_path: Path, document: object) -> Path:
+    """A manifest file holding `document` as JSON, or as written when text."""
+    path = tmp_path / "manifest.json"
+    text = document if isinstance(document, str) else json.dumps(document)
+    path.write_text(text)
+    return path
+
+
+def test_a_manifest_reads_as_its_reports(tmp_path: Path) -> None:
+    """A number is the default, with its bounds as decimals; a text has
+    none; either may be optional."""
+    path = write_manifest(
+        tmp_path,
+        {
+            "reports": {
+                "score": {"better": "higher", "at_least": 0, "at_most": 1},
+                "error": {"type": "number", "at_least": 0.5},
+                "feedback": {"type": "text", "optional": True},
+            }
+        },
+    )
+    manifest = primitive.read_manifest(path, "the manifest")
+    assert manifest == {
+        "score": primitive.Declared("number", False, Decimal(0), Decimal(1)),
+        "error": primitive.Declared("number", False, Decimal("0.5"), None),
+        "feedback": primitive.Declared("text", True),
+    }
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ("reports: {}", "is not valid JSON"),
+        ('{"reports": {"score": {"at_least": NaN}}}', "is not valid JSON"),
+        ('{"reports": {"score": {"at_most": Infinity}}}', "is not valid JSON"),
+        ([], "holding reports alone"),
+        ({"reports": {}, "title": "x"}, "holding reports alone"),
+        ({"reports": []}, "reports that are not an object"),
+        ({"reports": {"Score": {}}}, "declares 'Score', not a report name"),
+        ({"reports": {"a" * 65: {}}}, "not a report name"),
+        ({"reports": {"verdict": {}}}, "declares verdict, a name exec gives"),
+        ({"reports": {"time_ms": {}}}, "declares time_ms, a name exec gives"),
+        ({"reports": {"message": {"type": "text"}}}, "declares message, a name"),
+        ({"reports": {"score": "number"}}, "with keys it does not know"),
+        ({"reports": {"score": {"unit": "%"}}}, "with keys it does not know"),
+        ({"reports": {"score": {"type": "file"}}}, "neither a number nor a text"),
+        ({"reports": {"score": {"optional": 1}}}, "neither a number nor a text"),
+        ({"reports": {"note": {"type": "text", "at_most": 1}}}, "a direction or a"),
+        ({"reports": {"score": {"better": "up"}}}, "neither higher nor lower"),
+        ({"reports": {"score": {"at_least": True}}}, "by something not a number"),
+        ({"reports": {"score": {"at_least": "0"}}}, "by something not a number"),
+        ('{"reports": {"score": {"at_most": 1e999}}}', "by something not a number"),
+        ({"reports": {"score": {"at_least": 2, "at_most": 1}}}, "at least above"),
+        ({"reports": {"score": {"better": None}}}, "neither higher nor lower"),
+        ({"reports": {"score": {"at_least": None}}}, "by something not a number"),
+        (
+            '{"reports": {"score": {"at_most": 1e99999999999999999999}}}',
+            "holds a number too large to read",
+        ),
+    ],
+)
+def test_a_manifest_it_cannot_use_is_an_error(
+    tmp_path: Path, document: object, message: str
+) -> None:
+    path = write_manifest(tmp_path, document)
+    with pytest.raises(primitive.PrimitiveError, match=re.escape(message)):
+        primitive.read_manifest(path, "the manifest")
+
+
+def write_report(folder: Path, files: dict[str, bytes]) -> Path:
+    """A report folder holding `files`, by name."""
+    folder.mkdir(exist_ok=True)
+    for name, content in files.items():
+        (folder / name).write_bytes(content)
+    return folder
+
+
+DIFF = {"score": primitive.Declared("number", False, Decimal(0), Decimal(1))}
+
+
+def test_a_report_gives_its_reports_and_texts_and_shows_the_rest(
+    tmp_path: Path,
+) -> None:
+    folder = write_report(
+        tmp_path / "report",
+        {
+            "verdict": b"0\n",
+            "score": b"0.5\n",
+            "label": b"partial\n",
+            "message": "line 3 differs, é\n".encode(),
+            "staff_message": b"compared 12 lines\n",
+            "notes": b"anything\n",
+        },
+    )
+    report = primitive.read_report(folder, DIFF)
+    assert report == primitive.Report(
+        accepted=True,
+        outputs={
+            "score": 0.5,
+            "label": "partial",
+            "message": "line 3 differs, é",
+            "staff_message": "compared 12 lines",
+        },
+        shown={"notes": b"anything\n"},
+    )
+
+
+def test_a_wrong_verdict_shows_its_reports_unchecked(tmp_path: Path) -> None:
+    """Under `1` the reports don't count, so they are shown, not outputs, and
+    one that would not hold is no fault."""
+    folder = write_report(
+        tmp_path / "report",
+        {"verdict": b"1", "score": b"oops", "message": b"wrong on line 2"},
+    )
+    report = primitive.read_report(folder, DIFF)
+    assert not report.accepted
+    assert report.outputs == {"message": "wrong on line 2"}
+    assert report.shown == {"score": b"oops"}
+
+
+def test_an_optional_report_may_be_left_out(tmp_path: Path) -> None:
+    manifest = {"score": primitive.Declared("number", optional=True)}
+    folder = write_report(tmp_path / "report", {"verdict": b"0"})
+    assert primitive.read_report(folder, manifest).outputs == {}
+
+
+def test_a_text_report_is_an_output_too(tmp_path: Path) -> None:
+    manifest = {"feedback": primitive.Declared("text")}
+    folder = write_report(tmp_path / "report", {"verdict": b"0", "feedback": b"ok\n\n"})
+    assert primitive.read_report(folder, manifest).outputs == {"feedback": "ok"}
+
+
+@pytest.mark.parametrize(
+    ("written", "value"),
+    [
+        (b"1", 1),
+        (b"0", 0),
+        (b"-0", 0),
+        (b" 0.25 \n", 0.25),
+        (b"1e-05\n", 1e-05),
+        (b"5E-1", 0.5),
+        (b"1.0", 1.0),
+    ],
+)
+def test_a_number_is_a_decimal_as_json_writes_one(
+    tmp_path: Path, written: bytes, value: float
+) -> None:
+    folder = write_report(tmp_path / "report", {"verdict": b"0", "score": written})
+    reported = primitive.read_report(folder, DIFF).outputs["score"]
+    assert reported == value
+    assert type(reported) is type(value)
+
+
+@pytest.mark.parametrize(
+    ("files", "message"),
+    [
+        ({}, "has no verdict"),
+        ({"verdict": b""}, "has a verdict '', not 0 or 1"),
+        ({"verdict": b"2"}, "has a verdict '2', not 0 or 1"),
+        ({"verdict": b"0 1"}, "has a verdict '0 1', not 0 or 1"),
+        ({"verdict": b"accepted"}, "has a verdict 'accepted', not 0 or 1"),
+        ({"verdict": b"0"}, "has no score, which the manifest declares"),
+        ({"verdict": b"0", "score": b"nan"}, "has score 'nan', not a decimal"),
+        ({"verdict": b"0", "score": b"inf"}, "has score 'inf', not a decimal"),
+        ({"verdict": b"0", "score": b"0x1"}, "has score '0x1', not a decimal"),
+        ({"verdict": b"0", "score": b"01"}, "has score '01', not a decimal"),
+        ({"verdict": b"0", "score": b"+1"}, "has score '+1', not a decimal"),
+        ({"verdict": b"0", "score": b"0,5"}, "has score '0,5', not a decimal"),
+        ({"verdict": b"0", "score": b"1 1"}, "has score '1 1', not a decimal"),
+        ({"verdict": b"0", "score": b""}, "has score '', not a decimal"),
+        ({"verdict": b"0", "score": b"1e999"}, "has score '1e999', not a finite"),
+        ({"verdict": b"0", "score": b"-1e999"}, "'-1e999', not a finite"),
+        ({"verdict": b"0", "score": b"1e99999999999999999999"}, "not a finite"),
+        ({"verdict": b"0", "score": b"1e-99999999999999999999"}, "not a finite"),
+        ({"verdict": b"1", os.fsdecode(b"\xff"): b""}, "holds '\ufffd', not a plain"),
+        ({"verdict": b"0", "score": b"-0.1"}, "has score -0.1, below its least, 0"),
+        ({"verdict": b"0", "score": b"1.5"}, "has score 1.5, above its most, 1"),
+        ({"verdict": b"0", "score": b"1.0000000000000000001"}, "above its most"),
+        ({"verdict": b"0", "score": b"1", "message": b"\xff"}, "message not in UTF-8"),
+        ({"verdict": b"0", "score": b"1", "label": b"a\0b"}, "label holding a NUL"),
+        ({"verdict": b"1", "notes": b"\xfe"}, "has notes not in UTF-8"),
+        ({"verdict": b"1", "message": b"x" * (64 * 1024 + 1)}, "message, over 64 KB"),
+        ({"verdict": b"1", ".hidden": b""}, "holds '.hidden', not a plain name"),
+        ({"verdict": b"1", "a b": b""}, "holds 'a b', not a plain name"),
+    ],
+)
+def test_a_report_that_does_not_hold_is_a_fault(
+    tmp_path: Path, files: dict[str, bytes], message: str
+) -> None:
+    """Each check `SIMPLER-CORE.md` 13.1 names, and what exec relies on."""
+    folder = write_report(tmp_path / "report", files)
+    with pytest.raises(primitive.ReportError, match=re.escape(message)):
+        primitive.read_report(folder, DIFF)
+
+
+def test_a_text_of_64_kb_is_kept_whole(tmp_path: Path) -> None:
+    text = b"x" * (64 * 1024)
+    folder = write_report(tmp_path / "report", {"verdict": b"1", "message": text})
+    assert primitive.read_report(folder, DIFF).outputs["message"] == text.decode()
+
+
+def test_a_report_of_too_many_files_is_a_fault(tmp_path: Path) -> None:
+    files = {f"note{n}": b"" for n in range(primitive.REPORT_FILES)}
+    folder = write_report(tmp_path / "report", files | {"verdict": b"1"})
+    with pytest.raises(primitive.ReportError, match="more than 64 files"):
+        primitive.read_report(folder, DIFF)
+
+
+@pytest.mark.parametrize("kind", ["link", "fifo", "folder"])
+def test_a_report_file_that_is_not_a_plain_file_is_a_fault(
+    tmp_path: Path, kind: str
+) -> None:
+    """A link is not followed, so a run cannot have exec read for it a file
+    it may not read itself; a FIFO is not waited on."""
+    secret = tmp_path / "secret"
+    secret.write_text("hidden answer")
+    folder = write_report(tmp_path / "report", {"verdict": b"1"})
+    if kind == "link":
+        (folder / "message").symlink_to(secret)
+    elif kind == "fifo":
+        os.mkfifo(folder / "message")
+    else:
+        (folder / "message").mkdir()
+    with pytest.raises(primitive.ReportError, match="holds message, not a plain file"):
+        primitive.read_report(folder, DIFF)
+
+
+def reporting(work: Path, result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """A batch's outputs keyed by run, with what its extras hold by name."""
+    outputs = by_run(result)
+    for entry in outputs.values():
+        if "extras" in entry:
+            folder = work / entry["extras"]["folder"]
+            entry["extras"] = {p.name: p.read_text() for p in folder.iterdir()}
+    return outputs
+
+
+def test_a_program_given_a_manifest_reports_through_its_folder(
+    run: Any, tmp_path: Path
+) -> None:
+    """Its reports are outputs under `0`; under `1` they are shown with the
+    rest."""
+    result = run(
+        [
+            ("main-1", "report\nverdict 0\nscore 1\nmessage fine\nnotes kept"),
+            ("main-2", "report\nverdict 1\nscore 0.5\nlabel close"),
+        ],
+        manifest=SCORE,
+    )
+    outputs = reporting(tmp_path / "work", result)
+    assert outputs["main-1"]["outcome"] == "accepted"
+    assert outputs["main-1"]["score"] == 1
+    assert outputs["main-1"]["message"] == "fine"
+    assert outputs["main-1"]["extras"] == {"notes": "kept\n"}
+    assert outputs["main-2"]["outcome"] == "wrong_answer"
+    assert "score" not in outputs["main-2"]
+    assert outputs["main-2"]["label"] == "close"
+    assert outputs["main-2"]["extras"] == {"score": "0.5\n"}
+    assert printed(tmp_path / "work", outputs["main-2"]) == "reported\n"
+
+
+def test_each_run_reports_into_a_fresh_folder(run: Any, tmp_path: Path) -> None:
+    """The folder is outside the run's working directory, and what one run
+    left in its folder is not there for the next."""
+    manifest = {"reports": {"score": {"optional": True}}}
+    result = run(
+        [("main-1", "report\nverdict 0\nnotes left"), ("main-2", "report-where\n")],
+        manifest=manifest,
+    )
+    outputs = reporting(tmp_path / "work", result)
+    assert outputs["main-1"]["extras"] == {"notes": "left\n"}
+    assert printed(tmp_path / "work", outputs["main-2"]) == "report True\nempty True\n"
+    assert "extras" not in outputs["main-2"]
+
+
+def test_a_program_given_no_manifest_has_no_report_folder(
+    run: Any, tmp_path: Path
+) -> None:
+    outputs = by_run(run([("main-1", "no-report\n")]))
+    assert printed(tmp_path / "work", outputs["main-1"]) == "report None\n"
+
+
+@pytest.mark.parametrize(
+    ("stdin", "message"),
+    [
+        ("report\nscore 1", "the report of run main-2 has no verdict"),
+        ("report\nverdict 0\nscore 2", "the report of run main-2 has score 2, above"),
+        ("report-then-fail\n", "run main-2 did not judge: it ended in runtime error"),
+        ("spin\n", "run main-2 did not judge: it ended in time limit"),
+    ],
+)
+def test_a_program_that_does_not_judge_is_an_error_of_the_step(
+    run: Any, stdin: str, message: str
+) -> None:
+    """An organiser's program that reports wrongly, crashes or breaks a limit
+    has not judged, so the batch is an error, which staff see."""
+    result = run(
+        [("main-1", "report\nverdict 0\nscore 1"), ("main-2", stdin)],
+        manifest=SCORE,
+        time_limit=0.5,
+    )
+    assert set(result) == {"schema_version", "error"}
+    assert message in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("stdin", "outcome"),
+    [
+        ("report\nscore 1", "runtime_error"),
+        ("report\nverdict 0\nscore 2", "runtime_error"),
+        ("report-then-fail\n", "runtime_error"),
+        ("spin\n", "time_limit"),
+        ("report\nverdict 0\nscore 1e99999999999999999999", "runtime_error"),
+        ("report-bad-name\n", "runtime_error"),
+        ("report\nverdict 0\nscore 1", "accepted"),
+    ],
+)
+def test_a_self_reported_run_that_does_not_judge_is_the_entrants(
+    run: Any, stdin: str, outcome: str
+) -> None:
+    """Where the program runs the entrant's code, what it did is the run's
+    own outcome, never a fault (`SIMPLER-CORE.md` 7.3), with no report."""
+    result = run(
+        [("main-1", stdin)], manifest=SCORE, self_reported=True, time_limit=0.5
+    )
+    outputs = by_run(result)["main-1"]
+    assert outputs["outcome"] == outcome
+    assert ("score" in outputs) == (outcome == "accepted")
+
+
+def test_a_link_in_the_report_folder_reads_nothing_for_the_run(
+    run: Any, tmp_path: Path
+) -> None:
+    """A link to the next run's input, which the run may not read, is a
+    fault, and exec does not read the input for it."""
+    work = tmp_path / "work"
+    result = run(
+        [("main-1", f"report-link\n{work}/in/3/input\n"), ("main-2", "hidden answer")],
+        manifest=SCORE,
+    )
+    assert "the report of run main-1 holds message, not a plain file" in result["error"]
+    assert "hidden" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    ("inputs", "message"),
+    [
+        ({"self_reported": True}, "is self_reported without a manifest"),
+        ({"self_reported": "yes"}, "self_reported of run main-1 is not true or false"),
+        ({"manifest": {"file": "in/2/input"}}, "manifest of run main-1 is not valid"),
+        ({"manifest": {"file": "in/none"}}, "manifest of run main-1 is not in the"),
+    ],
+)
+def test_a_manifest_or_self_report_it_cannot_use_is_an_error(
+    tmp_path: Path, inputs: dict[str, Any], message: str
+) -> None:
+    batch_inputs(tmp_path, b"", [("main-1", "not json")])
+    document = json.loads((tmp_path / "inputs.json").read_text())
+    document["batch"][0]["inputs"].update(inputs)
+    (tmp_path / "inputs.json").write_text(json.dumps(document))
+    primitive.main(["exec", str(tmp_path)])
+    assert message in json.loads((tmp_path / "outputs.json").read_text())["error"]
+
+
+def test_a_hard_link_into_the_report_folder_is_refused(
+    run: Any, tmp_path: Path
+) -> None:
+    """Landlock refuses a link from outside the run's own folders, so a run
+    cannot hand exec the next run's input to read for it."""
+    work = tmp_path / "work"
+    result = run(
+        [
+            ("main-1", f"report-hardlink\n{work}/in/3/input\n"),
+            ("main-2", "report\nverdict 0\nscore 1"),
+        ],
+        manifest=SCORE,
+    )
+    outputs = by_run(result)["main-1"]
+    assert printed(work, outputs).startswith("refused ")
+    assert outputs["outcome"] == "accepted"
+    assert "message" not in outputs
+    assert "extras" not in outputs

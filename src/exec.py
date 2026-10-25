@@ -26,11 +26,22 @@ of the program, with every process it left behind killed, and every System V
 shared memory segment, message queue and semaphore set and every `user`
 extended attribute under the working directory it left removed, before the
 next item starts. Every run is put under
-Landlock: it may write only inside that directory and to /dev/null, read only
-the system's own directories, its program and that directory, and may not
+Landlock: it may write only inside that directory, its report folder if it
+has one, and to /dev/null, read only the system's own directories, its
+program and those, and may not
 trace anything outside itself, and from Landlock ABI 6 it may not signal
 anything outside itself either. A kernel without Landlock ABI 3 is an error of
 the step: the runs are not started less confined.
+
+A run given a `manifest`, an organiser's program such as a checker, also gets
+an empty folder of its own outside its working directory, named in
+`$UNICON_REPORT`, and writes there one file per value it reports: `verdict`,
+`0` for accepted or `1` for a wrong answer, and each report the manifest
+declares. Its reports become outputs of their own names on `0`, and a report
+that does not hold, or a run of it that crashes or breaks a limit, is an error
+of the step, since the program did not judge; for a `self_reported` run, one
+that runs the entrant's code, it is the run's `runtime_error` or limit
+instead.
 """
 
 import ctypes
@@ -50,8 +61,9 @@ import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
-from stat import S_IMODE, S_ISDIR, S_ISLNK
+from stat import S_IMODE, S_ISDIR, S_ISLNK, S_ISREG
 from typing import BinaryIO
 
 SCHEMA_VERSION = 6
@@ -161,6 +173,37 @@ GONE = frozenset({errno.EINVAL, errno.EIDRM})
 NO_ATTRIBUTES = frozenset({errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP})
 """What listing or removing an attribute answers for a path that is gone, or
 on a filesystem without attributes."""
+REPORT_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
+"""A report a manifest declares, which becomes an output of that name and a
+file of that name in the report folder."""
+OWN_NAMES = frozenset(
+    {
+        "verdict",
+        "label",
+        "message",
+        "staff_message",
+        "output",
+        "time_ms",
+        "memory_kb",
+        "outcome",
+        "extras",
+    }
+)
+"""What no report may be named: the report folder's own files and exec's own
+outputs."""
+REPORT_KEYS = frozenset({"type", "optional", "better", "at_least", "at_most"})
+TEXTS = ("label", "message", "staff_message")
+"""The text files a report may hold besides its reports, each an output of
+its name: a finer name for the outcome, a message for the entrant, and one for
+staff alone."""
+REPORT_TEXT_LIMIT = 64 * 1024
+"""The most bytes one file in a report folder may hold."""
+REPORT_FILES = 64
+"""The most files a report folder may hold."""
+DECIMAL = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+"""A reported number, as JSON writes one: so `1e-05`, as Python prints a small
+float, is one, and `nan`, `inf` and `0x10` are not."""
+WHOLE = re.compile(r"-?(?:0|[1-9][0-9]*)")
 
 
 class PrimitiveError(Exception):
@@ -171,12 +214,44 @@ class PrimitiveError(Exception):
     """
 
 
+class ReportError(Exception):
+    """What a run given a manifest reported does not hold: the end of a
+    sentence that begins with the run's report."""
+
+
+@dataclass(frozen=True)
+class Declared:
+    """One report a manifest declares: a `number`, with the bounds every value
+    lies within, both inclusive, or a `text`; and whether a verdict of `0` may
+    leave it out. Which way is better is the forge's to carry, not exec's to
+    check.
+    """
+
+    kind: str
+    optional: bool = False
+    at_least: Decimal | None = None
+    at_most: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class Report:
+    """What a run given a manifest reported: whether it judged the run
+    accepted, the outputs it gives, and the files only shown with the run, by
+    name."""
+
+    accepted: bool
+    outputs: dict[str, object]
+    shown: dict[str, bytes]
+
+
 @dataclass(frozen=True)
 class Item:
     """One run: its id, its place in the batch from 1, the program, the file
     for standard input if any, the two limits, the arguments, and the named
     files placed in its working directory: `files` it reads, and `loads`, code
     the program loads, such as the entrant's module a test harness imports.
+    `manifest` is the reports the program declares, when it is one that
+    reports, and `self_reported` says it runs the entrant's code.
     """
 
     run: str
@@ -188,6 +263,8 @@ class Item:
     args: tuple[str, ...] = ()
     files: dict[str, Path] = field(default_factory=dict)
     loads: dict[str, Path] = field(default_factory=dict)
+    manifest: dict[str, Declared] | None = None
+    self_reported: bool = False
 
     @property
     def wall_limit(self) -> float:
@@ -394,6 +471,21 @@ def read_item(root: Path, entry: object, number: int) -> Item:
             f"the run {run} names {clash[0]} in both files and loads; each name "
             "is one file in its working directory"
         )
+    manifest = None
+    if "manifest" in inputs:
+        manifest = read_manifest(
+            input_file(root, inputs, "manifest", run),
+            f"the input named manifest of run {run}",
+        )
+    self_reported = inputs.get("self_reported", False)
+    if not isinstance(self_reported, bool):
+        raise PrimitiveError(
+            f"the input named self_reported of run {run} is not true or false"
+        )
+    if self_reported and manifest is None:
+        raise PrimitiveError(
+            f"the run {run} is self_reported without a manifest, so it reports nothing"
+        )
     return Item(
         run=run,
         number=number,
@@ -404,7 +496,69 @@ def read_item(root: Path, entry: object, number: int) -> Item:
         args=arguments(inputs, run),
         files=files,
         loads=loads,
+        manifest=manifest,
+        self_reported=self_reported,
     )
+
+
+def read_manifest(path: Path, what: str) -> dict[str, Declared]:
+    """Read a manifest, the reports a program declares in its `program.yaml`,
+    as the forge gives it: that file's JSON form, `{"reports": {<name>:
+    {"type": "number", "optional": false, "better": "higher", "at_least": 0,
+    "at_most": 1}}}`, `type` `number` when left out. The forge reads the YAML
+    with its own parser and checks it at the save, so exec has no second
+    parser to differ from it; it checks again what it relies on.
+    """
+    try:
+        document = json.loads(
+            path.read_bytes(),
+            parse_float=Decimal,
+            parse_int=Decimal,
+            parse_constant=refuse_constant,
+        )
+    except ValueError, RecursionError:
+        raise PrimitiveError(f"{what} is not valid JSON") from None
+    except ArithmeticError:
+        raise PrimitiveError(f"{what} holds a number too large to read") from None
+    if not isinstance(document, dict) or set(document) != {"reports"}:
+        raise PrimitiveError(f"{what} is not an object holding reports alone")
+    reports = document["reports"]
+    if not isinstance(reports, dict):
+        raise PrimitiveError(f"{what} has reports that are not an object")
+    return {name: declared(name, port, what) for name, port in reports.items()}
+
+
+def refuse_constant(constant: str) -> object:
+    """Refuse `NaN` and `Infinity`, which Python's JSON reader takes but JSON
+    has not."""
+    raise ValueError(f"{constant} is not JSON")
+
+
+def declared(name: str, port: object, what: str) -> Declared:
+    """Check one report a manifest declares, `name`, and return it."""
+    if not REPORT_NAME.fullmatch(name):
+        raise PrimitiveError(f"{what} declares {name!r}, not a report name")
+    if name in OWN_NAMES:
+        raise PrimitiveError(f"{what} declares {name}, a name exec gives already")
+    if not isinstance(port, dict) or not set(port) <= REPORT_KEYS:
+        raise PrimitiveError(f"{what} declares {name} with keys it does not know")
+    kind = port.get("type", "number")
+    optional = port.get("optional", False)
+    at_least, at_most = port.get("at_least"), port.get("at_most")
+    if kind not in ("number", "text") or not isinstance(optional, bool):
+        raise PrimitiveError(f"{what} declares {name} as neither a number nor a text")
+    if kind == "text" and set(port) & {"better", "at_least", "at_most"}:
+        raise PrimitiveError(f"{what} gives the text {name} a direction or a bound")
+    if "better" in port and port["better"] not in ("higher", "lower"):
+        raise PrimitiveError(f"{what} says {name} is better neither higher nor lower")
+    for key in ("at_least", "at_most"):
+        if key in port and not (
+            isinstance(port[key], Decimal) and math.isfinite(float(port[key]))
+        ):
+            raise PrimitiveError(f"{what} bounds {name} by something not a number")
+    if at_least is not None and at_most is not None and at_least > at_most:
+        raise PrimitiveError(f"{what} bounds {name} at least above at most")
+    return Declared(kind, optional, at_least, at_most)
 
 
 def input_file(root: Path, inputs: dict[str, object], name: str, run: str) -> Path:
@@ -591,37 +745,209 @@ def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, ob
     out = root / "out" / str(item.number)
     out.mkdir(parents=True, exist_ok=True)
     output = out / "output"
-    cwd = Path(tempfile.mkdtemp(prefix="run-"))
+    report = None
+    if item.manifest is not None:
+        report = Path(tempfile.mkdtemp(prefix="report-"))
     try:
-        place_files(root, cwd, item.files | item.loads)
-        descriptor = os.open(
-            output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644
-        )
-        stdin_path = item.stdin if item.stdin is not None else Path(os.devnull)
-        with stdin_path.open("rb") as stdin, os.fdopen(descriptor, "wb") as stdout:
-            if any("\0" in argument for argument in item.args):
-                run = Run(127, 0.0, 0.0, 0, 0, None)
-            else:
-                run = execute(program, cwd, stdin, stdout, item, abi)
+        cwd = Path(tempfile.mkdtemp(prefix="run-"))
+        try:
+            place_files(root, cwd, item.files | item.loads)
+            descriptor = os.open(
+                output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644
+            )
+            stdin_path = item.stdin if item.stdin is not None else Path(os.devnull)
+            with stdin_path.open("rb") as stdin, os.fdopen(descriptor, "wb") as stdout:
+                if any("\0" in argument for argument in item.args):
+                    run = Run(127, 0.0, 0.0, 0, 0, None)
+                else:
+                    run = execute(program, cwd, report, stdin, stdout, item, abi)
+        finally:
+            reap_strays()
+            sweep_sysv()
+            clear_attributes(root)
+            give_back_tree(cwd)
+            shutil.rmtree(cwd, ignore_errors=True)
+            give_back_along(root, output)
+        if run.output_bytes > OUTPUT_LIMIT:
+            os.truncate(output, OUTPUT_LIMIT)
+        outcome = judge(run, item, program.kind)
+        time_ms = round(run.cpu_seconds * 1000)
+        if outcome == "time_limit":
+            time_ms = max(time_ms, item.time_limit_ms)
+        outputs: dict[str, object] = {
+            "output": {"file": f"out/{item.number}/output"},
+            "time_ms": time_ms,
+            "memory_kb": run.memory_kb,
+            "outcome": outcome,
+        }
+        if report is not None:
+            outputs |= reported(item, outcome, report, out)
     finally:
-        reap_strays()
-        sweep_sysv()
-        clear_attributes(root)
-        give_back_tree(cwd)
-        shutil.rmtree(cwd, ignore_errors=True)
-        give_back_along(root, output)
-    if run.output_bytes > OUTPUT_LIMIT:
-        os.truncate(output, OUTPUT_LIMIT)
-    outcome = judge(run, item, program.kind)
-    time_ms = round(run.cpu_seconds * 1000)
-    if outcome == "time_limit":
-        time_ms = max(time_ms, item.time_limit_ms)
-    return {
-        "output": {"file": f"out/{item.number}/output"},
-        "time_ms": time_ms,
-        "memory_kb": run.memory_kb,
-        "outcome": outcome,
-    }
+        if report is not None:
+            give_back_tree(report)
+            shutil.rmtree(report, ignore_errors=True)
+    return outputs
+
+
+def reported(item: Item, outcome: str, folder: Path, out: Path) -> dict[str, object]:
+    """The outputs a run given a manifest adds from its report `folder`, and
+    the outcome its verdict gives, the run's processes all gone.
+
+    Each report is an output on a verdict of `0` alone, as an output that
+    counts is written only on `accepted`; the texts in `TEXTS` are outputs on
+    either verdict, and every other file is copied under `out/extras/`, shown
+    with the run and never a column, as are the reports under `1`.
+
+    A run that did not end `accepted` did not judge, nor did one whose
+    report does not hold: an error of the step, retried and then left for
+    staff, unless the run is `self_reported`, when what the entrant's code
+    did is the run's own outcome, its limit or a `runtime_error`, with no
+    report.
+    """
+    if outcome != "accepted":
+        if item.self_reported:
+            return {}
+        raise PrimitiveError(
+            f"the program given a manifest for run {item.run} did not judge: it "
+            f"ended in {outcome.replace('_', ' ')}"
+        )
+    try:
+        report = read_report(folder, item.manifest or {})
+    except ReportError as fault:
+        if item.self_reported:
+            return {"outcome": "runtime_error"}
+        raise PrimitiveError(f"the report of run {item.run} {fault}") from None
+    outputs = dict(report.outputs)
+    if report.shown:
+        extras = out / "extras"
+        extras.mkdir(exist_ok=True)
+        for name, content in report.shown.items():
+            (extras / name).write_bytes(content)
+        outputs["extras"] = {"folder": f"out/{item.number}/extras"}
+    outputs["outcome"] = verdict_outcome(report.accepted)
+    return outputs
+
+
+def verdict_outcome(accepted: bool) -> str:
+    """The outcome a report's verdict gives: `0`, judged and counted, is
+    `accepted`, and `1` is `wrong_answer`."""
+    return "accepted" if accepted else "wrong_answer"
+
+
+def read_report(folder: Path, manifest: dict[str, Declared]) -> Report:
+    """Read what a run wrote to its report folder, against what its manifest
+    declares, raising `ReportError` when it does not hold: no `verdict`, or
+    one that is not `0` or `1`; under `0`, a declared report that is not
+    optional missing, or a number that is not a finite decimal or lies
+    outside its bounds; on either verdict, a file that is not UTF-8 text
+    without a NUL, as every file is shown as text, a file over
+    `REPORT_TEXT_LIMIT`, more than `REPORT_FILES` of them, or anything there
+    that is not a plain file under a plain name.
+    """
+    give_back_tree(folder)
+    files = report_files(folder)
+    if "verdict" not in files:
+        raise ReportError("has no verdict")
+    verdict = files.pop("verdict").strip()
+    if verdict not in (b"0", b"1"):
+        raise ReportError(f"has a verdict {shown_bytes(verdict)}, not 0 or 1")
+    accepted = verdict == b"0"
+    outputs: dict[str, object] = {}
+    for name in TEXTS:
+        if name in files:
+            outputs[name] = report_text(name, files.pop(name))
+    if accepted:
+        for name, port in manifest.items():
+            if name not in files:
+                if not port.optional:
+                    raise ReportError(f"has no {name}, which the manifest declares")
+                continue
+            content = files.pop(name)
+            if port.kind == "text":
+                outputs[name] = report_text(name, content)
+            else:
+                outputs[name] = report_number(name, content, port)
+    for name, content in files.items():
+        report_text(name, content)
+    return Report(accepted, outputs, files)
+
+
+def report_files(folder: Path) -> dict[str, bytes]:
+    """Every file in a report folder by name, each read whole, none through a
+    link: a run that left a link there to a file it may not read, the next
+    run's input, would have exec read that file for it. The folder is listed
+    only as far as one file past `REPORT_FILES`, so a run that left a
+    million costs exec no more.
+    """
+    entries: list[str] = []
+    try:
+        with os.scandir(folder) as listing:
+            for entry in listing:
+                entries.append(entry.name)
+                if len(entries) > REPORT_FILES:
+                    raise ReportError(f"holds more than {REPORT_FILES} files")
+    except OSError as error:
+        raise ReportError(f"could not be listed: {error.strerror}") from None
+    files: dict[str, bytes] = {}
+    for name in sorted(entries):
+        if len(name) > 255 or not FILE_NAME.fullmatch(name):
+            shown = shown_bytes(os.fsencode(name))
+            raise ReportError(f"holds {shown}, not a plain name")
+        try:
+            descriptor = os.open(
+                folder / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            )
+        except OSError:
+            raise ReportError(f"holds {name}, not a plain file") from None
+        if not S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise ReportError(f"holds {name}, not a plain file")
+        with os.fdopen(descriptor, "rb") as stream:
+            content = stream.read(REPORT_TEXT_LIMIT + 1)
+        if len(content) > REPORT_TEXT_LIMIT:
+            raise ReportError(f"holds {name}, over {REPORT_TEXT_LIMIT // 1024} KB")
+        files[name] = content
+    return files
+
+
+def report_text(name: str, content: bytes) -> str:
+    """One reported text: UTF-8 with no NUL, which no text the forge keeps may
+    hold, its trailing newlines left off, as `echo` and `print` add one."""
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ReportError(f"has {name} not in UTF-8") from None
+    if "\0" in text:
+        raise ReportError(f"has {name} holding a NUL character")
+    return text.rstrip("\n")
+
+
+def report_number(name: str, content: bytes, port: Declared) -> int | float:
+    """One reported number: a decimal as JSON writes one, with spaces and
+    newlines around it, finite as a double and within the declared bounds,
+    compared as the decimal written. A whole number is given as one.
+    """
+    text = content.strip()
+    if not DECIMAL.fullmatch(text.decode("ascii", "replace")):
+        raise ReportError(f"has {name} {shown_bytes(text)}, not a decimal number")
+    try:
+        value = Decimal(text.decode("ascii"))
+        finite = math.isfinite(float(value))
+    except ArithmeticError:
+        finite = False
+    if not finite:
+        raise ReportError(f"has {name} {shown_bytes(text)}, not a finite number")
+    if port.at_least is not None and value < port.at_least:
+        raise ReportError(f"has {name} {value}, below its least, {port.at_least}")
+    if port.at_most is not None and value > port.at_most:
+        raise ReportError(f"has {name} {value}, above its most, {port.at_most}")
+    return int(value) if WHOLE.fullmatch(text.decode("ascii")) else float(value)
+
+
+def shown_bytes(content: bytes) -> str:
+    """What a run wrote, for an error staff read: quoted, and cut short."""
+    text = content[:24].decode("utf-8", "replace")
+    return repr(text + "...") if len(content) > 24 else repr(text)
 
 
 def place_files(root: Path, cwd: Path, files: dict[str, Path]) -> None:
@@ -645,6 +971,7 @@ def place_files(root: Path, cwd: Path, files: dict[str, Path]) -> None:
 def execute(
     program: Program,
     cwd: Path,
+    report_folder: Path | None,
     stdin: BinaryIO,
     stdout: BinaryIO,
     item: Item,
@@ -672,10 +999,17 @@ def execute(
     A command line too long for the kernel, which only the item's arguments
     can make, is a run that could not start, judged as a native program the
     kernel will not run is.
+
+    A run given a `report_folder` may write there too, and finds it named in
+    `UNICON_REPORT`.
     """
     env = {"PATH": RUN_PATH, "HOME": str(cwd), "TMPDIR": str(cwd), "LANG": "C.UTF-8"}
+    writable = [cwd]
+    if report_folder is not None:
+        env["UNICON_REPORT"] = str(report_folder)
+        writable.append(report_folder)
     try:
-        ruleset = landlock_ruleset(cwd, program.readable(), abi)
+        ruleset = landlock_ruleset(writable, program.readable(), abi)
     except OSError as error:
         raise PrimitiveError(
             f"the run could not be confined with Landlock: {error.strerror}"
@@ -1280,11 +1614,13 @@ def landlock_abi() -> int:
         return 0
 
 
-def landlock_ruleset(directory: Path, readable: list[Path], abi: int) -> int:
-    """A Landlock ruleset for one run in `directory` that reads `readable`.
+def landlock_ruleset(writable: list[Path], readable: list[Path], abi: int) -> int:
+    """A Landlock ruleset for one run that writes `writable` and reads
+    `readable`.
 
-    Writing, creating, removing and renaming are allowed under `directory`,
-    and writing to /dev/null. Reading is allowed under `directory`, of each
+    Writing, creating, removing and renaming are allowed under each of
+    `writable`, the working directory and a report folder if the run has
+    one, and writing to /dev/null. Reading is allowed under them, of each
     file in `readable` and beneath each directory in it (the program, and the
     interpreter it needs), beneath the system directories in
     READABLE_DIRECTORIES, and of /dev/null and the devices in
@@ -1303,10 +1639,8 @@ def landlock_ruleset(directory: Path, readable: list[Path], abi: int) -> int:
     attr = ctypes.create_string_buffer(
         struct.pack("=QQQ", handled, 0, scoped)[:size], size
     )
-    rules: list[tuple[str, int]] = [
-        (str(directory), handled),
-        ("/dev/null", FS_READ_FILE | FS_WRITE_FILE | FS_TRUNCATE),
-    ]
+    rules: list[tuple[str, int]] = [(str(path), handled) for path in writable]
+    rules += [("/dev/null", FS_READ_FILE | FS_WRITE_FILE | FS_TRUNCATE)]
     rules += [
         (str(path), FS_READS if path.is_dir() else FS_READ_FILE) for path in readable
     ]

@@ -34,13 +34,18 @@ these inputs and outputs.
 | Input | `stdin` | file, optional, `runs: false` | What the program reads on standard input; with none, standard input is empty |
 | Input | `files` | named files, optional, `runs: false` | Files placed read-only in the program's working directory under their names, such as `input` or `answer` |
 | Input | `loads` | named files, optional, `runs: true` | Code the program loads, placed as `files` are, such as the entrant's module a test harness imports |
+| Input | `manifest` | file, optional, `runs: false` | The reports the program declares, its `program.yaml` as JSON, when it is one that reports, such as a checker (see "A program that reports") |
+| Input | `self_reported` | boolean, optional | True when the program given a manifest runs the entrant's code, so what it does is the run's own outcome, never a fault |
 | Input | `args` | text, optional | Appended to the program's command line, split on spaces |
 | Input | `time_limit` | number | Seconds of CPU time the run may use |
 | Input | `memory_limit` | number | Megabytes of memory the run may use |
 | Output | `output` | file | `out/<n>/output`, `n` the item's place in the batch from 1, what the program printed on standard output |
 | Output | `time_ms` | number, `better: lower`, `at_least: 0` | CPU time used, user plus system, in milliseconds; on `time_limit` at least the limit |
 | Output | `memory_kb` | number, `better: lower`, `at_least: 0` | Peak resident memory of the run, all its processes together (below), in kilobytes |
-| Output | `outcome` | outcome | `accepted`, `time_limit`, `memory_limit`, `output_limit` or `runtime_error` (see "Limits and outcomes"); `primitive.yaml` says when each is given under `outcomes`, for the workflow editor |
+| Output | `label`, `message`, `staff_message` | text, optional | From a program given a manifest: a finer name for the outcome, a message shown with the run, and one for staff alone |
+| Output | `extras` | folder, optional | Every other file a program given a manifest reported, shown with the run and never a column |
+| Output | each report the manifest declares | number or text | From a program given a manifest, on `accepted` only (`outputs_from: manifest`) |
+| Output | `outcome` | outcome | `accepted`, `wrong_answer` (from a manifest's verdict alone), `time_limit`, `memory_limit`, `output_limit` or `runtime_error` (see "Limits and outcomes"); `primitive.yaml` says when each is given under `outcomes`, for the workflow editor |
 
 The output goes under the item's place in the batch, not its run id.
 
@@ -63,6 +68,68 @@ come after the program on the command line: `program <args>`, `python3 -I -B
 program <args>`, `java ... -jar program <args>`. An argument no command line
 can carry, one holding a NUL character or longer than the kernel takes, is
 the run failing to start, a `runtime_error`.
+
+## A program that reports
+
+A run given a `manifest` is an organiser's program, such as a checker or
+the diff script, that judges a run and reports values, as `SIMPLER-CORE.md`
+13.1 says. It gets an empty folder of its own under `/tmp`, outside its
+working directory, named in `UNICON_REPORT`, which it may write and no
+other run may, and writes there one plain text file per value:
+
+```bash
+echo 0                       > $UNICON_REPORT/verdict
+echo 1                       > $UNICON_REPORT/score
+echo "extra space on line 3" > $UNICON_REPORT/message
+```
+
+| File | Required | Becomes |
+|---|---|---|
+| `verdict` | yes | `0`: the outcome is `accepted` and the reports count; `1`: `wrong_answer` |
+| `label`, `message`, `staff_message` | no | the text outputs of those names, on either verdict |
+| a report the manifest declares | on `0`, unless `optional` | an output of its name on `0`; on `1` a file in `extras`, shown and not counted |
+| any other name | no | a file in `extras` |
+
+**The manifest** is the program's `program.yaml` in its JSON form, which
+the forge writes from the YAML it read and checked at the save, so exec has
+no YAML parser of its own to differ from the forge's:
+
+```json
+{"reports": {"score": {"type": "number", "better": "higher", "at_least": 0, "at_most": 1},
+             "feedback": {"type": "text", "optional": true}}}
+```
+
+`type` is `number` when left out; a number may have `better`, `at_least`
+and `at_most`, a text none of them; either may be `optional`. A report is
+named as an output is, at most 64 characters, and never `verdict`, `label`,
+`message`, `staff_message`, `extras` or one of exec's own outputs. exec
+reads which way is better from the manifest only to have the forge carry
+it; it checks the bounds.
+
+**The checks,** on every run. A value is read whole, at most 64 KB; a
+number is a decimal as JSON writes one, `1e-05` among them, with spaces and
+newlines around it, finite as a double and inside its bounds, compared as
+the decimal written; a text is UTF-8 without a NUL, its trailing newlines
+left off. The report does not hold when `verdict` is missing or is not
+`0` or `1`; under `0`, a declared report that is not optional is missing,
+or a number is not a finite decimal (`nan`, `1e999`) or is outside its
+bounds; or, on either verdict, any file in the folder is not UTF-8 text
+without a NUL, since every file is shown as text, is over 64 KB, or is not
+a plain file under a plain name, links included, or there are more than
+64 files. A hard link into the folder from outside the run's own folders
+is refused by Landlock.
+
+**Faults.** A report that does not hold, or a program given a manifest that
+crashes, exits non-zero or breaks a limit, has not judged: the step is an
+`error`, which the forge retries once and then leaves for staff. A
+`self_reported` run is the exception: it runs the entrant's code, as a test
+harness that imports the entrant's module does, so a report that does not
+hold is its `runtime_error`, and a crash or a limit its own outcome, with no
+report, as for any run.
+
+The folder is fresh for each run and removed after it, so nothing one run
+reports is there for the next. A program given no manifest gets no folder
+and no `UNICON_REPORT`.
 
 ## What it promises
 
@@ -98,7 +165,10 @@ The task's save does not check these; the scoring rules rely on them.
 primitive could not work at all: `inputs.json` is missing, is not JSON or is
 for another contract version; a file is missing or lies outside `in/`; a
 limit is not a positive number, or `args` is not text; a named file's name
-is not a plain name, or one name is in both `files` and `loads`; an item's run is not
+is not a plain name, or one name is in both `files` and `loads`; a manifest
+is not one, or `self_reported` is set without one or is not true or false;
+a program given a manifest did not judge, unless it is `self_reported`
+(see "A program that reports"); an item's run is not
 a run id, or two items are for the same run; the program is in none of the
 three formats; the interpreter a Python or Java program needs could not be
 started; the machine's kernel does not offer Landlock ABI 3, or a run could
@@ -116,7 +186,8 @@ For each item, in order:
    this item alone, before its clock starts.
 2. A fresh, empty directory is made under `/tmp` and becomes the run's
    working directory, `HOME` and `TMPDIR`. The environment holds only those,
-   `PATH` and `LANG=C.UTF-8`.
+   `PATH` and `LANG=C.UTF-8`, and for a program given a manifest
+   `UNICON_REPORT`, a second fresh folder under `/tmp`.
 3. Each of `files` and `loads` is copied into that directory, read-only.
    The `stdin` file, or `/dev/null` without one, is opened as standard input, `out/<n>/output` as standard
    output, and standard error goes nowhere.
@@ -127,7 +198,8 @@ For each item, in order:
    shared memory segment, message queue and semaphore set it left is
    removed, every `user` extended attribute under `/work` is removed, and
    the directory and the copy are removed. The run could make no POSIX
-   message queue.
+   message queue. A program given a manifest has its report read, and the
+   folder removed.
 
 Everything a run prints is kept, up to the output limit, even when it failed.
 
@@ -207,8 +279,9 @@ processes or System V objects a run leaves is there for the next one:
   copy and the folder that copy is in. exec gives each back before
   it copies the next program, so no run can end the whole batch in an error.
 - **Files.** Every run is put under [Landlock](https://docs.kernel.org/userspace-api/landlock.html).
-  It may create, change or remove files only inside its own directory, plus
-  write to `/dev/null`. It may read only its own directory, its program, the
+  It may create, change or remove files only inside its own directory, and
+  its report folder when it has a manifest, plus write to `/dev/null`. It
+  may read only those, its program, the
   system's directories (`/usr`, `/bin`, `/sbin`, the `/lib` directories,
   `/etc`, `/proc`, `/sys`), `/dev/null`, `/dev/zero` and the random devices,
   and for a Python program the interpreter's installation; its input arrives

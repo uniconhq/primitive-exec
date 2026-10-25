@@ -9,14 +9,18 @@ binary format.
 
 import errno
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from support import (
     PROGRAM,
+    SCORE,
+    SIBLING_DIFF,
     Check,
     Compiled,
     RunImage,
@@ -685,3 +689,211 @@ def test_python_args_in_the_sandbox(tmp_path: Path, run_image: RunImage) -> None
     expected = ["--threshold", "0.5", "--heuristic", "true"]
     assert printed(work, outputs["main-1"]) == f"{expected!r}\n"
     assert printed(work, outputs["main-2"]) == "[]\n"
+
+
+C_CHECKER = """
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static void put(const char *name, const char *value) {
+    char path[4096];
+    snprintf(path, sizeof path, "%s/%s", getenv("UNICON_REPORT"), name);
+    FILE *f = fopen(path, "w");
+    if (!f || fputs(value, f) < 0 || fclose(f) != 0) exit(2);
+}
+static long slurp(const char *name, char *buffer, long size) {
+    FILE *f = fopen(name, "rb");
+    if (!f) exit(3);
+    long got = (long) fread(buffer, 1, size, f);
+    fclose(f);
+    return got;
+}
+int main(void) {
+    static char a[4096], b[4096];
+    long x = slurp("output", a, sizeof a), y = slurp("answer", b, sizeof b);
+    int same = x == y && memcmp(a, b, x) == 0;
+    put("verdict", same ? "0" : "1");
+    put("score", same ? "1" : "0");
+    put("label", same ? "same" : "differs");
+    put("message", "c judged");
+    put("staff_message", "compared bytes");
+    return 0;
+}
+"""
+
+CPP_CHECKER = """
+#include <bits/stdc++.h>
+static std::string slurp(const char *name) {
+    std::ifstream in(name, std::ios::binary);
+    if (!in) std::exit(3);
+    return std::string(std::istreambuf_iterator<char>(in), {});
+}
+static void put(const std::string &name, const std::string &value) {
+    std::ofstream out(std::string(std::getenv("UNICON_REPORT")) + "/" + name);
+    out << value;
+    if (!out) std::exit(2);
+}
+int main() {
+    bool same = slurp("output") == slurp("answer");
+    put("verdict", same ? "0" : "1");
+    put("score", same ? "1" : "0");
+    put("label", same ? "same" : "differs");
+    put("message", "cpp judged");
+    put("staff_message", "compared bytes");
+}
+"""
+
+JAVA_CHECKER = """
+import java.nio.file.*;
+import java.util.Arrays;
+public class Main {
+    static void put(String name, String value) throws Exception {
+        Files.writeString(Path.of(System.getenv("UNICON_REPORT"), name), value);
+    }
+    public static void main(String[] args) throws Exception {
+        byte[] output = Files.readAllBytes(Path.of("output"));
+        boolean same = Arrays.equals(output, Files.readAllBytes(Path.of("answer")));
+        put("verdict", same ? "0" : "1");
+        put("score", same ? "1" : "0");
+        put("label", same ? "same" : "differs");
+        put("message", "java judged");
+        put("staff_message", "compared bytes");
+    }
+}
+"""
+
+PYTHON_CHECKER = """
+import os
+
+def put(name, value):
+    with open(os.path.join(os.environ["UNICON_REPORT"], name), "w") as stream:
+        print(value, file=stream)
+
+same = open("output", "rb").read() == open("answer", "rb").read()
+put("verdict", 0 if same else 1)
+put("score", 1 if same else 0)
+put("label", "same" if same else "differs")
+put("message", "python judged")
+put("staff_message", "compared bytes")
+"""
+
+
+@pytest.mark.parametrize(
+    ("language", "name", "source"),
+    [
+        ("c", "main.c", C_CHECKER),
+        ("cpp", "main.cpp", CPP_CHECKER),
+        ("java", "Main.java", JAVA_CHECKER),
+        ("python", "main.py", PYTHON_CHECKER),
+    ],
+)
+def test_a_checker_in_each_language_writes_a_full_report(
+    tmp_path: Path,
+    run_image: RunImage,
+    compiled: Compiled,
+    check: Check,
+    language: str,
+    name: str,
+    source: str,
+) -> None:
+    """A checker built by compile, given a manifest, reports through its
+    folder from any language that writes a file: its reports are outputs on
+    `0`, and on `1` they are shown in its extras."""
+    binary = compiled(language, name, source)
+    work = tmp_path / "work"
+    files = {
+        "main-same": {"output": b"42\n", "answer": b"42\n"},
+        "main-differs": {"output": b"41\n", "answer": b"42\n"},
+    }
+    items = [("main-same", ""), ("main-differs", "")]
+    batch_inputs(work, binary, items, 2.0, 256, files=files, manifest=SCORE)
+    check(json.loads((work / "inputs.json").read_text()), "inputs_file")
+    result = run_image(work, container_limits(2.0, 256, len(items)))
+    check(result, "outputs_file", frozenset({"score"}))
+    outputs = by_run(result)
+    same, differs = outputs["main-same"], outputs["main-differs"]
+    assert same["outcome"] == "accepted"
+    assert same["score"] == 1
+    assert (same["label"], same["message"]) == ("same", f"{language} judged")
+    assert same["staff_message"] == "compared bytes"
+    assert "extras" not in same
+    assert differs["outcome"] == "wrong_answer"
+    assert "score" not in differs
+    assert differs["label"] == "differs"
+    extras = work / differs["extras"]["folder"]
+    assert (extras / "score").read_text().strip() == "0"
+
+
+DIFF_CASES = [
+    (b"1 2 3\n", b"1 2 3\n", True),
+    (b"1 2 3", b"1 2 3\n", True),
+    (b"1 2 3   \t\n", b"1 2 3\n", True),
+    (b"1 2 3\r\n4\r\n", b"1 2 3\n4\n", True),
+    (b"yes\n\n\n", b"yes\n", True),
+    (b"yes\n", b"yes\n\n  \n", True),
+    (b"", b"\n\n", True),
+    (b"", b"", True),
+    (b"1 2 3\n", b"1 2 4\n", False),
+    (b" 1 2 3\n", b"1 2 3\n", False),
+    (b"1  2 3\n", b"1 2 3\n", False),
+    (b"a\n\nb\n", b"a\nb\n", False),
+    (b"a\n", b"a\nb\n", False),
+    (b"", b"0\n", False),
+    (b"\n\nyes\n", b"yes\n", False),
+]
+"""diff-check@v2's cases, each an output, an answer and whether they match."""
+
+
+def diff_script() -> tuple[str, dict[str, Any]]:
+    """The diff script of unicon/classic@v3 and its manifest in JSON, from
+    `DIFF_SCRIPT` or a deploy checkout beside this one."""
+    folder = Path(os.environ.get("DIFF_SCRIPT", SIBLING_DIFF))
+    if not (folder / "diff.py").is_file():
+        pytest.skip("no diff script; set DIFF_SCRIPT to its folder")
+    manifest: dict[str, Any] = yaml.safe_load((folder / "program.yaml").read_text())
+    return (folder / "diff.py").read_text(), manifest
+
+
+def test_the_diff_script_judges_as_diff_check_did(
+    tmp_path: Path, run_image: RunImage, compiled: Compiled, check: Check
+) -> None:
+    """Run through exec in manifest mode, the script gives each of
+    diff-check's cases the outcome diff-check gave, with a score of 1 on a
+    match."""
+    source, manifest = diff_script()
+    binary = compiled("python", "diff.py", source)
+    work = tmp_path / "work"
+    items = [(f"case-{n}", "") for n in range(len(DIFF_CASES))]
+    files = {
+        run: {"output": output, "answer": answer}
+        for (run, _), (output, answer, _) in zip(items, DIFF_CASES, strict=True)
+    }
+    batch_inputs(work, binary, items, 2.0, 64, files=files, manifest=manifest)
+    result = run_image(work, container_limits(2.0, 64, len(items)))
+    check(result, "outputs_file", frozenset({"score"}))
+    outputs = by_run(result)
+    for (run, _), (_, _, matches) in zip(items, DIFF_CASES, strict=True):
+        if matches:
+            assert (outputs[run]["outcome"], outputs[run]["score"]) == ("accepted", 1)
+        else:
+            assert outputs[run]["outcome"] == "wrong_answer"
+            assert "score" not in outputs[run]
+
+
+def test_the_diff_script_compares_the_largest_output_in_little_memory(
+    tmp_path: Path, run_image: RunImage, compiled: Compiled
+) -> None:
+    """A 16 MB output against a 24 MB answer, both in the run's tmpfs, is
+    read in blocks: the script holds a few megabytes, as diff-check did."""
+    source, manifest = diff_script()
+    binary = compiled("python", "diff.py", source)
+    work = tmp_path / "work"
+    large = b"1\n" * (8 * 1024 * 1024)
+    files = {"case-1": {"output": large, "answer": large.replace(b"\n", b" \n")}}
+    batch_inputs(
+        work, binary, [("case-1", "")], 4.0, 64, files=files, manifest=manifest
+    )
+    limits = container_limits(4.0, 64, 1) | {"memory_mb": 512}
+    outputs = by_run(run_image(work, limits))["case-1"]
+    assert (outputs["outcome"], outputs["score"]) == ("accepted", 1)
+    assert outputs["memory_kb"] < 32 * 1024

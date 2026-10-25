@@ -17,10 +17,14 @@ NAME = "primitive-exec"
 SCHEMA_VERSION = 6
 SIBLING_SCHEMA = ROOT.parent / "runner" / "schemas" / "primitive.schema.json"
 SIBLING_COMPILE = ROOT.parent / "primitive-compile"
+SIBLING_DIFF = ROOT.parent / "deploy" / "workflows-next" / "classic" / "v3" / "diff"
 
 RunImage = Callable[..., dict[str, Any]]
-Check = Callable[[dict[str, Any], str], None]
+Check = Callable[..., None]
 Compiled = Callable[[str, str, str], bytes]
+
+SCORE = {"reports": {"score": {"better": "higher", "at_least": 0, "at_most": 1}}}
+"""A manifest as the diff script's: a score between 0 and 1, higher better."""
 
 
 def declaration() -> dict[str, Any]:
@@ -138,10 +142,13 @@ def batch_inputs(
     args: dict[str, str] | None = None,
     files: dict[str, dict[str, bytes]] | None = None,
     loads: dict[str, dict[str, bytes]] | None = None,
+    manifest: dict[str, Any] | None = None,
+    self_reported: bool = False,
 ) -> None:
     """Write inputs.json, the program and one input per item under `in/`, as the
     harness does: the program is `in/1/program` and the nth item's standard
-    input `in/<n + 1>/input`.
+    input `in/<n + 1>/input`. A `manifest`, given every item, is
+    `in/manifest.json`, and `self_reported` is set on every item.
 
     `items` are (run, standard input) pairs, all run under the same limits;
     `args` gives the `args` input of the runs it names, and the others have
@@ -150,6 +157,8 @@ def batch_inputs(
     """
     (work / "in" / "1").mkdir(parents=True)
     (work / "in" / "1" / "program").write_bytes(binary)
+    if manifest is not None:
+        (work / "in" / "manifest.json").write_text(json.dumps(manifest))
     batch = []
     for number, (run, stdin) in enumerate(items, 2):
         (work / "in" / str(number)).mkdir()
@@ -162,6 +171,10 @@ def batch_inputs(
         }
         if args and run in args:
             inputs["args"] = args[run]
+        if manifest is not None:
+            inputs["manifest"] = {"file": "in/manifest.json"}
+        if self_reported:
+            inputs["self_reported"] = True
         for port, given in (("files", files), ("loads", loads)):
             if given and run in given:
                 folder = work / "in" / str(number) / port
@@ -503,6 +516,44 @@ elif case == "fork-bomb":
             children += 1
     except OSError as error:
         print("stopped", error.errno, children < 128)
+elif case == "report":
+    folder = os.environ["UNICON_REPORT"]
+    for line in sys.stdin.read().splitlines():
+        name, _, value = line.partition(" ")
+        with open(os.path.join(folder, name), "w") as stream:
+            stream.write(value + "\\n")
+    print("reported")
+elif case == "report-then-fail":
+    with open(os.path.join(os.environ["UNICON_REPORT"], "verdict"), "w") as stream:
+        stream.write("0\\n")
+    sys.exit(1)
+elif case == "report-link":
+    target = sys.stdin.readline().strip()
+    folder = os.environ["UNICON_REPORT"]
+    open(os.path.join(folder, "verdict"), "w").write("0")
+    os.symlink(target, os.path.join(folder, "message"))
+    print("linked")
+elif case == "report-bad-name":
+    folder = os.environ["UNICON_REPORT"].encode()
+    open(folder + b"/verdict", "w").write("0")
+    open(folder + b"/\\xff", "w").write("x")
+elif case == "report-hardlink":
+    target = sys.stdin.readline().strip()
+    folder = os.environ["UNICON_REPORT"]
+    open(os.path.join(folder, "verdict"), "w").write("0")
+    open(os.path.join(folder, "score"), "w").write("1")
+    try:
+        os.link(target, os.path.join(folder, "message"))
+        print("linked")
+    except OSError as error:
+        print("refused", error.errno)
+elif case == "report-where":
+    folder = os.environ.get("UNICON_REPORT")
+    print("report", folder is not None and not folder.startswith(os.getcwd()))
+    print("empty", os.listdir(folder) == [] if folder else None)
+    open(os.path.join(folder, "verdict"), "w").write("0")
+elif case == "no-report":
+    print("report", os.environ.get("UNICON_REPORT"))
 elif case == "read-mark":
     try:
         print("attribute", os.getxattr(sys.argv[0], "user.leak").decode())
