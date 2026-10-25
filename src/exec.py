@@ -146,6 +146,8 @@ UID_MAP = Path("/proc/self/uid_map")
 ROOT_DOCKER = ["0", "0", "4294967295"]
 """The first line of `/proc/self/uid_map` where the container's root is the
 machine's own, as under root Docker: every user ID maps to itself."""
+DEV_ROOT_DOCKER_VARIABLE = "UNICON_DEV_ROOT_DOCKER"
+"""Set to `1` by a development stack alone, so exec runs under root Docker."""
 BOX = 0
 GIVEN = ("program", "stdin", "manifest")
 """The file inputs of a run beside its named files."""
@@ -1432,12 +1434,21 @@ def check_shape() -> None:
     a privileged step would be the machine's root. exec is meant for a
     container whose root is a user namespace's, as under rootless Docker;
     this check catches root Docker, not every map whose root is the
-    machine's. Without a map to read, it does not start either."""
+    machine's. Without a map to read, it does not start either. A
+    development stack, whose laptop has root Docker alone, lets it through
+    with `UNICON_DEV_ROOT_DOCKER=1`, saying so on standard error."""
     try:
         first = UID_MAP.read_text().splitlines()[0].split()
     except OSError, IndexError:
         first = None
-    if first is None or first == ROOT_DOCKER:
+    if first == ROOT_DOCKER and os.environ.get(DEV_ROOT_DOCKER_VARIABLE) == "1":
+        print(
+            f"exec: WARNING: {DEV_ROOT_DOCKER_VARIABLE} is set, so this step runs "
+            "under root Docker, where a box that breaks out is the machine's root. "
+            "Only a development stack may set it.",
+            file=sys.stderr,
+        )
+    elif first is None or first == ROOT_DOCKER:
         raise PrimitiveError(
             "this container has root Docker's identity user ID map, where its "
             "root is the machine's own root; exec runs only where it is a user "

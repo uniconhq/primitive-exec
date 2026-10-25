@@ -357,6 +357,31 @@ def test_root_dockers_identity_map_is_refused(
         primitive.check_shape()
 
 
+def test_root_docker_passes_with_the_development_switch_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A development stack lets root Docker through, and exec says so; any
+    other value of the switch, or no map to read, is still refused."""
+    uid_map = tmp_path / "uid_map"
+    uid_map.write_text("0 0 4294967295\n")
+    monkeypatch.setattr(primitive, "UID_MAP", uid_map)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setenv(primitive.DEV_ROOT_DOCKER_VARIABLE, "1")
+    primitive.check_shape()
+    assert "WARNING" in capsys.readouterr().err
+    monkeypatch.setattr(os, "geteuid", lambda: 65532)
+    with pytest.raises(primitive.PrimitiveError, match="runs as root"):
+        primitive.check_shape()
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setenv(primitive.DEV_ROOT_DOCKER_VARIABLE, "yes")
+    with pytest.raises(primitive.PrimitiveError, match="machine's own root"):
+        primitive.check_shape()
+    monkeypatch.setenv(primitive.DEV_ROOT_DOCKER_VARIABLE, "1")
+    uid_map.write_text("")
+    with pytest.raises(primitive.PrimitiveError, match="machine's own root"):
+        primitive.check_shape()
+
+
 def test_a_rootless_map_passes_as_root_alone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

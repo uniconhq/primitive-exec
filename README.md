@@ -475,7 +475,10 @@ Docker: the shape picked for every step that runs code, provisionally
 1. refuses root Docker's identity map, where a privileged container is the
    machine's own root: the first line of `/proc/self/uid_map` exactly `0 0
    4294967295`. It catches root Docker, not every map whose root is the
-   machine's. It also refuses where it cannot read the map, or is not root;
+   machine's. It also refuses where it cannot read the map, or is not root.
+   A development stack, whose laptop has root Docker alone, sets
+   `UNICON_DEV_ROOT_DOCKER=1` on every step, and exec then runs under root
+   Docker, saying so on standard error. A grading machine never sets it;
 2. raises its own soft limits on the stack, to 256 MB, and on open files,
    to 101,024, which isolate and so its boxes inherit. After a run isolate
    gives the box's tree back to root folder by folder, holding one open and
