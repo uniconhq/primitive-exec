@@ -347,7 +347,7 @@ def test_a_run_that_buries_files_past_path_max_leaves_the_next_its_room(
 def test_a_run_that_makes_too_many_folders_is_over_its_memory(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """A box's tmpfs holds 100,000 files and folders, so a run that makes
+    """A box's tmpfs holds 60,000 files and folders, so a run that makes
     more fails with `ENOSPC`, and exec, finding none free after it, gives
     `memory_limit`, though the run is far under its memory limit; one that
     makes fewer does not."""
@@ -974,7 +974,7 @@ isolate, giving a deep tree back, ran out of both before exec raised them."""
 def test_a_tree_as_deep_as_the_box_holds_ends_only_its_own_run(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """A run nesting folders until its box has no inode left, about 99,990
+    """A run nesting folders until its box has no inode left, about 59,990
     deep, under a soft limit of 1,024 open files and an 8 MB stack: isolate,
     which gives the tree back with a folder open at each level, gets the
     limits exec raised, so the run ends `memory_limit` and the batch goes
