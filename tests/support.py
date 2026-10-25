@@ -30,6 +30,9 @@ STEP_MEMORY_MB = "1024"
 """The memory the in-process tests give exec's step, as the planner would
 give a run of 512 MB, the most a test gives one, with its copies and the
 256 MB room."""
+ISOLATE_LIMITS = ["--ulimit=nofile=1024:1048576", "--ulimit=stack=8388608:-1"]
+"""Hard limits that let exec raise its soft limits for isolate's cleanup;
+the Docker daemon's defaults can be lower than the deepest box needs."""
 
 RunImage = Callable[..., dict[str, Any]]
 Check = Callable[..., None]
@@ -149,6 +152,7 @@ def step_flags(limits: dict[str, int]) -> list[str]:
     cpu_seconds = math.ceil(limits["cpu_ms"] / 1000)
     return [
         "--privileged",
+        *ISOLATE_LIMITS,
         f"--memory={memory}",
         f"--memory-swap={memory}",
         f"--pids-limit={limits['pids']}",

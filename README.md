@@ -650,7 +650,8 @@ docker build -t primitive-base:test -f ../runner/images/primitive-base/Dockerfil
 docker build -t primitive-exec:test --build-arg BASE_IMAGE=primitive-base:test .
 docker build -t primitive-exec:test-container --build-arg IMAGE=primitive-exec:test \
   -f tests/Dockerfile .
-docker run --rm --privileged --env=UNICON_BOX_USERS=60000-60009 \
+docker run --rm --privileged --ulimit=nofile=1024:1048576 \
+  --ulimit=stack=8388608:-1 --env=UNICON_BOX_USERS=60000-60009 \
   --env=UNICON_STEP_MEMORY_MB=1024 -v "$PWD:/src:ro" \
   primitive-exec:test-container python3 tests/userns.py pytest -p no:cacheprovider tests/test_exec.py
 ```

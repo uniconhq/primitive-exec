@@ -21,6 +21,7 @@ import yaml
 
 from support import (
     BOX_USERS,
+    ISOLATE_LIMITS,
     NAME,
     PROGRAM,
     ROOT,
@@ -1011,7 +1012,7 @@ def test_the_in_process_tests_pass_in_the_test_container(
     build = ["docker", "build", "--quiet", "--tag", tag, "--build-arg"]
     build += [f"IMAGE={image}", "--file", str(ROOT / "tests" / "Dockerfile")]
     subprocess.run([*build, str(ROOT)], check=True, capture_output=True)
-    command = ["docker", "run", "--rm", "--privileged"]
+    command = ["docker", "run", "--rm", "--privileged", *ISOLATE_LIMITS]
     command += [f"--env=UNICON_BOX_USERS={BOX_USERS}"]
     command += [f"--env=UNICON_STEP_MEMORY_MB={STEP_MEMORY_MB}"]
     command += ["--volume", f"{ROOT}:/src:ro", tag]
