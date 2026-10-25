@@ -1,46 +1,68 @@
-# The sandbox-run primitive, ghcr.io/uniconhq/primitive-sandbox-run. One
-# container per batch of tests: it reads /work/inputs.json and the binary and
-# inputs under /work/in/, and writes /work/outputs.json and each run's output
-# under /work/out/.
+# The exec primitive, ghcr.io/uniconhq/primitive-exec. One container per batch
+# of runs: it reads /work/inputs.json and the program and inputs under
+# /work/in/, and writes /work/outputs.json and each run's output under
+# /work/out/. Each run goes in an isolate box of its own, so the container
+# runs as root and privileged (see "Where it runs" in the README).
 
-# Pinned by digest so a release rebuilds from the same base. python:3.14-slim
-# (Debian 13), pulled 2026-09-13, the same pin as the runner's images and the
-# compile primitive, whose Python and Java versions this image must match to
-# run what compile builds. Change it in both primitives together, from
+# The image builds on the primitives' base, the runner's
+# ghcr.io/uniconhq/primitive-base: the same python:3.14-slim, with the step
+# wrapper as its entrypoint, which runs this image's command in a grading
+# step and runs it in its own place anywhere else. BASE_IMAGE names the
+# runner release's image; a build against a runner checkout passes the one
+# built from it, as the tests and the shared CI do.
+ARG BASE_IMAGE=ghcr.io/uniconhq/primitive-base:v0.10.0
+
+# The stage that builds isolate is pinned by digest, python:3.14-slim
+# (Debian 13), pulled 2026-09-13, the base image's own pin, so isolate
+# links the libraries the final stage has. Change it with the runner's
+# images/primitive-base/Dockerfile, from
 # `docker image inspect python:3.14-slim --format '{{index .RepoDigests 0}}'`.
-FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6 AS helper
+FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6 AS isolate
 
-# sandbox-exec, the small static program every binary is started through, so
-# that its peak memory is its own (see src/sandbox-exec.c).
+# isolate 2.7 (https://github.com/ioi/isolate), built unpatched from its tag's
+# commit and refused at any other, installed as its own `make install` does:
+# the setuid /usr/local/bin/isolate and its configuration file, which exec
+# writes at the step's start. Beside it, our box launcher,
+# src/box-launch.c, linked statically: exec runs every program in a box
+# through it, and it refuses the keyring, inotify and fanotify calls isolate's
+# own filter leaves, before it runs the program (see the file).
+ARG ISOLATE_COMMIT=8f185bb37f3f23e29b33b0c7727c91c13429abe3
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends gcc libc6-dev \
+    && apt-get install --yes --no-install-recommends ca-certificates git gcc make \
+       libc6-dev libcap-dev libseccomp-dev libsystemd-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
-COPY src/sandbox-exec.c /src/
-RUN gcc -O2 -static -Wall -Werror -o /sandbox-exec /src/sandbox-exec.c
+RUN git clone --quiet https://github.com/ioi/isolate /src \
+    && cd /src \
+    && git checkout --quiet "$ISOLATE_COMMIT" \
+    && test "$(git rev-parse HEAD)" = "$ISOLATE_COMMIT" \
+    && make install DESTDIR=/out
+COPY src/box-launch.c /box-launch.c
+RUN gcc -O2 -Wall -Wextra -Werror -static -o /out/usr/local/bin/box-launch \
+    /box-launch.c -lseccomp
 
 
-FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
+FROM ${BASE_IMAGE}
 
-LABEL org.opencontainers.image.title="primitive-sandbox-run" \
-      org.opencontainers.image.description="The Unicon sandbox-run primitive: run a binary per test and measure it." \
-      org.opencontainers.image.source="https://github.com/uniconhq/primitive-sandbox-run" \
+LABEL org.opencontainers.image.title="primitive-exec" \
+      org.opencontainers.image.description="The Unicon exec primitive: run a program under limits and measure it." \
+      org.opencontainers.image.source="https://github.com/uniconhq/primitive-exec" \
       org.opencontainers.image.licenses="MIT"
 
 # The Java runtime runs the jars compile builds, from the same Debian package
-# set as compile's JDK. Native binaries are statically linked and Python
-# binaries run on the image's own interpreter. The JRE's post-install scripts
+# set as compile's JDK. Native programs are statically linked and Python
+# programs run on the image's own interpreter. The JRE's post-install scripts
 # expect the man directory the slim image leaves out.
 RUN mkdir -p /usr/share/man/man1 \
     && apt-get update \
     && apt-get install --yes --no-install-recommends openjdk-21-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=helper --chmod=0755 /sandbox-exec /usr/local/bin/sandbox-exec
-COPY --chmod=0755 src/sandbox_run.py /usr/local/bin/sandbox-run
+# isolate links libcap2 and libseccomp2, which the base image has; box-launch
+# links nothing. Every box sees it, under the /usr isolate binds into each.
+COPY --from=isolate /out/ /
+COPY --chmod=0755 src/exec.py /usr/local/bin/exec
 
-# The harness runs every step as a non-root user with a read-only root, and
-# /work and /tmp as the only writable places. The program and every binary it
-# runs write nowhere else.
-USER 65532:65532
+# exec runs as root: it sets up the step's cgroup, mounts each box's tmpfs and
+# runs isolate, and each run is a box user of its own, never root.
 WORKDIR /work
-ENTRYPOINT ["/usr/local/bin/sandbox-run"]
+CMD ["/usr/local/bin/exec"]

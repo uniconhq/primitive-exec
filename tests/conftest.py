@@ -1,22 +1,22 @@
 """Fixtures for running the image the way the harness does, and the contract checks.
 
 The image tests build the image from this checkout (or use the one named by
-`PRIMITIVE_IMAGE`) and start it with the flags every step container gets: no
-network, a read-only root, every capability dropped, no new privileges,
-Docker's built-in seccomp profile, user 65532, no swap, the declared memory
-and pids limits, the CPU-time and file-size limits as `RLIMIT_CPU` and
-`RLIMIT_FSIZE`, one CPU, a small noexec tmpfs at /tmp and the working
-directory at /work. They are skipped when Docker is not reachable.
+`PRIMITIVE_IMAGE`) and start it as an exec step container is started:
+privileged, as root, with no swap, the declared memory and pids limits, the
+CPU-time limit as `RLIMIT_CPU`, one CPU, the step's box users, and the
+working directory at /work. They are skipped when Docker is not reachable.
 
 The contract checks use `primitive.schema.json` from `PRIMITIVE_SCHEMA`, or
-from a runner checkout beside this one, when it is the version 5 contract.
+from a runner checkout beside this one, when it has the version 6 contract.
 
 Native and Java binaries come from the compile primitive's image, named by
 `COMPILE_IMAGE` or built from a primitive-compile checkout beside this one;
 the tests that need one are skipped when there is neither. The in-process
 tests import the program, which needs Linux, so elsewhere only the image
-tests are collected. The declaration is checked by the runner's shared
-primitive CI.
+tests are collected; those that run programs need root and isolate too, so
+they are skipped elsewhere and run in the privileged test container
+(`tests/Dockerfile`), which one image test starts. The declaration is
+checked by the runner's shared primitive CI.
 """
 
 import json
@@ -39,15 +39,18 @@ from support import (
     SCHEMA_VERSION,
     SIBLING_COMPILE,
     SIBLING_SCHEMA,
+    USERNS,
     Check,
     Compiled,
     RunImage,
+    base_build_args,
     declaration,
     open_up,
     sandbox_flags,
+    step_flags,
 )
 
-collect_ignore = [] if sys.platform == "linux" else ["test_sandbox_run.py"]
+collect_ignore = [] if sys.platform == "linux" else ["test_exec.py", "test_programs.py"]
 
 
 @pytest.fixture(scope="session")
@@ -61,66 +64,58 @@ def image() -> str:
     if named:
         return named
     tag = f"{NAME}:test"
-    subprocess.run(["docker", "build", "--quiet", "--tag", tag, str(ROOT)], check=True)
+    command = ["docker", "build", "--quiet", *base_build_args(), "--tag", tag]
+    subprocess.run([*command, str(ROOT)], check=True)
     return tag
 
 
+@pytest.fixture(scope="session")
+def rootless(image: str) -> bool:
+    """Whether the daemon is rootless Docker, where a step's root is
+    already a user namespace's, so exec starts as the image's entrypoint
+    starts it rather than through `USERNS`, and there is no root Docker to
+    refuse."""
+    return "rootless" in docker("info", "--format", "{{json .SecurityOptions}}")
+
+
 @pytest.fixture
-def run_image(image: str) -> RunImage:
+def run_image(image: str, rootless: bool) -> RunImage:
     """Run the image once over a working directory and return its outputs.json.
 
     The directory is copied into a Docker volume, run there and copied back,
-    because the harness gives a step a volume: Landlock's rules hold on the
-    volume's filesystem, and not on a bind mount of a directory Docker
-    Desktop shares from another operating system, whose files it cannot tell
-    apart from one open to the next.
+    because the harness gives a step a volume, and so the files exec writes
+    as root come back as the tester's own.
     """
 
     def run(
         work: Path,
         limits: dict[str, int] | None = None,
         seconds: list[float] | None = None,
-        owned: bool = False,
+        root_docker: bool = False,
+        flags: list[str] | None = None,
     ) -> dict[str, Any]:
         """Run the batch in `work`; `seconds`, when given, gets how long the
-        sandboxed container took, from `docker run` to its exit. `owned`
-        hands the whole working directory to the step's user, as the harness
-        lays it out, rather than opening it to every user."""
+        step container took, from `docker run` to its exit. exec is started
+        through `USERNS` unless `root_docker`, when it meets root Docker's
+        identity user ID map as the image's entrypoint does, or the daemon
+        is `rootless`, when the entrypoint starts it as a step's is.
+        `flags` are more `docker run` flags."""
         limits = limits or declaration()["limits"]
-        open_up(work)
         volume = f"{NAME}-test-{secrets.token_hex(4)}"
         docker("volume", "create", volume)
         try:
             holder = docker("create", "--volume", f"{volume}:/work", image).strip()
             try:
                 docker("cp", f"{work}/.", f"{holder}:/work")
-                docker(
-                    "run",
-                    "--rm",
-                    "--user=0:0",
-                    "--entrypoint=chmod",
-                    "--volume",
-                    f"{volume}:/work",
-                    image,
-                    "-R",
-                    "a+rwX",
-                    "/work",
-                )
-                if owned:
-                    docker(
-                        "run",
-                        "--rm",
-                        "--user=0:0",
-                        "--entrypoint=chown",
-                        "--volume",
-                        f"{volume}:/work",
-                        image,
-                        "-R",
-                        "65532:65532",
-                        "/work",
-                    )
-                command = ["docker", "run", "--rm", *sandbox_flags(limits)]
-                command += ["--volume", f"{volume}:/work", image]
+                command = ["docker", "run", "--rm", *step_flags(limits)]
+                command += flags or []
+                command += ["--volume", f"{volume}:/work"]
+                if root_docker or rootless:
+                    command += [image]
+                else:
+                    command += ["--volume", f"{USERNS}:/userns.py:ro"]
+                    command += ["--entrypoint=python3", image]
+                    command += ["/userns.py", "/usr/local/bin/exec"]
                 started = time.monotonic()
                 subprocess.run(
                     command, check=True, timeout=limits["time_ms"] / 1000 + 60
@@ -157,36 +152,39 @@ def compile_image(image: str) -> str:
     if not (SIBLING_COMPILE / "Dockerfile").is_file():
         pytest.skip("no compile image to build binaries with; set COMPILE_IMAGE")
     tag = "primitive-compile:test"
-    command = ["docker", "build", "--quiet", "--tag", tag, str(SIBLING_COMPILE)]
+    command = ["docker", "build", "--quiet", *base_build_args(), "--tag", tag]
+    command.append(str(SIBLING_COMPILE))
     subprocess.run(command, check=True)
     return tag
 
 
 @pytest.fixture
 def compiled(compile_image: str, tmp_path_factory: pytest.TempPathFactory) -> Compiled:
-    """Compile a source with the compile primitive and return the binary.
+    """Compile a source with the compile primitive and return the program.
 
     The source goes in as compile's `source` folder holding the one file, in
-    contract version 5. A compile image that answers it speaks another
-    version, as the compile v1 image speaks 4 with `source` a file, is asked
-    again in that shape, so these tests run against either.
+    contract version 6, as compile@v3 takes it. A compile image that answers
+    it speaks another version, as compile@v2 speaks 5, is asked again in that
+    shape, so these tests run against either.
     """
 
     def build(language: str, name: str, source: str) -> bytes:
         work = source_in(tmp_path_factory, name, source)
         inputs = {"source": {"folder": "in/1/source"}, "language": language}
         result = compile_once(
-            compile_image, work, {"schema_version": SCHEMA_VERSION, "inputs": inputs}
+            compile_image, work, {"schema_version": 6, "inputs": inputs}
         )
         if "contract version" in result.get("error", ""):
-            # A directory of its own: what the first run wrote belongs to the
+            # compile@v2 speaks version 5 and names its output binary. A
+            # directory of its own: what the first run wrote belongs to the
             # container's user, which this one cannot open up again.
             work = source_in(tmp_path_factory, name, source)
-            inputs = {"source": {"file": f"in/1/source/{name}"}, "language": language}
-            document = {"schema_version": 4, "inputs": inputs}
+            document = {"schema_version": 5, "inputs": inputs}
             result = compile_once(compile_image, work, document)
         assert result["outputs"]["outcome"] == "accepted", result
-        return (work / str(result["outputs"]["binary"]["file"])).read_bytes()
+        outputs = result["outputs"]
+        program = outputs["program"] if "program" in outputs else outputs["binary"]
+        return (work / str(program["file"])).read_bytes()
 
     return build
 
@@ -219,16 +217,16 @@ def compile_once(
 
 @pytest.fixture(scope="session")
 def schema() -> dict[str, Any]:
-    """The runner's primitive.schema.json at contract version 5."""
+    """The runner's primitive.schema.json, when it has contract version 6."""
     named = os.environ.get("PRIMITIVE_SCHEMA")
     path = Path(named) if named else SIBLING_SCHEMA
     if not path.is_file():
         pytest.skip("no primitive.schema.json; set PRIMITIVE_SCHEMA")
     document: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     inputs = document.get("$defs", {}).get("inputs_file", {})
-    version = inputs.get("properties", {}).get("schema_version", {}).get("const")
-    if version != SCHEMA_VERSION:
-        pytest.skip(f"{path} is not the version {SCHEMA_VERSION} contract")
+    version = inputs.get("properties", {}).get("schema_version", {})
+    if SCHEMA_VERSION not in version.get("enum", [version.get("const")]):
+        pytest.skip(f"{path} has no version {SCHEMA_VERSION} contract")
     return document
 
 
@@ -237,13 +235,16 @@ def check(schema: dict[str, Any]) -> Check:
     """Validate a document against one part of the contract.
 
     For `outputs_file`, every entry must also carry each output the
-    declaration names as required, and nothing it does not name.
+    declaration names as required, and nothing it does not name but the
+    `reports` of the manifest it was given.
     """
     registry: Registry[Any] = Registry().with_resource(
         schema["$id"], Resource.from_contents(schema)
     )
 
-    def validate(document: dict[str, Any], part: str) -> None:
+    def validate(
+        document: dict[str, Any], part: str, reports: frozenset[str] = frozenset()
+    ) -> None:
         reference = {"$ref": f"{schema['$id']}#/$defs/{part}"}
         Draft202012Validator(reference, registry=registry).validate(document)
         if part != "outputs_file" or "error" in document:
@@ -255,6 +256,47 @@ def check(schema: dict[str, Any]) -> Check:
         else:
             entries = [document["outputs"]]
         for outputs in entries:
-            assert required <= set(outputs) <= set(declared), outputs
+            assert required <= set(outputs) <= set(declared) | reports, outputs
+
+    return validate
+
+
+@pytest.fixture
+def programs_check(schema: dict[str, Any]) -> Check:
+    """Validate a document against one part of the contract.
+
+    For `outputs_file`, every entry must also carry `facts`, `outcome` and,
+    for each program named in `programs`, each fact the several-programs
+    form names as required, and nothing else but the optional facts and
+    that program's `reports`, as `<name>.<report>`.
+    """
+    registry: Registry[Any] = Registry().with_resource(
+        schema["$id"], Resource.from_contents(schema)
+    )
+
+    def validate(
+        document: dict[str, Any],
+        part: str,
+        programs: dict[str, frozenset[str]] | None = None,
+    ) -> None:
+        reference = {"$ref": f"{schema['$id']}#/$defs/{part}"}
+        Draft202012Validator(reference, registry=registry).validate(document)
+        if part != "outputs_file" or "error" in document:
+            return
+        declared = declaration("programs")
+        facts = declared["inputs"]["programs"]["outputs"]
+        required = {name for name, port in facts.items() if not port.get("optional")}
+        for entry in document["batch"]:
+            outputs = entry["outputs"]
+            assert set(declared["outputs"]) == {
+                name for name in outputs if "." not in name
+            }, outputs
+            for name, reports in (programs or {}).items():
+                given = {
+                    key.partition(".")[2]
+                    for key in outputs
+                    if key.partition(".")[0] == name
+                }
+                assert required <= given <= set(facts) | reports, outputs
 
     return validate

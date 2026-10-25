@@ -273,8 +273,8 @@ wheels = [
 ]
 
 [[package]]
-name = "primitive-sandbox-run"
-version = "2.2.0"
+name = "primitive-exec"
+version = "1.0.0"
 source = { virtual = "." }
 
 [package.dev-dependencies]
