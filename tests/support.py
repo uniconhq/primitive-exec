@@ -437,6 +437,50 @@ elif case == "read-paths":
             print("found", path, len(os.getxattr(path, "user.cache")))
         except OSError as error:
             print("none", path, error.errno)
+elif case == "bury":
+    megabytes = int(sys.stdin.readline())
+    for _ in range(17):
+        os.mkdir("a" * 255)
+        os.chdir("a" * 255)
+    os.mkdir("box")
+    os.chdir("box")
+    for number in range(megabytes):
+        with open(f"part-{number}", "wb") as part:
+            part.write(b"z" * 2**20)
+    os.chdir("..")
+    os.chmod("box", 0)
+    print("buried", megabytes)
+elif case == "folders":
+    for number in range(int(sys.stdin.readline())):
+        os.mkdir(f"f{number}")
+    print("made them")
+elif case == "free":
+    status = os.statvfs(".")
+    print("free", status.f_bavail * status.f_frsize // 2**20)
+elif case == "acl":
+    import struct
+
+    owner, user, group, mask, other = 1, 2, 4, 0x10, 0x20
+    entries = [(owner, 6, -1), (user, 4, 4242), (user, 4, 4343), (group, 4, -1)]
+    entries += [(mask, 4, -1), (other, 4, -1)]
+    acl = struct.pack("<I", 2) + b"".join(
+        struct.pack("<HHI", tag, perm, ident & 0xFFFFFFFF)
+        for tag, perm, ident in entries
+    )
+    for path in sys.stdin.read().split():
+        names = ["system.posix_acl_access"]
+        if os.path.isdir(path):
+            names.append("system.posix_acl_default")
+        try:
+            for name in names:
+                os.setxattr(path, name, acl)
+            print("set", path)
+        except OSError as error:
+            print("refused", path, error.errno)
+elif case == "read-acl":
+    for path in sys.stdin.read().split():
+        found = [name for name in os.listxattr(path) if "posix_acl" in name]
+        print("found" if found else "none", path)
 elif case == "mark-and-lock":
     files = ["/work/in/3/input", "/work/out/1/output"]
     for path in files + ["/work/in/3"]:
@@ -505,6 +549,15 @@ elif case == "sockets":
     params = ctypes.create_string_buffer(120)
     ring = libc.syscall(425, 8, params)
     print("io_uring_setup", ring >= 0 or ctypes.get_errno())
+    import platform
+    keyring = {"x86_64": (248, 249, 250), "aarch64": (217, 218, 219)}
+    add_key, request_key, keyctl = keyring[platform.machine()]
+    made = libc.syscall(add_key, b"user", b"left", b"secret", 6, -3)
+    print("add_key", made >= 0 or ctypes.get_errno())
+    found = libc.syscall(request_key, b"user", b"left", None, 0)
+    print("request_key", found >= 0 or ctypes.get_errno())
+    session = libc.syscall(keyctl, 0, -3, 0)
+    print("keyctl", session >= 0 or ctypes.get_errno())
 elif case == "fork-bomb":
     children = 0
     try:

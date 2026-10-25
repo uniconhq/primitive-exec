@@ -25,6 +25,9 @@
  *     reaches no network and no netlink, whatever the container was given;
  *   - io_uring_setup(), since a ring's operations are not system calls the
  *     filter or Landlock sees;
+ *   - add_key(), request_key() and keyctl(), since the kernel's keyrings are
+ *     not namespaced: a key linked into the user's keyring outlives the run
+ *     and is there for every later run of the same user ID, in any container;
  *   - on x86_64, every x32 call, whose numbers would pass the checks above.
  *
  * A call made under another architecture (i386 on x86_64, arm32 on
@@ -85,7 +88,10 @@ static struct sock_filter rules[] = {
     BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 0, 1),
     BPF_STMT(BPF_RET | BPF_K, REFUSE),
 #endif
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 0, 1),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_add_key, 2, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_request_key, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_keyctl, 0, 1),
     BPF_STMT(BPF_RET | BPF_K, REFUSE),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 1, 0),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socketpair, 0, 3),

@@ -339,6 +339,55 @@ def test_a_run_that_locks_what_it_marked_leaves_no_attribute(
     assert [line.split()[0] for line in found] == ["none", "none", "none"]
 
 
+def test_a_run_finds_no_access_control_list_an_earlier_run_set(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """An access control list, whose entries name any user ID, holds as much
+    as an attribute: one set on the next item's input, and an access and a
+    default one on `out/`, are gone for the next run."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    paths = "/work/in/3/input /work/out"
+    items = [("main-set", f"acl\n{paths}\n"), ("main-read", f"read-acl\n{paths}\n")]
+    outputs = run_batch(run_image, work, binary, items, owned=True)
+    assert printed(work, outputs["main-set"]).split()[::2] == ["set"] * 2
+    assert printed(work, outputs["main-read"]).split()[::2] == ["none"] * 2
+
+
+def test_a_run_that_buries_files_past_path_max_leaves_the_next_its_room(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """A run that writes 20 MB in a folder deeper than any path can name, and
+    takes the access to it away, does not keep that room from the next: each
+    later run finds as much of `/tmp` free as the first did."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [
+        ("main-1", "free\n"),
+        ("main-2", "bury\n20\n"),
+        ("main-3", "free\n"),
+        ("main-4", "bury\n20\n"),
+        ("main-5", "free\n"),
+    ]
+    outputs = run_batch(run_image, work, binary, items)
+    assert set(outcomes(outputs).values()) == {"accepted"}
+    free = [int(printed(work, outputs[f"main-{n}"]).split()[1]) for n in (1, 3, 5)]
+    assert free[0] - min(free) <= 2, free
+
+
+def test_a_run_that_makes_too_many_folders_is_over_its_memory(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """Removing them would take longer than making them, on no clock, so a
+    run is stopped once it has made `RUN_ENTRIES`, though it is far under
+    its memory limit; one that makes fewer is not."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [("main-many", "folders\n150000\n"), ("main-few", "folders\n1000\n")]
+    outputs = run_batch(run_image, work, binary, items, 4.0, 512)
+    assert outcomes(outputs) == {"main-many": "memory_limit", "main-few": "accepted"}
+
+
 def test_a_run_that_locks_its_own_copy_does_not_stop_the_next(
     tmp_path: Path, run_image: RunImage
 ) -> None:
@@ -413,12 +462,13 @@ def test_a_large_named_file_costs_the_run_no_time(
     assert heavy[1] <= plain[1] + 30, (plain, heavy)
 
 
-def test_a_run_reaches_no_network_socket_and_no_io_uring(
+def test_a_run_reaches_no_network_socket_no_io_uring_and_no_keyring(
     tmp_path: Path, run_image: RunImage
 ) -> None:
     """The filter `sandbox-exec` installs refuses every socket but a Unix one,
-    and io_uring, with EPERM, so a run reaches no network whatever the
-    container was given; a Unix socket, which Java and Python use, works.
+    io_uring and the kernel's keyrings, with EPERM, so a run reaches no
+    network whatever the container was given and leaves no key for a later
+    run; a Unix socket, which Java and Python use, works.
     Docker's own seccomp profile is off here, so the refusals are the
     filter's."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
@@ -436,6 +486,9 @@ def test_a_run_reaches_no_network_socket_and_no_io_uring(
         "socketpair AF_UNIX True",
         f"socketpair AF_INET {errno.EPERM}",
         f"io_uring_setup {errno.EPERM}",
+        f"add_key {errno.EPERM}",
+        f"request_key {errno.EPERM}",
+        f"keyctl {errno.EPERM}",
     ]
 
 

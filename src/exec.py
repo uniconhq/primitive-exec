@@ -46,6 +46,7 @@ instead.
 
 import ctypes
 import errno
+import functools
 import json
 import math
 import os
@@ -69,6 +70,11 @@ from typing import BinaryIO
 SCHEMA_VERSION = 6
 OUTPUT_LIMIT = 32 * 1024 * 1024
 POLL_SECONDS = 0.005
+RUN_ENTRIES = 100_000
+"""The most files and folders one run may make in `/tmp`, where its working
+directory is. Removing them after it takes several times what making them
+did, and none of it is on the run's clock, so a run that makes more is
+stopped for its memory, which every entry in a tmpfs takes."""
 TOTAL_SPACING = 4.0
 """How long to wait before reading a run's total memory again, as a multiple
 of how long the last reading took. A reading walks every page the run holds,
@@ -173,6 +179,9 @@ GONE = frozenset({errno.EINVAL, errno.EIDRM})
 NO_ATTRIBUTES = frozenset({errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP})
 """What listing or removing an attribute answers for a path that is gone, or
 on a filesystem without attributes."""
+ACL_ATTRIBUTES = frozenset({"system.posix_acl_access", "system.posix_acl_default"})
+"""The attributes a file's owner may set outside the `user` namespace with no
+capability: its access control lists, each entry naming any user ID."""
 REPORT_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 """A report a manifest declares, which becomes an output of that name and a
 file of that name in the report folder."""
@@ -435,7 +444,9 @@ def main(argv: list[str]) -> int:
 def read_inputs(root: Path) -> list[Item]:
     """Read `inputs.json` and return its items in order."""
     try:
-        document = json.loads((root / "inputs.json").read_bytes())
+        document = json.loads(
+            (root / "inputs.json").read_bytes(), parse_constant=refuse_constant
+        )
     except FileNotFoundError:
         raise PrimitiveError("inputs.json is not in the working directory") from None
     except ValueError:
@@ -604,7 +615,11 @@ def named_files(
 def positive_number(inputs: dict[str, object], name: str, run: str) -> float:
     """Read a number input that must be above zero."""
     value = inputs.get(name)
-    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not 0 < value < math.inf
+    ):
         raise PrimitiveError(
             f"the input named {name} of run {run} is not a positive number"
         )
@@ -722,7 +737,12 @@ def prepare(item: Item, kind: str, scratch: Path) -> Program:
     before the item's clock starts, so its time is not the run's.
     """
     path = scratch / f"program-{item.number}"
-    shutil.copyfile(item.program, path)
+    try:
+        shutil.copyfile(item.program, path)
+    except OSError as error:
+        raise PrimitiveError(
+            f"the program of run {item.run} could not be copied: {error.strerror}"
+        ) from error
     if kind == "native":
         path.chmod(0o755)
     return Program(kind, path)
@@ -748,45 +768,61 @@ def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, ob
     report = None
     if item.manifest is not None:
         report = Path(tempfile.mkdtemp(prefix="report-"))
+    cwd = Path(tempfile.mkdtemp(prefix="run-"))
+    settle = functools.partial(settle_run, root, cwd, output)
     try:
-        cwd = Path(tempfile.mkdtemp(prefix="run-"))
-        try:
-            place_files(root, cwd, item.files | item.loads)
-            descriptor = os.open(
-                output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644
-            )
-            stdin_path = item.stdin if item.stdin is not None else Path(os.devnull)
-            with stdin_path.open("rb") as stdin, os.fdopen(descriptor, "wb") as stdout:
-                if any("\0" in argument for argument in item.args):
-                    run = Run(127, 0.0, 0.0, 0, 0, None)
-                else:
-                    run = execute(program, cwd, report, stdin, stdout, item, abi)
-        finally:
-            reap_strays()
-            sweep_sysv()
-            clear_attributes(root)
-            give_back_tree(cwd)
-            shutil.rmtree(cwd, ignore_errors=True)
-            give_back_along(root, output)
-        if run.output_bytes > OUTPUT_LIMIT:
-            os.truncate(output, OUTPUT_LIMIT)
-        outcome = judge(run, item, program.kind)
-        time_ms = round(run.cpu_seconds * 1000)
-        if outcome == "time_limit":
-            time_ms = max(time_ms, item.time_limit_ms)
-        outputs: dict[str, object] = {
-            "output": {"file": f"out/{item.number}/output"},
-            "time_ms": time_ms,
-            "memory_kb": run.memory_kb,
-            "outcome": outcome,
-        }
-        if report is not None:
-            outputs |= reported(item, outcome, report, out)
-    finally:
-        if report is not None:
-            give_back_tree(report)
-            shutil.rmtree(report, ignore_errors=True)
+        place_files(root, cwd, item.files | item.loads)
+        descriptor = os.open(
+            output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644
+        )
+        stdin_path = item.stdin if item.stdin is not None else Path(os.devnull)
+        with stdin_path.open("rb") as stdin, os.fdopen(descriptor, "wb") as stdout:
+            if any("\0" in argument for argument in item.args):
+                run = Run(127, 0.0, 0.0, 0, 0, None)
+            else:
+                run = execute(program, cwd, report, stdin, stdout, item, abi)
+    except BaseException:
+        quietly(settle)
+        raise
+    settle()
+    if run.output_bytes > OUTPUT_LIMIT:
+        os.truncate(output, OUTPUT_LIMIT)
+    outcome = judge(run, item, program.kind)
+    time_ms = round(run.cpu_seconds * 1000)
+    if outcome == "time_limit":
+        time_ms = max(time_ms, item.time_limit_ms)
+    outputs: dict[str, object] = {
+        "output": {"file": f"out/{item.number}/output"},
+        "time_ms": time_ms,
+        "memory_kb": run.memory_kb,
+        "outcome": outcome,
+    }
+    if report is not None:
+        outputs |= reported(item, outcome, report, out)
+        remove_tree(report)
     return outputs
+
+
+def settle_run(root: Path, cwd: Path, output: Path) -> None:
+    """Undo what a run could leave for the next, once it has ended: its
+    processes, System V objects and attributes, and its working directory,
+    in that order, so nothing is removed while a process of its lives."""
+    reap_strays()
+    sweep_sysv()
+    clear_attributes(root)
+    remove_tree(cwd)
+    give_back_along(root, output)
+
+
+def quietly(cleanup: Callable[[], None]) -> None:
+    """Run `cleanup` while an error that ends the batch is on its way out: an
+    error of its own goes to standard error, so it does not hide the first.
+    The container goes with the batch, so what it could not undo stays with
+    no later run."""
+    try:
+        cleanup()
+    except Exception as error:
+        print(f"exec: cleaning up after the error failed too: {error}", file=sys.stderr)
 
 
 def reported(item: Item, outcome: str, folder: Path, out: Path) -> dict[str, object]:
@@ -964,7 +1000,12 @@ def place_files(root: Path, cwd: Path, files: dict[str, Path]) -> None:
     for name, source in files.items():
         give_back_along(root, source)
         placed = cwd / name
-        shutil.copyfile(source, placed)
+        try:
+            shutil.copyfile(source, placed)
+        except OSError as error:
+            raise PrimitiveError(
+                f"the named file {name} could not be placed: {error.strerror}"
+            ) from error
         placed.chmod(NAMED_FILE_MODE)
 
 
@@ -984,8 +1025,9 @@ def execute(
     memory. Every few milliseconds every process of the run is read: their
     CPU time together, their memory (see `RunMemory`), the wall-clock time
     and the output size, and the program is killed as soon as one is over its
-    limit. Resource limits set before the start back this up: CPU time, file
-    size, stack, and no core dumps.
+    limit, or once it has made more than `RUN_ENTRIES` files and folders in
+    `/tmp`, for its memory. Resource limits set before the start back this
+    up: CPU time, file size, stack, and no core dumps.
 
     The memory reported is the higher of the program's own peak, as
     `sandbox-exec` saw it, and the highest this program read while the run
@@ -1017,6 +1059,7 @@ def execute(
     read_end, write_end = os.pipe()
     passed = (write_end, ruleset)
     memory = RunMemory(cgroup=own_cgroup())
+    entries = tmp_entries()
     started = time.monotonic()
     try:
         helper = subprocess.Popen(
@@ -1058,7 +1101,10 @@ def execute(
         if stopped is None:
             if cpu > item.time_limit or now - started > item.wall_limit:
                 stopped = "time"
-            elif memory.peak_kb > item.memory_limit_kb:
+            elif (
+                memory.peak_kb > item.memory_limit_kb
+                or tmp_entries() - entries > RUN_ENTRIES
+            ):
                 stopped = "memory"
             elif os.fstat(stdout.fileno()).st_size > OUTPUT_LIMIT:
                 stopped = "output"
@@ -1446,13 +1492,16 @@ def clear_attributes(top: Path) -> None:
     A run may set one on any file or folder it can name and write, which
     Landlock does not stop: the next item's input, `out/`, its own output.
     Each holds a few kilobytes, as many as the filesystem allows, so a run
-    could keep work there for the next one. It may set no other namespace
-    without a capability. A run may also take this program's access away
-    from what it set one on, with `chmod`, which Landlock does not stop
-    either, so each path is given back before its attributes are listed or
-    removed, and a folder before what is in it. A path that is gone, or a
-    filesystem without attributes, is passed over; an attribute that still
-    can't be removed is a `PrimitiveError`, since the next run would find it.
+    could keep work there for the next one. Its owner may also set an
+    access control list on it, and a default one on a folder, whose
+    entries name any user ID they like, so those are removed too; no other
+    namespace may be set without a capability. A run may also take this
+    program's access away from what it set one on, with `chmod`, which
+    Landlock does not stop either, so each path is given back before its
+    attributes are listed or removed, and a folder before what is in it. A
+    path that is gone, or a filesystem without attributes, is passed over;
+    an attribute that still can't be removed is a `PrimitiveError`, since
+    the next run would find it.
     """
     folders = [top]
     while folders:
@@ -1477,8 +1526,12 @@ def clear_attributes(top: Path) -> None:
 
 
 def clear_attributes_of(path: Path) -> None:
-    """Remove the `user` attributes of one path, not following a link."""
+    """Remove the `user` attributes of one path, not following a link, and
+    its access control lists when this program's user owns it: no run can
+    set one on a path another user owns, and only the owner may remove it.
+    """
     try:
+        owned = os.lstat(path).st_uid == os.geteuid()
         names = os.listxattr(path, follow_symlinks=False)
     except OSError as error:
         if error.errno in NO_ATTRIBUTES:
@@ -1488,7 +1541,7 @@ def clear_attributes_of(path: Path) -> None:
             f"listed: {error.strerror}"
         ) from error
     for name in names:
-        if name.startswith("user."):
+        if name.startswith("user.") or (owned and name in ACL_ATTRIBUTES):
             try:
                 os.removexattr(path, name, follow_symlinks=False)
             except OSError as error:
@@ -1542,6 +1595,92 @@ def give_back_along(root: Path, path: Path, needed: int | None = None) -> None:
             folder = folder / part
         give_back(folder)
     give_back(path, needed)
+
+
+def tmp_entries() -> int:
+    """How many files and folders the filesystem of `/tmp` holds, which a
+    tmpfs counts exactly; 0 where the filesystem does not count them."""
+    status = os.statvfs(tempfile.gettempdir())
+    return status.f_files - status.f_ffree
+
+
+def remove_tree(top: Path) -> None:
+    """Remove `top`, a folder a run worked in, and all it holds, once the
+    run's processes are gone: see `empty_folder`. A `top` already gone is
+    passed over."""
+    if not os.path.lexists(top):
+        return
+    empty_folder(top)
+    try:
+        top.rmdir()
+    except OSError as error:
+        raise PrimitiveError(
+            f"a run's folder, {top}, could not be removed: {error.strerror}"
+        ) from error
+
+
+def empty_folder(top: Path) -> None:
+    """Remove everything in `top`, a folder a run worked in, however deep or
+    locked the run left it, once its processes are gone.
+
+    A run may build folders deeper than any path can name and take this
+    program's access away from them with `chmod`, so nothing here goes by
+    path below `top`: each folder is given back and opened through its
+    parent's descriptor, and a folder inside one is first moved up into
+    `top`, which needs it writable, so at most two are open at once however
+    deep the run went. What cannot be removed is a `PrimitiveError`, since
+    the next run would have less room for what it leaves.
+    """
+    give_back(top)
+    try:
+        top_fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise PrimitiveError(
+            f"a run's folder, {top}, could not be opened to empty: {error.strerror}"
+        ) from error
+    moved = 0
+    try:
+        while entries := list(os.scandir(top_fd)):
+            for entry in entries:
+                if not entry.is_dir(follow_symlinks=False):
+                    os.unlink(entry.name, dir_fd=top_fd)
+                    continue
+                os.chmod(entry.name, OWNER_FOLDER, dir_fd=top_fd)
+                folder = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=top_fd,
+                )
+                try:
+                    for inner in list(os.scandir(folder)):
+                        if inner.is_dir(follow_symlinks=False):
+                            os.chmod(inner.name, OWNER_FOLDER, dir_fd=folder)
+                            moved = move_up(folder, inner.name, top_fd, moved)
+                        else:
+                            os.unlink(inner.name, dir_fd=folder)
+                finally:
+                    os.close(folder)
+                os.rmdir(entry.name, dir_fd=top_fd)
+    except OSError as error:
+        raise PrimitiveError(
+            f"what a run left in {top} could not be removed: {error.strerror}"
+        ) from error
+    finally:
+        os.close(top_fd)
+
+
+def move_up(folder: int, name: str, top: int, moved: int) -> int:
+    """Move the folder `name` in `folder` into `top` under a name of its own,
+    and return how many have been moved so far. A name the run took already
+    is passed over for the next."""
+    while True:
+        moved += 1
+        try:
+            os.rename(name, f".removed-{moved}", src_dir_fd=folder, dst_dir_fd=top)
+            return moved
+        except OSError as error:
+            if error.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOTDIR):
+                raise
 
 
 def give_back_tree(top: Path) -> None:

@@ -194,6 +194,7 @@ def test_detect(tmp_path: Path) -> None:
     [
         ({"time_limit": 0}, "time_limit of run main-1 is not a positive number"),
         ({"time_limit": True}, "time_limit of run main-1 is not a positive number"),
+        ({"time_limit": float("nan")}, "inputs.json is not valid JSON"),
         ({"memory_limit": "64"}, "memory_limit of run main-1 is not a positive"),
         (
             {"program": {"file": "in/../inputs.json"}},
@@ -216,6 +217,43 @@ def test_inputs_it_cannot_use_are_an_error(
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert set(result) == {"schema_version", "error"}
     assert message in result["error"]
+
+
+def test_a_limit_too_large_to_be_a_number_is_an_error(tmp_path: Path) -> None:
+    """`1e999` is valid JSON, which Python reads as infinity."""
+    batch_inputs(tmp_path, b"", [("main-1", "")])
+    text = (tmp_path / "inputs.json").read_text()
+    document = json.loads(text)
+    document["batch"][0]["inputs"]["memory_limit"] = 123456789
+    (tmp_path / "inputs.json").write_text(
+        json.dumps(document).replace("123456789", "1e999")
+    )
+    assert primitive.main(["exec", str(tmp_path)]) == 0
+    result = json.loads((tmp_path / "outputs.json").read_text())
+    assert "memory_limit of run main-1 is not a positive number" in result["error"]
+
+
+def test_cleanup_that_fails_after_an_error_does_not_hide_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fail(*_: object) -> None:
+        raise primitive.PrimitiveError("the first error")
+
+    def fail_cleanup(*_: object) -> None:
+        raise primitive.PrimitiveError("the cleanup error")
+
+    batch_inputs(
+        tmp_path,
+        python_binary(tmp_path / "p", "print(1)\n").read_bytes(),
+        [("main-1", "")],
+    )
+    monkeypatch.setattr(primitive, "landlock_abi", lambda: 6)
+    monkeypatch.setattr(primitive, "execute", fail)
+    monkeypatch.setattr(primitive, "remove_tree", fail_cleanup)
+    assert primitive.main(["exec", str(tmp_path)]) == 0
+    result = json.loads((tmp_path / "outputs.json").read_text())
+    assert result["error"] == "the first error"
+    assert "the cleanup error" in capsys.readouterr().err
 
 
 def test_a_version_5_batch_is_an_error(tmp_path: Path) -> None:

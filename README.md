@@ -125,7 +125,11 @@ crashes, exits non-zero or breaks a limit, has not judged: the step is an
 `self_reported` run is the exception: it runs the entrant's code, as a test
 harness that imports the entrant's module does, so a report that does not
 hold is its `runtime_error`, and a crash or a limit its own outcome, with no
-report, as for any run.
+report, as for any run. Its report is only as honest as the entrant's code:
+that code runs in the same process, with `UNICON_REPORT` in reach, and can
+write a verdict of its own. A task that needs a verdict the entrant cannot
+write gives the judging to a program the entrant's code does not run in,
+such as `interact`'s partner.
 
 The folder is fresh for each run and removed after it, so nothing one run
 reports is there for the next. A program given no manifest gets no folder
@@ -163,7 +167,7 @@ The task's save does not check these; the scoring rules rely on them.
 
 `outputs.json` carries `error` instead, and nothing else, only when the
 primitive could not work at all: `inputs.json` is missing, is not JSON or is
-for another contract version; a file is missing or lies outside `in/`; a
+for another contract version, or holds `NaN` or `Infinity`; a file is missing or lies outside `in/`; a
 limit is not a positive number, or `args` is not text; a named file's name
 is not a plain name, or one name is in both `files` and `loads`; a manifest
 is not one, or `self_reported` is set without one or is not true or false;
@@ -172,8 +176,9 @@ a program given a manifest did not judge, unless it is `self_reported`
 a run id, or two items are for the same run; the program is in none of the
 three formats; the interpreter a Python or Java program needs could not be
 started; the machine's kernel does not offer Landlock ABI 3, or a run could
-not be put under its seccomp filter or its Landlock rules; or processes, a System V object or an
-attribute a run left behind could not be stopped or removed. The harness
+not be put under its seccomp filter or its Landlock rules; or processes, a
+System V object, an attribute or a file a run left behind could not be
+stopped or removed. The harness
 turns an error into a `system_error`, so no entrant is graded by a broken
 step. A native program the kernel refuses to run as built is the entrant's
 program failing, a `runtime_error`.
@@ -189,15 +194,17 @@ For each item, in order:
    `PATH` and `LANG=C.UTF-8`, and for a program given a manifest
    `UNICON_REPORT`, a second fresh folder under `/tmp`.
 3. Each of `files` and `loads` is copied into that directory, read-only.
-   The `stdin` file, or `/dev/null` without one, is opened as standard input, `out/<n>/output` as standard
-   output, and standard error goes nowhere.
+   The `stdin` file, or `/dev/null` without one, is opened as standard
+   input, `out/<n>/output` as standard output, and standard error goes
+   nowhere.
 4. The copy is started through `sandbox-exec`, with its arguments and its
    limits already set (below), under the seccomp filter and Landlock, and
    watched until it ends.
 5. Every process the run left behind is killed and reaped, every System V
    shared memory segment, message queue and semaphore set it left is
-   removed, every `user` extended attribute under `/work` is removed, and
-   the directory and the copy are removed. The run could make no POSIX
+   removed, every `user` extended attribute and access control list under
+   `/work` is removed, and the directory, however deep the run built it,
+   and the copy are removed. The run could make no POSIX
    message queue. A program given a manifest has its report read, and the
    folder removed.
 
@@ -266,11 +273,20 @@ processes or System V objects a run leaves is there for the next one:
   32 MB program, the largest compile makes, measured on Docker Desktop.
 - **Extended attributes.** A run may set a `user` extended attribute on any
   file or folder it can name and write, which Landlock does not stop: the
-  next run's input, `out/`, its own output. After every run exec
-  removes every one under `/work`, so none keeps work for the next run. A
-  run may also take exec's access away from what it marked, with
-  `chmod`, so each path is given back first; an attribute that still can't
-  be removed is an `error` of the step.
+  next run's input, `out/`, its own output. On what its user owns it may
+  also set an access control list, whose entries name any user ID, and a
+  default one on a folder. After every run exec removes every one of
+  these under `/work`, so none keeps work for the next run. A run may also
+  take exec's access away from what it marked, with `chmod`, so each path
+  is given back first; an attribute that still can't be removed is an
+  `error` of the step.
+- **What a run leaves in `/tmp`.** A run may build folders deeper than any
+  path can name in its working directory, fill them and take exec's access
+  away from them. exec removes them through open folders, never by path,
+  so the next run has as much of `/tmp` as the first; what still can't be
+  removed is an `error` of the step. Removing takes several times what
+  making took, on no run's clock, so a run that makes more than 100,000
+  files and folders in `/tmp` is stopped for its memory, `memory_limit`.
 - **POSIX message queues.** A queue outlives the process that made it, and
   the kernel lists none to remove, so a run is given no bytes for one
   (`RLIMIT_MSGQUEUE` at 0) and can make none.
@@ -304,7 +320,10 @@ processes or System V objects a run leaves is there for the next one:
   seccomp filter of its own, after no-new-privileges and before Landlock:
   `socket` and `socketpair` fail with `EPERM` for every family but
   `AF_UNIX`, and `io_uring_setup` fails with `EPERM`, since a ring's
-  operations are calls neither the filter nor Landlock sees. On x86_64 every
+  operations are calls neither the filter nor Landlock sees. `add_key`,
+  `request_key` and `keyctl` fail with `EPERM` too: the kernel's keyrings
+  are not namespaced, so a key a run linked into its user's keyring would
+  be there for every later run of that user, in any container. On x86_64 every
   x32 call is refused too, and a call of another architecture (i386 on
   x86_64, arm32 on aarch64) kills the run. So a run reaches no network and
   no netlink even in a container that has one, as a Woodpecker step may; a
