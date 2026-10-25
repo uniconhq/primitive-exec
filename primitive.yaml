@@ -84,7 +84,7 @@ outputs:
     outcomes:
       accepted: the program finishes within its limits, and given a manifest reports a verdict of 0
       wrong_answer: the program given a manifest reports a verdict of 1
-      time_limit: it runs out of time
-      memory_limit: it uses more memory than allowed
-      output_limit: it prints more than allowed
-      runtime_error: it crashes or exits with an error
+      time_limit: it runs out of time, or a program given a manifest reports a verdict of time_limit
+      memory_limit: it uses more memory than allowed, or a program given a manifest reports a verdict of memory_limit
+      output_limit: it prints more than allowed, or a program given a manifest reports a verdict of output_limit
+      runtime_error: it crashes or exits with an error, or a program given a manifest reports a verdict of runtime_error

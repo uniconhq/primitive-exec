@@ -33,12 +33,13 @@ is an error of the step; no program runs outside a box.
 
 A run given a `manifest`, an organiser's program such as a checker, also gets
 an empty folder of its own in its box, named in `$UNICON_REPORT`, and writes
-there one file per value it reports: `verdict`, `0` for accepted or `1` for a
-wrong answer, and each report the manifest declares. Its reports become
-outputs of their own names on `0`, and a report that does not hold, or a run
-of it that crashes or breaks a limit, is an error of the step, since the
-program did not judge; for a `self_reported` run, one that runs the entrant's
-code, it is the run's `runtime_error` or limit instead.
+there one file per value it reports: `verdict`, `0` for accepted, `1` for a
+wrong answer, or an outcome word for a program that judged another's run,
+and each report the manifest declares. Its reports become outputs of their
+own names on `0`, and a report that does not hold, or a run of it that
+crashes or breaks a limit, is an error of the step, since the program did
+not judge; for a `self_reported` run, one that runs the entrant's code, it
+is the run's `runtime_error` or limit instead.
 """
 
 import contextlib
@@ -163,6 +164,12 @@ TEXTS = ("label", "message", "staff_message")
 """The text files a report may hold besides its reports, each an output of
 its name: a finer name for the outcome, a message for the entrant, and one for
 staff alone."""
+VERDICT_WORDS = ("time_limit", "memory_limit", "output_limit", "runtime_error")
+"""The outcomes a report's verdict may name besides `0` and `1`: a program
+that judged another program's run, as `unicon/interactive`'s verdict script
+judges the programs `interact` ran, says whose limit it was, or that it
+crashed. From a `self_reported` run, the entrant's code, such a word is the
+run's `runtime_error`, so that code never chooses its own outcome."""
 REPORT_TEXT_LIMIT = 64 * 1024
 """The most bytes one file in a report folder may hold."""
 REPORT_FILES = 64
@@ -202,13 +209,18 @@ class Declared:
 
 @dataclass(frozen=True)
 class Report:
-    """What a run given a manifest reported: whether it judged the run
-    accepted, the outputs it gives, and the files only shown with the run, by
-    name."""
+    """What a run given a manifest reported: its verdict, `0`, `1` or one of
+    `VERDICT_WORDS`, the outputs it gives, and the files only shown with the
+    run, by name."""
 
-    accepted: bool
+    verdict: str
     outputs: dict[str, object]
     shown: dict[str, bytes]
+
+    @property
+    def accepted(self) -> bool:
+        """Whether the verdict is `0`, under which the reports count."""
+        return self.verdict == "0"
 
 
 @dataclass(frozen=True)
@@ -880,7 +892,7 @@ def reported(item: Item, outcome: str, folder: Path, out: Path) -> dict[str, obj
     report does not hold: an error of the step, retried and then left for
     staff, unless the run is `self_reported`, when what the entrant's code
     did is the run's own outcome, its limit or a `runtime_error`, with no
-    report.
+    report. A `self_reported` run's verdict word is a `runtime_error` too.
     """
     if outcome != "accepted":
         if item.self_reported:
@@ -895,6 +907,8 @@ def reported(item: Item, outcome: str, folder: Path, out: Path) -> dict[str, obj
         if item.self_reported:
             return {"outcome": "runtime_error"}
         raise PrimitiveError(f"the report of run {item.run} {fault}") from None
+    if item.self_reported and report.verdict in VERDICT_WORDS:
+        return {"outcome": "runtime_error"}
     outputs = dict(report.outputs)
     if report.shown:
         extras = out / "extras"
@@ -902,22 +916,28 @@ def reported(item: Item, outcome: str, folder: Path, out: Path) -> dict[str, obj
         for name, content in report.shown.items():
             (extras / name).write_bytes(content)
         outputs["extras"] = {"folder": f"out/{item.number}/extras"}
-    outputs["outcome"] = verdict_outcome(report.accepted)
+    outputs["outcome"] = verdict_outcome(report.verdict)
     return outputs
 
 
-def verdict_outcome(accepted: bool) -> str:
+def verdict_outcome(verdict: str) -> str:
     """The outcome a report's verdict gives: `0`, judged and counted, is
-    `accepted`, and `1` is `wrong_answer`."""
-    return "accepted" if accepted else "wrong_answer"
+    `accepted`, `1` is `wrong_answer`, and a word of `VERDICT_WORDS` is that
+    outcome."""
+    if verdict == "0":
+        return "accepted"
+    if verdict == "1":
+        return "wrong_answer"
+    return verdict
 
 
 def read_report(folder: Path, manifest: dict[str, Declared]) -> Report:
     """Read what a run wrote to its report folder, against what its manifest
     declares, raising `ReportError` when it does not hold: no `verdict`, or
-    one that is not `0` or `1`; under `0`, a declared report that is not
-    optional missing, or a number that is not a finite decimal or lies
-    outside its bounds; on either verdict, a file that is not UTF-8 text
+    one that is not `0`, `1` or a word of `VERDICT_WORDS`, under which, as
+    under `1`, the reports are shown unchecked; under `0`, a declared report
+    that is not optional missing, or a number that is not a finite decimal
+    or lies outside its bounds; on any verdict, a file that is not UTF-8 text
     without a NUL, as every file is shown as text, a file over
     `REPORT_TEXT_LIMIT`, more than `REPORT_FILES` of them, or anything there
     that is not a plain file under a plain name.
@@ -925,15 +945,17 @@ def read_report(folder: Path, manifest: dict[str, Declared]) -> Report:
     files = report_files(folder)
     if "verdict" not in files:
         raise ReportError("has no verdict")
-    verdict = files.pop("verdict").strip()
-    if verdict not in (b"0", b"1"):
-        raise ReportError(f"has a verdict {shown_bytes(verdict)}, not 0 or 1")
-    accepted = verdict == b"0"
+    written = files.pop("verdict").strip()
+    verdict = written.decode("ascii", "replace")
+    if verdict not in ("0", "1", *VERDICT_WORDS):
+        raise ReportError(
+            f"has a verdict {shown_bytes(written)}, not 0, 1 or an outcome word"
+        )
     outputs: dict[str, object] = {}
     for name in TEXTS:
         if name in files:
             outputs[name] = report_text(name, files.pop(name))
-    if accepted:
+    if verdict == "0":
         for name, port in manifest.items():
             if name not in files:
                 if not port.optional:
@@ -946,19 +968,34 @@ def read_report(folder: Path, manifest: dict[str, Declared]) -> Report:
                 outputs[name] = report_number(name, content, port)
     for name, content in files.items():
         report_text(name, content)
-    return Report(accepted, outputs, files)
+    return Report(verdict, outputs, files)
 
 
 def report_files(folder: Path) -> dict[str, bytes]:
     """Every file in a report folder by name, each read whole, none through a
     link: a run that left a link there to a file it may not read, the next
-    run's input, would have exec read that file for it. The folder is listed
-    only as far as one file past `REPORT_FILES`, so a run that left a
-    million costs exec no more.
+    run's input, would have exec read that file for it. The folder itself is
+    opened without following a link, since the box's user owns `/box` and
+    could put a link in its place, and everything in it is opened through
+    that descriptor. The folder is listed only as far as one file past
+    `REPORT_FILES`, so a run that left a million costs exec no more.
     """
+    try:
+        directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ReportError(f"could not be opened: {error.strerror}") from None
+    try:
+        return folder_files(directory)
+    finally:
+        os.close(directory)
+
+
+def folder_files(directory: int) -> dict[str, bytes]:
+    """Every plain file in the report folder open on `directory`, by name,
+    each opened through that descriptor, never through a link."""
     entries: list[str] = []
     try:
-        with os.scandir(folder) as listing:
+        with os.scandir(directory) as listing:
             for entry in listing:
                 entries.append(entry.name)
                 if len(entries) > REPORT_FILES:
@@ -972,19 +1009,37 @@ def report_files(folder: Path) -> dict[str, bytes]:
             raise ReportError(f"holds {shown}, not a plain name")
         try:
             descriptor = os.open(
-                folder / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
             )
         except OSError:
             raise ReportError(f"holds {name}, not a plain file") from None
-        if not S_ISREG(os.fstat(descriptor).st_mode):
+        try:
+            if not S_ISREG(os.fstat(descriptor).st_mode):
+                raise ReportError(f"holds {name}, not a plain file")
+            content = read_capped(descriptor, REPORT_TEXT_LIMIT + 1)
+        except OSError as error:
+            raise ReportError(
+                f"holds {name}, which could not be read: {error.strerror}"
+            ) from None
+        finally:
             os.close(descriptor)
-            raise ReportError(f"holds {name}, not a plain file")
-        with os.fdopen(descriptor, "rb") as stream:
-            content = stream.read(REPORT_TEXT_LIMIT + 1)
         if len(content) > REPORT_TEXT_LIMIT:
             raise ReportError(f"holds {name}, over {REPORT_TEXT_LIMIT // 1024} KB")
         files[name] = content
     return files
+
+
+def read_capped(descriptor: int, limit: int) -> bytes:
+    """Up to `limit` bytes of an open file, read to its end or the limit."""
+    chunks: list[bytes] = []
+    read = 0
+    while read < limit:
+        chunk = os.read(descriptor, limit - read)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        read += len(chunk)
+    return b"".join(chunks)
 
 
 def report_text(name: str, content: bytes) -> str:

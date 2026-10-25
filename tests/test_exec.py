@@ -138,7 +138,10 @@ def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
     """
     reported = {
         primitive.judge(make_run(**changes), ITEM, kind) for changes, kind, _ in JUDGED
-    } | {primitive.verdict_outcome(accepted) for accepted in (True, False)}
+    } | {
+        primitive.verdict_outcome(verdict)
+        for verdict in ("0", "1", *primitive.VERDICT_WORDS)
+    }
 
     outcomes = declaration()["outputs"]["outcome"]["outcomes"]
 
@@ -1219,7 +1222,7 @@ def test_a_report_gives_its_reports_and_texts_and_shows_the_rest(
     )
     report = primitive.read_report(folder, DIFF)
     assert report == primitive.Report(
-        accepted=True,
+        verdict="0",
         outputs={
             "score": 0.5,
             "label": "partial",
@@ -1241,6 +1244,25 @@ def test_a_wrong_verdict_shows_its_reports_unchecked(tmp_path: Path) -> None:
     assert not report.accepted
     assert report.outputs == {"message": "wrong on line 2"}
     assert report.shown == {"score": b"oops"}
+
+
+@pytest.mark.parametrize("word", primitive.VERDICT_WORDS)
+def test_an_outcome_word_is_a_verdict_and_shows_its_reports_unchecked(
+    tmp_path: Path, word: str
+) -> None:
+    """A program that judged another's run, as `unicon/interactive`'s
+    verdict script does, says whose limit it was; as under `1`, the reports
+    don't count."""
+    folder = write_report(
+        tmp_path / "report",
+        {"verdict": f"{word}\n".encode(), "score": b"oops", "label": b"slow"},
+    )
+    report = primitive.read_report(folder, DIFF)
+    assert report.verdict == word
+    assert not report.accepted
+    assert report.outputs == {"label": "slow"}
+    assert report.shown == {"score": b"oops"}
+    assert primitive.verdict_outcome(report.verdict) == word
 
 
 def test_an_optional_report_may_be_left_out(tmp_path: Path) -> None:
@@ -1280,10 +1302,13 @@ def test_a_number_is_a_decimal_as_json_writes_one(
     ("files", "message"),
     [
         ({}, "has no verdict"),
-        ({"verdict": b""}, "has a verdict '', not 0 or 1"),
-        ({"verdict": b"2"}, "has a verdict '2', not 0 or 1"),
-        ({"verdict": b"0 1"}, "has a verdict '0 1', not 0 or 1"),
-        ({"verdict": b"accepted"}, "has a verdict 'accepted', not 0 or 1"),
+        ({"verdict": b""}, "has a verdict '', not 0, 1 or an outcome word"),
+        ({"verdict": b"2"}, "has a verdict '2', not 0, 1 or an outcome word"),
+        ({"verdict": b"0 1"}, "has a verdict '0 1', not 0, 1 or an outcome"),
+        ({"verdict": b"accepted"}, "has a verdict 'accepted', not 0, 1 or an"),
+        ({"verdict": b"wrong_answer"}, "has a verdict 'wrong_answer', not 0"),
+        ({"verdict": b"Time_limit"}, "has a verdict 'Time_limit', not 0"),
+        ({"verdict": b"time_limit 1"}, "has a verdict 'time_limit 1', not 0"),
         ({"verdict": b"0"}, "has no score, which the manifest declares"),
         ({"verdict": b"0", "score": b"nan"}, "has score 'nan', not a decimal"),
         ({"verdict": b"0", "score": b"inf"}, "has score 'inf', not a decimal"),
@@ -1384,6 +1409,21 @@ def test_a_program_given_a_manifest_reports_through_its_folder(
     assert printed(tmp_path / "work", outputs["main-2"]) == "reported\n"
 
 
+def test_a_program_given_a_manifest_may_name_an_outcome_as_its_verdict(
+    run: Any, tmp_path: Path
+) -> None:
+    """An outcome word is the run's outcome, its texts outputs and its
+    reports shown."""
+    result = run(
+        [("main-1", "report\nverdict time_limit\nscore 1\nmessage too slow")],
+        manifest=SCORE,
+    )
+    outputs = reporting(tmp_path / "work", result)["main-1"]
+    assert outputs["outcome"] == "time_limit"
+    assert outputs["message"] == "too slow"
+    assert outputs["extras"] == {"score": "1\n"}
+
+
 def test_each_run_reports_into_a_fresh_folder(run: Any, tmp_path: Path) -> None:
     """The folder is outside the run's working directory, in its box, and
     what one run left in its folder is not there for the next."""
@@ -1437,6 +1477,8 @@ def test_a_program_that_does_not_judge_is_an_error_of_the_step(
         ("spin\n", "time_limit"),
         ("report\nverdict 0\nscore 1e99999999999999999999", "runtime_error"),
         ("report-bad-name\n", "runtime_error"),
+        ("report\nverdict time_limit", "runtime_error"),
+        ("report\nverdict memory_limit\nscore 1", "runtime_error"),
         ("report\nverdict 0\nscore 1", "accepted"),
     ],
 )
@@ -1444,7 +1486,9 @@ def test_a_self_reported_run_that_does_not_judge_is_the_entrants(
     run: Any, stdin: str, outcome: str
 ) -> None:
     """Where the program runs the entrant's code, what it did is the run's
-    own outcome, never a fault (`SIMPLER-CORE.md` 7.3), with no report."""
+    own outcome, never a fault (`SIMPLER-CORE.md` 7.3), with no report, and
+    an outcome word it writes is a `runtime_error`, so the entrant's code
+    never chooses its own."""
     result = run(
         [("main-1", stdin)], manifest=SCORE, self_reported=True, time_limit=0.5
     )
@@ -1466,6 +1510,23 @@ def test_a_link_in_the_report_folder_reads_nothing_for_the_run(
     )
     assert "the report of run main-1 has no score" in result["error"]
     assert "hidden" not in json.dumps(result)
+
+
+def test_a_report_folder_swapped_for_a_link_reads_nothing_for_the_run(
+    run: Any, tmp_path: Path
+) -> None:
+    """The box's user owns `/box`, so a run can put a link where its report
+    folder was, to a folder of root's the box cannot name; exec opens the
+    folder without following it, so the report does not hold and nothing
+    of root's is read."""
+    hidden = tmp_path / "hidden"
+    hidden.mkdir(mode=0o700)
+    (hidden / "verdict").write_text("0\n")
+    (hidden / "token").write_text("root-only-secret\n")
+    (hidden / "token").chmod(0o600)
+    result = run([("main-1", f"report-swap\n{hidden}\n")], manifest=SCORE)
+    assert "the report of run main-1 could not be opened" in result["error"]
+    assert "root-only" not in json.dumps(result)
 
 
 @pytest.mark.parametrize(

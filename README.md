@@ -86,10 +86,17 @@ echo "extra space on line 3" > $UNICON_REPORT/message
 
 | File | Required | Becomes |
 |---|---|---|
-| `verdict` | yes | `0`: the outcome is `accepted` and the reports count; `1`: `wrong_answer` |
-| `label`, `message`, `staff_message` | no | the text outputs of those names, on either verdict |
-| a report the manifest declares | on `0`, unless `optional` | an output of its name on `0`; on `1` a file in `extras`, shown and not counted |
+| `verdict` | yes | `0`: the outcome is `accepted` and the reports count; `1`: `wrong_answer`; `time_limit`, `memory_limit`, `output_limit` or `runtime_error`: that outcome |
+| `label`, `message`, `staff_message` | no | the text outputs of those names, on any verdict |
+| a report the manifest declares | on `0`, unless `optional` | an output of its name on `0`; on any other verdict a file in `extras`, shown and not counted |
 | any other name | no | a file in `extras` |
+
+**An outcome word** as the verdict is for a program that judged another
+program's run, not its own output: `unicon/interactive`'s verdict script
+reads the facts `interact` gives of the entrant and the judge, and writes
+`time_limit` when the entrant ran out of time. Under a word, as under `1`,
+the reports are shown and not counted. From a `self_reported` run a word is
+its `runtime_error`, so the entrant's code never chooses its own outcome.
 
 **The manifest** is the program's `program.yaml` in its JSON form, which
 the forge writes from the YAML it read and checked at the save, so exec has
@@ -112,9 +119,9 @@ number is a decimal as JSON writes one, `1e-05` among them, with spaces and
 newlines around it, finite as a double and inside its bounds, compared as
 the decimal written; a text is UTF-8 without a NUL, its trailing newlines
 left off. The report does not hold when `verdict` is missing or is not
-`0` or `1`; under `0`, a declared report that is not optional is missing,
+`0`, `1` or one of the four words; under `0`, a declared report that is not optional is missing,
 or a number is not a finite decimal (`nan`, `1e999`) or is outside its
-bounds; or, on either verdict, any file in the folder is not UTF-8 text
+bounds; or, on any verdict, any file in the folder is not UTF-8 text
 without a NUL, since every file is shown as text, is over 64 KB, or is not
 a plain file under a plain name, links included, or there are more than
 64 files. A symbolic link the run leaves there is gone before exec reads
@@ -126,12 +133,13 @@ crashes, exits non-zero or breaks a limit, has not judged: the step is an
 `error`, which the forge retries once and then leaves for staff. A
 `self_reported` run is the exception: it runs the entrant's code, as a test
 harness that imports the entrant's module does, so a report that does not
-hold is its `runtime_error`, and a crash or a limit its own outcome, with no
-report, as for any run. Its report is only as honest as the entrant's code:
-that code runs in the same process, with `UNICON_REPORT` in reach, and can
-write a verdict of its own. A task that needs a verdict the entrant cannot
-write gives the judging to a program the entrant's code does not run in,
-such as `interact`'s partner.
+hold, or one whose verdict is an outcome word, is its `runtime_error`, and
+a crash or a limit its own outcome, with no report, as for any run. Its
+report is only as honest as the entrant's code: that code runs in the same
+process, with `UNICON_REPORT` in reach, and can write a verdict of its own.
+A task that needs a verdict the entrant cannot write gives the judging to a
+program the entrant's code does not run in, such as the judge `interact`
+runs beside it.
 
 The folder is in the run's box, so it is fresh for each run and goes with
 the box: nothing one run reports is there for the next. A program given no
@@ -392,6 +400,13 @@ the process limit and the keyrings are per user. exec runs one box at a
 time and so uses the first; it takes a range so that a step that runs boxes
 side by side, as `interact` does, is given its users the same way. Without
 it, or with a range out of bounds, exec does not start.
+
+**Its twin.** `primitive-interact`'s `src/interact.py` holds a copy of this
+box handling under the same names and in the same order: `box_users`,
+`set_up_step` and what it calls, `fresh_box`, `close_box`, `isolate_box`,
+`mount` and `unmount`, `pump`, `read_meta`, `isolate_said`, the isolate
+command line, the report and `judge`. A change to one is made to the other,
+with the keyrings patch and the image's isolate stage.
 
 **The machine** needs cgroup v2 with the CPU and memory controllers, and
 the container a cgroup namespace of its own, Docker's default on cgroup v2.

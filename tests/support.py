@@ -660,6 +660,12 @@ elif case == "report-link":
     open(os.path.join(folder, "verdict"), "w").write("0")
     os.symlink(target, os.path.join(folder, "message"))
     print("linked")
+elif case == "report-swap":
+    target = sys.stdin.readline().strip()
+    folder = os.environ["UNICON_REPORT"]
+    os.rename(folder, folder + "-gone")
+    os.symlink(target, folder)
+    print("swapped")
 elif case == "report-bad-name":
     folder = os.environ["UNICON_REPORT"].encode()
     open(folder + b"/verdict", "w").write("0")
