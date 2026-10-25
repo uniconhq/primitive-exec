@@ -246,6 +246,120 @@ def test_a_run_reads_nothing_another_run_left(
     assert printed(work, outputs["main/peek"]).splitlines() == peeked("/work")
 
 
+@pytest.mark.parametrize("kind", ["shm", "msg", "sem"])
+def test_a_run_finds_no_system_v_object_an_earlier_run_left(
+    tmp_path: Path, run_image: RunImage, kind: str
+) -> None:
+    """A shared memory segment, a message queue or a semaphore set one run
+    makes is removed before the next, which could otherwise read in it what
+    the first was given.
+    """
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [
+        ("main/leave", f"leave-sysv\n{kind} 1\n"),
+        ("main/find", f"find-sysv\n{kind}\n"),
+    ]
+    outputs = run_batch(run_image, work, binary, items)
+    assert outcomes(outputs) == {"main/leave": "accepted", "main/find": "accepted"}
+    assert printed(work, outputs["main/leave"]) == f"made {kind} 1\n"
+    assert printed(work, outputs["main/find"]) == f"found {kind} 0\n"
+
+
+def test_a_run_that_leaves_many_segments_leaves_none(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [("main/leave", "leave-sysv\nshm 100\n"), ("main/find", "find-sysv\nshm\n")]
+    outputs = run_batch(run_image, work, binary, items)
+    assert printed(work, outputs["main/leave"]) == "made shm 100\n"
+    assert printed(work, outputs["main/find"]) == "found shm 0\n"
+
+
+def test_a_run_finds_no_mark_an_earlier_run_set_on_the_binary(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """Each item runs a copy of the binary of its own, so an attribute or a
+    time one run sets on it is gone for the next."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [("main/mark", "mark\n"), ("main/read", "read-mark\n")]
+    outputs = run_batch(run_image, work, binary, items, owned=True)
+    assert printed(work, outputs["main/mark"]) == "marked\n"
+    assert printed(work, outputs["main/read"]) == "no attribute\ntime fresh\n"
+
+
+def test_a_run_finds_no_attribute_an_earlier_run_set_on_a_file_it_named(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """An extended attribute is no place to keep work for the next test:
+    one set on the next item's input, on `out/` or on the run's own output,
+    files it can name and write though Landlock keeps it from reading
+    them, is gone for the next run."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    paths = "/work/in/3/input /work/out /work/out/1/output"
+    items = [
+        ("main/mark", f"mark-paths\n{paths}\n"),
+        ("main/read", f"read-paths\n{paths}\n"),
+    ]
+    outputs = run_batch(run_image, work, binary, items)
+    marked = printed(work, outputs["main/mark"]).splitlines()
+    assert [line.split()[0] for line in marked] == ["marked", "marked", "marked"]
+    found = printed(work, outputs["main/read"]).splitlines()
+    assert [line.split()[0] for line in found] == ["none", "none", "none"]
+
+
+def test_a_run_that_locks_what_it_marked_leaves_no_attribute(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """A run that takes the access away from what it marked, a file by
+    `chmod 0444` and a folder by `chmod 0`, still leaves nothing for the next
+    run: each path is given back before its attributes are removed."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    paths = "/work/in/3/input /work/out/1/output /work/in/3"
+    items = [
+        ("main/mark", "mark-and-lock\n"),
+        ("main/read", f"read-paths\n{paths}\n"),
+    ]
+    outputs = run_batch(run_image, work, binary, items, owned=True)
+    assert outcomes(outputs) == {"main/mark": "accepted", "main/read": "accepted"}
+    assert printed(work, outputs["main/mark"]) == "marked and locked\n"
+    found = printed(work, outputs["main/read"]).splitlines()
+    assert [line.split()[0] for line in found] == ["none", "none", "none"]
+
+
+def test_a_run_that_locks_its_own_copy_does_not_stop_the_next(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """A run can name its copy of the binary, the scratch folder it is in and
+    the binary under `in/`, and take this program's access to them away; the
+    next item still gets its copy, so no run can end the batch in an error."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [("main/lock", "lock-scratch\n"), ("main/next", "double\n21\n")]
+    outputs = run_batch(run_image, work, binary, items, owned=True)
+    assert outcomes(outputs) == {"main/lock": "accepted", "main/next": "accepted"}
+    assert printed(work, outputs["main/lock"]) == "locked\n"
+    assert printed(work, outputs["main/next"]) == "42\n"
+
+
+def test_a_run_can_make_no_posix_message_queue(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """A POSIX queue outlives its process and none can be listed to remove,
+    so a run is given no bytes for one, and the next run finds none."""
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [("main/leave", "leave-mq\n"), ("main/find", "find-mq\n")]
+    outputs = run_batch(run_image, work, binary, items)
+    assert outcomes(outputs) == {"main/leave": "accepted", "main/find": "accepted"}
+    assert printed(work, outputs["main/leave"]).split()[0] == "refused"
+    assert printed(work, outputs["main/find"]) == f"none {errno.ENOENT}\n"
+
+
 def test_a_hostile_run_cannot_reach_the_program_that_watches_it(
     tmp_path: Path, run_image: RunImage
 ) -> None:

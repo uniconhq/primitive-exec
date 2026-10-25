@@ -16,13 +16,16 @@ and every item reports its time and memory whatever its outcome.
 `error` in `outputs.json` is kept for the cases where the primitive could not
 work at all, such as a missing input or a binary in no format it runs.
 
-Each run is a fresh process in a fresh empty directory, with every process it
-left behind killed before the next item starts. Every run is put under
+Each run is a fresh process in a fresh empty directory, running a fresh copy
+of the binary, with every process it left behind killed, and every System V
+shared memory segment, message queue and semaphore set and every `user`
+extended attribute under the working directory it left removed, before the
+next item starts. Every run is put under
 Landlock: it may write only inside that directory and to /dev/null, read only
 the system's own directories, its binary and that directory, and may not
 trace anything outside itself, and from Landlock ABI 6 it may not signal
-anything outside itself either. A kernel without Landlock is an error of the
-step: the runs are not started unconfined.
+anything outside itself either. A kernel without Landlock ABI 3 is an error of
+the step: the runs are not started less confined.
 """
 
 import ctypes
@@ -97,11 +100,11 @@ SYS_LANDLOCK_CREATE_RULESET = 444
 SYS_LANDLOCK_ADD_RULE = 445
 LANDLOCK_CREATE_RULESET_VERSION = 1
 LANDLOCK_RULE_PATH_BENEATH = 1
-MINIMUM_LANDLOCK_ABI = 1
+MINIMUM_LANDLOCK_ABI = 3
 """Reads and writes can both be confined from the first Landlock ABI, Linux
-5.13. Later ABIs add what a run is kept from on top: renaming across
-directories is refused outright below ABI 2, `truncate` of a file named by
-path is confined from ABI 3, and signals from ABI 6.
+5.13, but below ABI 3, Linux 6.2, `truncate` of a file named by path is not,
+so a run could empty a file it may only read. Renaming across directories is
+confined from ABI 2, and signals from ABI 6, which a run is kept from on top.
 """
 FS_WRITE_FILE = 1 << 1
 FS_READ_FILE = 1 << 2
@@ -132,6 +135,19 @@ READABLE_DEVICES = ("/dev/zero", "/dev/random", "/dev/urandom")
 """Devices a run may read besides /dev/null, which it may also write."""
 SCOPE_ABSTRACT_UNIX_SOCKET = 1 << 0
 SCOPE_SIGNAL = 1 << 1
+SYSVIPC = Path("/proc/sysvipc")
+"""The kernel's tables of the System V objects in this program's IPC
+namespace, the step container's own, one line each after a header."""
+NO_SYSVIPC = (
+    "sandbox-run: this machine shows no /proc/sysvipc, so System V objects a run "
+    "leaves cannot be found and removed; a kernel without them has none to leave"
+)
+IPC_RMID = 0
+GONE = frozenset({errno.EINVAL, errno.EIDRM})
+"""What removing a System V object answers when it is already gone."""
+NO_ATTRIBUTES = frozenset({errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP})
+"""What listing or removing an attribute answers for a path that is gone, or
+on a filesystem without attributes."""
 
 
 class PrimitiveError(Exception):
@@ -416,6 +432,8 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
     prctl(PR_SET_DUMPABLE, 0)
     if own_cgroup() is None:
         print(NO_CGROUP, file=sys.stderr)
+    if not SYSVIPC.is_dir():
+        print(NO_SYSVIPC, file=sys.stderr)
     previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         return run_all(root, items)
@@ -424,7 +442,14 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
 
 
 def run_all(root: Path, items: list[Item]) -> list[dict[str, object]]:
-    """Run the items one after another, each binary prepared once.
+    """Run the items one after another, in the order given, each on a copy of
+    its binary of its own.
+
+    A run may take this program's access away from the binary under `in/`
+    and from the scratch folder its copy is in, both of which it can name, so
+    each is given back before the copy is made and before it is removed: a
+    run that could make the next copy fail would end the whole batch in an
+    error, which a hidden test's run could do or not by what its input holds.
 
     Nothing runs unless the kernel offers Landlock at `MINIMUM_LANDLOCK_ABI`
     or later: without it a run could read the other tests' inputs and outputs
@@ -433,17 +458,24 @@ def run_all(root: Path, items: list[Item]) -> list[dict[str, object]]:
     abi = landlock_abi()
     if abi < MINIMUM_LANDLOCK_ABI:
         raise PrimitiveError(
-            "this machine's kernel does not offer Landlock, which every run is "
-            "confined with; it needs Linux 5.13 or later with Landlock enabled"
+            "this machine's kernel does not offer Landlock ABI 3, which every run "
+            "is confined with; it needs Linux 6.2 or later with Landlock enabled"
         )
     scratch = Path(tempfile.mkdtemp(prefix=".sandbox-run-", dir=root))
-    programs: dict[Path, Program] = {}
+    kinds: dict[Path, str] = {}
     results: list[dict[str, object]] = []
     try:
         for item in items:
-            if item.binary not in programs:
-                programs[item.binary] = prepare(item.binary, scratch, len(programs))
-            outputs = run_item(root, item, programs[item.binary], abi)
+            give_back_along(root, item.binary)
+            give_back(scratch)
+            if item.binary not in kinds:
+                kinds[item.binary] = detect(item.binary)
+            program = prepare(item, kinds[item.binary], scratch)
+            try:
+                outputs = run_item(root, item, program, abi)
+            finally:
+                give_back(scratch)
+                program.path.unlink(missing_ok=True)
             results.append({"test": item.test, "outputs": outputs})
     finally:
         give_back_tree(root)
@@ -472,19 +504,20 @@ def detect(binary: Path) -> str:
     )
 
 
-def prepare(binary: Path, scratch: Path, number: int) -> Program:
-    """Get a binary ready to run.
+def prepare(item: Item, kind: str, scratch: Path) -> Program:
+    """Get the item's binary, of format `kind`, ready to run: copied into the
+    scratch directory for this item alone, and for a native executable marked
+    executable there, since the file under `in/` may not be.
 
-    A native executable is copied into the scratch directory and marked
-    executable there, since the copy under `in/` may not be; the other two
-    formats are read by their interpreter where they are.
+    A run is this program's user, so it may set an attribute, a mode or a
+    time on the file it runs, which Landlock does not stop; a copy of its own,
+    removed after it, leaves none of them for the next item. The copy is made
+    before the item's clock starts, so its time is not the run's.
     """
-    kind = detect(binary)
-    if kind != "native":
-        return Program(kind, binary)
-    path = scratch / f"program-{number}"
-    shutil.copyfile(binary, path)
-    path.chmod(0o755)
+    path = scratch / f"program-{item.number}"
+    shutil.copyfile(item.binary, path)
+    if kind == "native":
+        path.chmod(0o755)
     return Program(kind, path)
 
 
@@ -516,6 +549,8 @@ def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, ob
                 run = execute(program, cwd, stdin, stdout, item, abi)
     finally:
         reap_strays()
+        sweep_sysv()
+        clear_attributes(root)
         give_back_tree(cwd)
         shutil.rmtree(cwd, ignore_errors=True)
         give_back_along(root, output)
@@ -714,8 +749,13 @@ def child_setup(item: Item) -> Callable[[], None]:
     def setup() -> None:
         """Set the run's resource limits, put the run first in line for the
         kernel's out-of-memory killer, and let SIGINT act again.
+
+        A POSIX message queue outlives the process that made it, as a System
+        V object does, and none can be listed to remove it, so a run may make
+        none: `RLIMIT_MSGQUEUE` at 0 gives it no bytes for one.
         """
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_MSGQUEUE, (0, 0))
         resource.setrlimit(resource.RLIMIT_FSIZE, (OUTPUT_LIMIT + 1, OUTPUT_LIMIT + 1))
         cpu = math.ceil(item.time_limit) + 1
         resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
@@ -936,6 +976,102 @@ def reap_strays() -> None:
     raise PrimitiveError("processes left behind by a run could not be stopped")
 
 
+def sweep_sysv() -> None:
+    """Remove every System V shared memory segment, message queue and
+    semaphore set in this program's IPC namespace, once a run's processes are
+    gone, so no run finds what an earlier one left.
+
+    The step container has an IPC namespace of its own, and every run is
+    this program's user, so every object in it is one a run made and this
+    program may remove. One that cannot be removed, for any reason but being
+    gone already, is an error of the step: it would carry one run's data to
+    the next. Without `SYSVIPC` the kernel has no System V objects to leave.
+    """
+    for kind in ("shm", "msg", "sem"):
+        try:
+            lines = (SYSVIPC / kind).read_text().splitlines()[1:]
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            remove_sysv(kind, int(line.split()[1]))
+
+
+def remove_sysv(kind: str, identifier: int) -> None:
+    """Remove one System V object of `kind` by its id, `IPC_RMID`."""
+    c = libc()
+    if kind == "sem":
+        result = c.semctl(identifier, 0, IPC_RMID)
+    else:
+        remove = c.shmctl if kind == "shm" else c.msgctl
+        result = remove(identifier, IPC_RMID, None)
+    if result != 0 and ctypes.get_errno() not in GONE:
+        raise PrimitiveError(
+            f"a System V object a run left, {kind} {identifier}, could not be "
+            f"removed: {os.strerror(ctypes.get_errno())}"
+        )
+
+
+def clear_attributes(top: Path) -> None:
+    """Remove every extended attribute in the `user` namespace from `top` and
+    everything under it, once a run's processes are gone.
+
+    A run may set one on any file or folder it can name and write, which
+    Landlock does not stop: the next item's input, `out/`, its own output.
+    Each holds a few kilobytes, as many as the filesystem allows, so a run
+    could keep work there for the next one. It may set no other namespace
+    without a capability. A run may also take this program's access away
+    from what it set one on, with `chmod`, which Landlock does not stop
+    either, so each path is given back before its attributes are listed or
+    removed, and a folder before what is in it. A path that is gone, or a
+    filesystem without attributes, is passed over; an attribute that still
+    can't be removed is a `PrimitiveError`, since the next run would find it.
+    """
+    folders = [top]
+    while folders:
+        folder = folders.pop()
+        give_back(folder)
+        clear_attributes_of(folder)
+        try:
+            entries = list(os.scandir(folder))
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise PrimitiveError(
+                f"a folder a run could have marked, {folder}, could not be "
+                f"listed: {error.strerror}"
+            ) from error
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                folders.append(Path(entry.path))
+            elif not entry.is_symlink():
+                give_back(Path(entry.path))
+                clear_attributes_of(Path(entry.path))
+
+
+def clear_attributes_of(path: Path) -> None:
+    """Remove the `user` attributes of one path, not following a link."""
+    try:
+        names = os.listxattr(path, follow_symlinks=False)
+    except OSError as error:
+        if error.errno in NO_ATTRIBUTES:
+            return
+        raise PrimitiveError(
+            f"the attributes a run could have set on {path} could not be "
+            f"listed: {error.strerror}"
+        ) from error
+    for name in names:
+        if name.startswith("user."):
+            try:
+                os.removexattr(path, name, follow_symlinks=False)
+            except OSError as error:
+                if error.errno in NO_ATTRIBUTES | {errno.ENODATA}:
+                    continue
+                raise PrimitiveError(
+                    f"an attribute a run set on {path} could not be removed: "
+                    f"{error.strerror}"
+                ) from error
+
+
 def give_back(path: Path, needed: int | None = None) -> None:
     """Give this program's user back what it needs of `path`, should a run
     have taken it away: reading and writing a file (or `needed`), and also
@@ -1017,7 +1153,8 @@ def child_pids() -> list[int]:
 
 
 def libc() -> ctypes.CDLL:
-    """The C library, for prctl and the Landlock system calls."""
+    """The C library, for prctl, the Landlock system calls and removing
+    System V objects."""
     return ctypes.CDLL(None, use_errno=True)
 
 
@@ -1066,21 +1203,15 @@ def landlock_ruleset(directory: Path, readable: list[Path], abi: int) -> int:
     input and output, stay usable. `sandbox-exec` enforces it on the binary
     alone, just before exec, so neither it nor this program is inside.
     """
-    handled = (
-        FS_WRITES
-        | FS_READS
-        | (FS_REFER if abi >= 2 else 0)
-        | (FS_TRUNCATE if abi >= 3 else 0)
-    )
+    handled = FS_WRITES | FS_READS | FS_REFER | FS_TRUNCATE
     scoped = SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL if abi >= 6 else 0
     size = 8 if abi < 4 else 16 if abi < 6 else 24
     attr = ctypes.create_string_buffer(
         struct.pack("=QQQ", handled, 0, scoped)[:size], size
     )
-    truncate = FS_TRUNCATE if abi >= 3 else 0
     rules: list[tuple[str, int]] = [
         (str(directory), handled),
-        ("/dev/null", FS_READ_FILE | FS_WRITE_FILE | truncate),
+        ("/dev/null", FS_READ_FILE | FS_WRITE_FILE | FS_TRUNCATE),
     ]
     rules += [
         (str(path), FS_READS if path.is_dir() else FS_READ_FILE) for path in readable

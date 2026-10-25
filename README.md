@@ -20,7 +20,10 @@ workflow that uses the primitive. The program speaks the primitive contract,
 The primitive takes a batch (`batch: true`): one container runs every test,
 so a hundred tests cost one container start rather than a hundred. Each item
 of the batch is keyed by its test, `<group>/<test>`, and `outputs.json`
-answers in the same order under the same tests. Each item has these inputs
+answers in the same order under the same tests. Items run one at a time in
+the order the batch gives them, and the forge puts the tests shown during
+the contest first, since a run can tell the runs after it a little (see
+"What a run can still learn"). Each item has these inputs
 and outputs.
 
 | | Name | Type | What it is |
@@ -68,8 +71,10 @@ The task's save does not check these; the scoring rules rely on them.
   the limit, never the few milliseconds of CPU it used. `memory_kb` is its
   peak memory, 0 for a run that could not start.
 - **Each item is kept apart from the others.** Every test is a new process in
-  a new, empty directory, and no run can read or change another test's
-  files (below).
+  a new, empty directory, running a copy of the binary of its own, and no
+  run can read or change another test's files or find a System V object
+  another left (below). What still carries from one run to the next is
+  listed under "What a run can still learn".
 - **`args` is not `secret`.** It lands on the contestant program's command
   line, where the program reads it, so a task cannot wire a secret into it.
 
@@ -79,9 +84,9 @@ for another contract version; a file is missing or lies outside `in/`; a
 limit is not a positive number, or `args` is not text; an item's test is not
 a test id, or two items are for the same test; the binary is in none of the
 three formats; the interpreter a Python or Java binary needs could not be
-started; the machine's kernel does not offer Landlock, or a run could not be
-put under its Landlock rules; or processes a run left behind could not be
-stopped. The harness turns an error into a `system_error`, so no contestant
+started; the machine's kernel does not offer Landlock ABI 3, or a run could
+not be put under its Landlock rules; or processes or a System V object a run
+left behind could not be stopped or removed. The harness turns an error into a `system_error`, so no contestant
 is graded by a broken step. A native binary the kernel refuses to run as
 built is the contestant's program failing, a `runtime_error`.
 
@@ -89,15 +94,20 @@ built is the contestant's program failing, a `runtime_error`.
 
 For each item, in order:
 
-1. A fresh, empty directory is made under `/tmp` and becomes the run's
+1. The binary is copied into a scratch directory under `/work`, a copy for
+   this item alone, before its clock starts.
+2. A fresh, empty directory is made under `/tmp` and becomes the run's
    working directory, `HOME` and `TMPDIR`. The environment holds only those,
    `PATH` and `LANG=C.UTF-8`.
-2. The input file is opened as standard input, `out/<n>/output` as standard
+3. The input file is opened as standard input, `out/<n>/output` as standard
    output, and standard error goes nowhere.
-3. The binary is started through `sandbox-exec`, with its arguments and its
+4. The copy is started through `sandbox-exec`, with its arguments and its
    limits already set (below), and watched until it ends.
-4. Every process the run left behind is killed and reaped, and the directory
-   is removed.
+5. Every process the run left behind is killed and reaped, every System V
+   shared memory segment, message queue and semaphore set it left is
+   removed, every `user` extended attribute under `/work` is removed, and
+   the directory and the copy are removed. The run could make no POSIX
+   message queue.
 
 Everything a run prints is kept, up to the output limit, even when it failed.
 
@@ -143,13 +153,39 @@ time and peak memory from `wait4` on a pipe the binary does not inherit. A C++ p
 
 ## Keeping runs apart
 
-Every test is a new process in a new, empty directory, and nothing a run does
-is visible to the next one:
+Every test is a new process in a new, empty directory, and none of the files,
+processes or System V objects a run leaves is there for the next one:
 
 - **Leftover processes.** The program is the child subreaper of everything it
   starts, so a process that outlives its run, even one that started its own
   session, becomes the program's child. After every run each such child is
   killed and reaped before the next run starts.
+- **System V objects.** The container has an IPC namespace of its own, so
+  every shared memory segment, message queue and semaphore set in it is one
+  a run made. After every run the program reads `/proc/sysvipc` and removes
+  each one; one it cannot remove is an `error` of the step. On a machine
+  without `/proc/sysvipc` the kernel has none to leave, and a warning goes
+  to standard error.
+- **The binary.** Each run gets a copy of the binary of its own, removed
+  after it. A run is the program's user, so it may set an extended
+  attribute, a mode or a time on the file it runs, which Landlock does not
+  stop; on a copy of its own, none of it reaches the next run. Copying
+  costs nothing a run is measured on, and at most about 17 ms a run for a
+  32 MB binary, the largest compile makes, measured on Docker Desktop.
+- **Extended attributes.** A run may set a `user` extended attribute on any
+  file or folder it can name and write, which Landlock does not stop: the
+  next test's input, `out/`, its own output. After every run the program
+  removes every one under `/work`, so none keeps work for the next test. A
+  run may also take the program's access away from what it marked, with
+  `chmod`, so each path is given back first; an attribute that still can't
+  be removed is an `error` of the step.
+- **POSIX message queues.** A queue outlives the process that made it, and
+  the kernel lists none to remove, so a run is given no bytes for one
+  (`RLIMIT_MSGQUEUE` at 0) and can make none.
+- **What the program needs.** A run may take the program's access away from
+  anything it can name and its user owns: the binary under `in/`, its own
+  copy and the folder that copy is in. The program gives each back before
+  it copies the next binary, so no run can end the whole batch in an error.
 - **Files.** Every run is put under [Landlock](https://docs.kernel.org/userspace-api/landlock.html).
   It may create, change or remove files only inside its own directory, plus
   write to `/dev/null`. It may read only its own directory, its binary, the
@@ -175,35 +211,53 @@ is visible to the next one:
   score, so when the container reaches its memory limit the kernel kills
   the run rather than the program.
 
-**The kernel it needs.** Landlock at ABI 1 or later: Linux 5.13 or later,
+**The kernel it needs.** Landlock at ABI 3 or later: Linux 6.2 or later,
 with Landlock among the kernel's security modules (`lsm=`; Docker Desktop's
 kernel has it, and `/sys/kernel/security/lsm` on a machine lists it).
-Without it nothing runs: `outputs.json` carries an `error`, which the harness
-turns into a `system_error`, never a grade. ABI 1 already confines reads and
-writes, which is what keeps tests apart, so the program asks for no more.
-Later ABIs add to it where the kernel has them: from ABI 2 a run may rename
-within its own directory (below it, Landlock refuses every rename across
-directories), from ABI 3 `truncate` of a file named by path is confined too
-(below it a run could shorten or lengthen a file it cannot open, such as
-another test's output, spoiling only its own results), and from ABI 6 it
-cannot signal `sandbox-exec`, as above. Requiring ABI 6 would turn away most
-machines on a 6.1 to 6.11 kernel for a gap that costs only the run itself.
-The worker's self-test on a grading machine (feature 12) should check the
-kernel offers Landlock before the machine takes runs.
-
-What a run can still learn of the tests before it is none of their files'
-contents: that a file it can name exists, and its size, mode and times,
-which Landlock does not confine and which a run can change on a file of its
-own user it can name; the time on the clock; and the free space of `/work`.
-A mode a run takes away from a file or folder of that user is given back
-after it, so the next run and the harness still read and write them.
+Ubuntu 24.04's 6.8 kernel has ABI 4, and Docker Desktop's current one ABI 8.
+Below ABI 3 nothing runs: `outputs.json` carries an `error`, which the
+harness turns into a `system_error`, never a grade. ABI 1 confines reads and
+writes, and ABI 3 adds `truncate` of a file named by path, without which a
+run could empty or lengthen a file it cannot even open, such as another
+test's output, which it can name. Later
+ABIs add to it where the kernel has them: from ABI 2 a run may rename
+within its own directory, and from ABI 6 it cannot signal `sandbox-exec`, as
+above. Requiring ABI 6 would turn away most machines on a 6.1 to 6.11 kernel
+for a gap that costs only the run itself. The worker's self-test on a
+grading machine (feature 12) should check the kernel offers Landlock ABI 3
+before the machine takes runs.
 
 The container itself is the harness's: no network, a read-only root
 filesystem, every capability dropped, `no-new-privileges`, Docker's built-in
 seccomp profile and a non-root user; the image's user is 65532. The only
-writable places are `/work` and a small tmpfs at `/tmp`. Native binaries are
-copied into a scratch directory under `/work`, removed before the program
-exits, because `/tmp` may be mounted `noexec`.
+writable places are `/work` and a small tmpfs at `/tmp`. Each run's copy of
+the binary goes into a scratch directory under `/work`, removed before the
+program exits, because `/tmp` may be mounted `noexec`.
+
+## What a run can still learn
+
+Of the runs before it, a run can learn none of their files' contents and
+none of their System V objects, but a little more, through what the
+container keeps between items:
+
+- **The container's CPU counter** (`cpu.stat` in its cgroup, under `/sys`,
+  which the Java runtime reads): how much CPU the runs before it used, to
+  the microsecond.
+- **The process ID counter:** how many processes the runs before it
+  started, from the ID its own processes get.
+- **The clock:** how long the runs before it took, against a time it can
+  read, such as its input's.
+- **Files it can name:** that one exists, and its size, mode and times,
+  which Landlock does not confine and which a run can change on a file of
+  its own user it can name; and the free space of `/work`. A mode a run
+  takes away from a file or folder of that user is given back after it, so
+  the next run and the harness still read and write them.
+
+Each is a number a run before it can choose, so a run can pass a later one
+a few bits. No cleanup inside one container closes the first three, and
+the clock carries between containers too, so the forge runs the tests shown
+during the contest before the hidden ones: a run can tell only the runs
+after it, and no hidden run comes before a shown one.
 
 ## The container's limits
 
@@ -239,8 +293,8 @@ holding a `__main__.py` at its root, or a zip holding a jar manifest.
 
 | Language | The binary | How sandbox-run runs it |
 |---|---|---|
-| `c`, `cpp` | A statically linked ELF executable | Copied to a scratch directory, marked executable and run directly |
-| `python` | A Python zip application behind the line `#!/usr/bin/env python3`: the source folder under `source/` with its layout, and a `__main__.py` at the root that runs the entry | `python3 -I -B binary`, on the image's Python 3.14 |
+| `c`, `cpp` | A statically linked ELF executable | Its copy marked executable and run directly |
+| `python` | A Python zip application behind the line `#!/usr/bin/env python3`: the source folder under `source/` with its layout, and a `__main__.py` at the root that runs the entry | `python3 -I -B binary` on its copy, on the image's Python 3.14 |
 | `java` | A runnable jar: the compiled classes and a manifest naming the main class | `java -Xmx<memory_limit>m -Xss64m -XX:+UseSerialGC -XX:-UsePerfData -XX:+ExitOnOutOfMemoryError -Djava.io.tmpdir=. -jar binary`, on the image's OpenJDK 21 |
 
 Static linking means a native binary needs nothing from the image it runs

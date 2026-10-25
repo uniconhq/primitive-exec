@@ -4,6 +4,7 @@ The runs use Python binaries on the interpreter running the tests, started
 through a `sandbox-exec` built from this checkout with the host's gcc.
 """
 
+import ctypes
 import errno
 import json
 import os
@@ -41,6 +42,21 @@ def helper(tmp_path_factory: pytest.TempPathFactory) -> str:
     command = ["gcc", "-O2", "-Wall", "-Werror", "-o", str(built), str(source)]
     subprocess.run(command, check=True)
     return str(built)
+
+
+@pytest.fixture(autouse=True)
+def tables(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Stand-in System V tables, empty, so a sweep in these tests never
+    removes an object of the machine running them, which is not a step
+    container with an IPC namespace of its own. The image tests sweep the
+    real ones.
+    """
+    folder = tmp_path / "sysvipc"
+    folder.mkdir()
+    for kind in ("shm", "msg", "sem"):
+        (folder / kind).write_text(f"       key      {kind}id perms\n")
+    monkeypatch.setattr(sandbox_run, "SYSVIPC", folder)
+    return folder
 
 
 @pytest.fixture
@@ -558,17 +574,19 @@ def test_a_run_reads_neither_another_runs_files_nor_the_steps(
     assert lines == peeked(work)
 
 
+@pytest.mark.parametrize("abi", [0, 2], ids=["none", "below-truncate"])
 def test_without_landlock_nothing_runs(
-    run: Any, monkeypatch: pytest.MonkeyPatch
+    run: Any, monkeypatch: pytest.MonkeyPatch, abi: int
 ) -> None:
-    """A kernel without Landlock, or with Landlock turned off, is an error of
-    the step, never a run left unconfined.
+    """A kernel without Landlock, with Landlock turned off, or with an ABI
+    below 3, which cannot keep a run from truncating a file it may only
+    read, is an error of the step, never a run left less confined.
     """
-    monkeypatch.setattr(sandbox_run, "landlock_abi", lambda: 0)
+    monkeypatch.setattr(sandbox_run, "landlock_abi", lambda: abi)
     result = run([("main/ok", "double\n21\n")])
     assert set(result) == {"schema_version", "error"}
-    assert "Landlock" in result["error"]
-    assert "5.13" in result["error"]
+    assert "Landlock ABI 3" in result["error"]
+    assert "Linux 6.2" in result["error"]
 
 
 def test_a_ruleset_the_kernel_refuses_is_an_error(
@@ -593,3 +611,114 @@ def test_the_launcher_starts_nothing_without_a_ruleset(helper: str) -> None:
     os.close(read_end)
     assert done.returncode == 2
     assert sandbox_run.parse_report(report) == {"L": [errno.EBADF]}
+
+
+def test_the_sweep_removes_every_object_the_kernel_lists(
+    tables: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tables / "shm").write_text(
+        "       key      shmid perms\n"
+        "  1592590336          5   600\n"
+        "           0          9  1600\n"
+    )
+    (tables / "sem").write_text("       key      semid perms\n  0   7   600\n")
+    removed: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        sandbox_run, "remove_sysv", lambda kind, ident: removed.append((kind, ident))
+    )
+    sandbox_run.sweep_sysv()
+    assert removed == [("shm", 5), ("shm", 9), ("sem", 7)]
+
+
+def test_an_object_already_gone_is_passed_over() -> None:
+    sandbox_run.remove_sysv("shm", 2**31 - 1)
+    sandbox_run.remove_sysv("msg", 2**31 - 1)
+    sandbox_run.remove_sysv("sem", 2**31 - 1)
+
+
+def test_an_object_that_cannot_be_removed_is_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A segment left behind would carry one run's data to the next."""
+
+    class Refusing:
+        @staticmethod
+        def shmctl(*_: object) -> int:
+            ctypes.set_errno(errno.EPERM)
+            return -1
+
+    monkeypatch.setattr(sandbox_run, "libc", Refusing)
+    with pytest.raises(sandbox_run.PrimitiveError, match="shm 5, could not be removed"):
+        sandbox_run.remove_sysv("shm", 5)
+
+
+def test_an_attribute_on_a_locked_file_or_folder_is_removed(tmp_path: Path) -> None:
+    """A run that marks a path and then takes its access away, which Landlock
+    does not stop, still has its mark removed."""
+    folder = tmp_path / "in" / "3"
+    folder.mkdir(parents=True)
+    marked = folder / "input"
+    marked.write_text("hidden")
+    os.setxattr(marked, "user.cache", b"x")
+    os.setxattr(folder, "user.cache", b"x")
+    marked.chmod(0o444)
+    folder.chmod(0)
+    sandbox_run.clear_attributes(tmp_path)
+    assert os.listxattr(folder) == []
+    assert os.listxattr(marked) == []
+
+
+def test_an_attribute_that_cannot_be_removed_is_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One left behind would carry a run's data to the next."""
+    os.setxattr(tmp_path, "user.cache", b"x")
+
+    def refuse(*_: object, **__: object) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "removexattr", refuse)
+    with pytest.raises(sandbox_run.PrimitiveError, match="could not be removed"):
+        sandbox_run.clear_attributes(tmp_path)
+
+
+def test_a_path_gone_or_without_attributes_is_passed_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unsupported(*_: object, **__: object) -> None:
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(os, "listxattr", unsupported)
+    sandbox_run.clear_attributes(tmp_path)
+    sandbox_run.clear_attributes(tmp_path / "gone")
+
+
+def test_a_machine_without_system_v_tables_warns_and_runs(
+    run: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sandbox_run, "SYSVIPC", tmp_path / "missing")
+    outputs = by_test(run([("main/ok", "double\n21\n")]))
+    assert outputs["main/ok"]["outcome"] == "accepted"
+    assert sandbox_run.NO_SYSVIPC in capsys.readouterr().err
+
+
+def test_a_sweep_with_nothing_to_remove_takes_under_a_millisecond() -> None:
+    started = time.perf_counter()
+    for _ in range(1000):
+        sandbox_run.sweep_sysv()
+    assert time.perf_counter() - started < 1.0
+
+
+def test_each_item_runs_a_copy_of_the_binary_of_its_own(
+    run: Any, tmp_path: Path
+) -> None:
+    """An attribute or a time one run sets on the file it runs, which Landlock
+    does not stop, is gone for the next.
+    """
+    outputs = by_test(run([("main/mark", "mark\n"), ("main/read", "read-mark\n")]))
+    work = tmp_path / "work"
+    assert printed(work, outputs["main/mark"]) == "marked\n"
+    assert printed(work, outputs["main/read"]) == "no attribute\ntime fresh\n"

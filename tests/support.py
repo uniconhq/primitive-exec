@@ -375,4 +375,69 @@ elif case == "interrupt":
     except OSError as error:
         print("refused", error.errno)
     print("still here")
+elif case == "leave-sysv":
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    kind, count = sys.stdin.readline().split()
+    made = 0
+    for key in range(0x5EED0000, 0x5EED0000 + int(count)):
+        if kind == "shm":
+            made += libc.shmget(key, 4096, 0o1600) >= 0
+        elif kind == "msg":
+            made += libc.msgget(key, 0o1600) >= 0
+        else:
+            made += libc.semget(key, 1, 0o1600) >= 0
+    print("made", kind, made)
+elif case == "find-sysv":
+    kind = sys.stdin.readline().strip()
+    with open("/proc/sysvipc/" + kind) as table:
+        print("found", kind, len(table.read().splitlines()) - 1)
+elif case == "mark":
+    os.setxattr(sys.argv[0], "user.leak", b"hidden input")
+    os.utime(sys.argv[0], (1000000000, 1000000000))
+    print("marked")
+elif case == "mark-paths":
+    for path in sys.stdin.read().split():
+        try:
+            os.setxattr(path, "user.cache", b"x" * 1000)
+            print("marked", path)
+        except OSError as error:
+            print("refused", path, error.errno)
+elif case == "read-paths":
+    for path in sys.stdin.read().split():
+        try:
+            print("found", path, len(os.getxattr(path, "user.cache")))
+        except OSError as error:
+            print("none", path, error.errno)
+elif case == "mark-and-lock":
+    files = ["/work/in/3/input", "/work/out/1/output"]
+    for path in files + ["/work/in/3"]:
+        os.setxattr(path, "user.cache", b"x" * 1000)
+    for path in files:
+        os.chmod(path, 0o444)
+    os.chmod("/work/in/3", 0)
+    os.chmod("/work/out", 0)
+    print("marked and locked")
+elif case == "lock-scratch":
+    os.chmod(os.path.dirname(os.path.abspath(sys.argv[0])), 0o500)
+    os.chmod(sys.argv[0], 0)
+    os.chmod("/work/in/1/binary", 0)
+    print("locked")
+elif case == "leave-mq":
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    made = libc.mq_open(b"/leak", os.O_CREAT | os.O_RDWR, 0o600, None)
+    print("made" if made >= 0 else "refused", ctypes.get_errno() if made < 0 else 0)
+elif case == "find-mq":
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    found = libc.mq_open(b"/leak", os.O_RDONLY)
+    print("found" if found >= 0 else "none", ctypes.get_errno() if found < 0 else 0)
+elif case == "read-mark":
+    try:
+        print("attribute", os.getxattr(sys.argv[0], "user.leak").decode())
+    except OSError:
+        print("no attribute")
+    marked = os.stat(sys.argv[0]).st_mtime == 1000000000
+    print("time", "marked" if marked else "fresh")
 """
