@@ -504,7 +504,7 @@ def test_filling_a_tmpfs_is_over_the_memory_limit(run: Any, folder: str) -> None
 def test_too_many_files_in_a_tmpfs_is_over_the_memory_limit(
     run: Any, folder: str
 ) -> None:
-    """A box's tmpfs holds 100,000 files and folders across `.`, `/tmp` and
+    """A box's tmpfs holds 60,000 files and folders across `.`, `/tmp` and
     `/dev/shm`: a program making more is told `ENOSPC`, and interact gives
     `memory_limit`."""
     # Reach the inode cap before the CPU cap, as the single-program case does.
