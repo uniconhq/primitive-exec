@@ -254,7 +254,7 @@ For each item, in order:
    whose clean-up did not run, it is unmounted first. `isolate --cg --init`
    makes the box, and a tmpfs of its own is mounted over its folder,
    `nosuid` and `nodev`, as large as the memory limit plus what exec copies
-   in, holding at most 100,000 files and folders.
+   in, holding at most 60,000 files and folders.
 2. The program is copied into the box as `/box/program`, and each of
    `files` and `loads` into `/box/run`, the run's working directory,
    read-only, before the run's clock starts. A program given a manifest also
@@ -299,7 +299,7 @@ isolate holds every limit but the output's, on the box as a whole.
 | CPU time: `time_limit` seconds | `--time`: the CPU time of every process in the box, added up by its cgroup, and the box killed once over. The time reported is that total, so work hidden in a child that is never waited for still counts |
 | Wall-clock time: twice `time_limit` plus one second | `--wall-time`. It stops a run that sleeps or waits without using the CPU; the margin keeps a busy machine from turning a fast run into a time limit |
 | Memory: `memory_limit` megabytes | `--cg-mem`: the box's own memory cgroup, with no swap, which the kernel holds on every page it charges there and kills the run at. The memory reported is the cgroup's peak. Java also gets `-Xmx` at the limit |
-| Files: the box's tmpfs | As large as the memory limit plus the copies, and 100,000 files and folders, its `/tmp` and `/dev/shm` among them, since both are folders on it. Every page a run writes there is charged to its memory, so writing past the memory limit is `memory_limit`. A run that makes files past the cap gets `ENOSPC`, and exec, finding the tmpfs with none left after the run, gives `memory_limit` too |
+| Files: the box's tmpfs | As large as the memory limit plus the copies, and 60,000 files and folders, its `/tmp` and `/dev/shm` among them, since both are folders on it. Every page a run writes there is charged to its memory, so writing past the memory limit is `memory_limit`. A run that makes files past the cap gets `ENOSPC`, and exec, finding the tmpfs with none left after the run, gives `memory_limit` too |
 | Output: 32 MB | exec reads the pipe up to 32 MB and one byte more, then closes it, so output costs the box no memory. A run that prints on dies of `SIGPIPE`; the output kept is cut to 32 MB |
 | Processes: 128 | `--processes`, `RLIMIT_NPROC` for the box's user: every process and thread of the run, a fork bomb's among them |
 | Stack | `--stack` at the memory limit, so deep recursion is bounded by memory rather than the default 8 MB |
@@ -480,9 +480,9 @@ Docker: the shape picked for every step that runs code, provisionally
    `UNICON_DEV_ROOT_DOCKER=1` on every step, and exec then runs under root
    Docker, saying so on standard error. A grading machine never sets it;
 2. raises its own soft limits on the stack, to 256 MB, and on open files,
-   to 101,024, which isolate and so its boxes inherit. After a run isolate
+   to 61,024, which isolate and so its boxes inherit. After a run isolate
    gives the box's tree back to root folder by folder, holding one open and
-   one stack frame for each level, and a run may nest 100,000 folders deep.
+   one stack frame for each level, and a run may nest 60,000 folders deep.
    The box's own limits are isolate's. Raising a hard limit needs the
    machine's root, so exec refuses to start where the container's hard
    limit on either is lower; Docker's default leaves both high enough;

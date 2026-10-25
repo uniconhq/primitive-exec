@@ -152,7 +152,7 @@ BOX = 0
 GIVEN = ("program", "stdin", "manifest")
 """The file inputs of a run beside its named files."""
 """The box every item runs in, one after another, made afresh each time."""
-BOX_INODES = 100_000
+BOX_INODES = 60_000
 """The most files and folders a box's tmpfs holds. Removing them takes
 several times what making them did, on no run's clock, so a run that fills
 them is stopped for its memory, which every entry in a tmpfs takes."""
@@ -162,8 +162,10 @@ ISOLATE_STACK = 256 * 1024 * 1024
 ISOLATE_OPEN_FILES = BOX_INODES + 1024
 """The stack and open files isolate needs: after a run it gives the box's
 tree back to root by recursing into it with a folder open at each level,
-and a run may nest folders as deep as the box's inode cap. 99,990 folders
-deep took more than an 8 MB stack."""
+and a run may nest folders as deep as the box's inode cap. A tree of about
+100,000 folders took more than an 8 MB stack. The open-file count, the cap
+plus a margin, stays under 65,536, the hard limit a container is given
+where Docker sets none."""
 BOX_FOLDERS = ("tmp", "shm")
 """The folders on the box's tmpfs that are the run's `/tmp` and `/dev/shm`,
 so they share its size and inode cap: isolate's own tmpfs for them takes

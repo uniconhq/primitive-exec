@@ -681,7 +681,8 @@ elif case == "files":
             open(os.path.join(folder, f"f{made}"), "w").close()
             made += 1
     except OSError as error:
-        print("stopped", error.errno, made > 90000)
+        # Most of the box's 60,000 inodes. An earlier ENOSPC is not the cap.
+        print("stopped", error.errno, made > 50_000)
 elif case == "nest":
     made = 0
     try:
@@ -690,7 +691,8 @@ elif case == "nest":
             os.chdir("d")
             made += 1
     except OSError as error:
-        print("nested", error.errno, made > 90000)
+        # Most of the box's 60,000 inodes. An earlier ENOSPC is not the cap.
+        print("nested", error.errno, made > 50_000)
 elif case == "append-stdin":
     try:
         with open("/proc/self/fd/0", "a") as again:

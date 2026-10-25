@@ -968,7 +968,7 @@ def test_a_run_writing_past_its_memory_is_over_the_memory_limit(
 def test_a_run_making_too_many_files_is_over_the_memory_limit(
     run: Any, tmp_path: Path, folder: str
 ) -> None:
-    """The box's tmpfs holds 100,000 files and folders, its `/tmp` and
+    """The box's tmpfs holds 60,000 files and folders, its `/tmp` and
     `/dev/shm` among them: a run making more is told `ENOSPC`, and exec,
     which finds none free after it, gives `memory_limit`; one that makes
     fewer is judged as ever."""
