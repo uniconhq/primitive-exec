@@ -7,7 +7,6 @@ import math
 import os
 import subprocess
 import textwrap
-import zipapp
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cache
@@ -21,22 +20,20 @@ NAME = "primitive-exec"
 SCHEMA_VERSION = 6
 SIBLING_SCHEMA = ROOT.parent / "runner" / "schemas" / "primitive.schema.json"
 SIBLING_RUNNER = ROOT.parent / "runner"
-SIBLING_COMPILE = ROOT.parent / "primitive-compile"
-SIBLING_DIFF = ROOT.parent / "deploy" / "workflows" / "classic" / "v3" / "diff"
+SIBLING_DIFF = ROOT.parent / "deploy" / "workflows" / "classic" / "v4" / "diff"
 USERNS = Path(__file__).resolve().parent / "userns.py"
 BOX_USERS = "60000-60009"
 """The box users the tests give exec: one step's range."""
-STEP_MEMORY_MB = "1024"
-"""The memory the in-process tests give exec's step, as the planner would
-give a run of 512 MB, the most a test gives one, with its copies and the
-256 MB room."""
+STEP_MEMORY_MB = "1136"
+"""The memory the in-process tests give exec's step: the compile box's
+1024 MB and the 112 MB the step needs beside it, which holds a run of
+512 MB, the most a test gives one, with its copies too."""
 ISOLATE_LIMITS = ["--ulimit=nofile=1024:1048576", "--ulimit=stack=8388608:-1"]
 """Hard limits that let exec raise its soft limits for isolate's cleanup;
 the Docker daemon's defaults can be lower than the deepest box needs."""
 
 RunImage = Callable[..., dict[str, Any]]
 Check = Callable[..., None]
-Compiled = Callable[[str, str, str], bytes]
 
 SCORE = {"reports": {"score": {"better": "higher", "at_least": 0, "at_most": 1}}}
 """A manifest as the diff script's: a score between 0 and 1, higher better."""
@@ -103,40 +100,22 @@ def container_limits(
     """The container limits the harness gives a batch, from the declaration.
 
     Each limit is raised by `limits_from` for the item's inputs, rounded up;
-    a batch's time and CPU are the per-item value times the number of items.
+    a batch's time and CPU are the per-item value times the number of items,
+    and its time has `once_time_ms` added once, for the compile.
     """
     document = declaration()
     inputs = {"time_limit": time_limit, "memory_limit": memory_limit}
     limits: dict[str, int] = {}
     for name, value in document["limits"].items():
+        if name == "once_time_ms":
+            continue
         rule = document.get("limits_from", {}).get(name)
         if rule:
             raised = inputs[rule["input"]] * rule.get("scale", 1) + rule.get("add", 0)
             value = max(value, math.ceil(raised))
         limits[name] = value * items if name in ("time_ms", "cpu_ms") else value
+    limits["time_ms"] += document["limits"]["once_time_ms"]
     return limits
-
-
-def sandbox_flags(limits: dict[str, int]) -> list[str]:
-    """The docker run flags the harness gives a step container."""
-    memory = f"{limits['memory_mb']}m"
-    cpu_seconds = math.ceil(limits["cpu_ms"] / 1000)
-    file_bytes = limits["output_mb"] * 1024 * 1024
-    return [
-        "--network=none",
-        "--read-only",
-        "--cap-drop=ALL",
-        "--security-opt=no-new-privileges",
-        "--security-opt=seccomp=builtin",
-        "--user=65532:65532",
-        f"--memory={memory}",
-        f"--memory-swap={memory}",
-        f"--pids-limit={limits['pids']}",
-        f"--ulimit=cpu={cpu_seconds}:{cpu_seconds}",
-        f"--ulimit=fsize={file_bytes}:{file_bytes}",
-        "--cpus=1",
-        "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
-    ]
 
 
 def step_flags(limits: dict[str, int]) -> list[str]:
@@ -164,27 +143,28 @@ def step_flags(limits: dict[str, int]) -> list[str]:
     ]
 
 
-def open_up(work: Path) -> None:
-    """Let user 65532 in the container write the working directory and read `in/`."""
-    for path in [work, *work.rglob("*")]:
-        path.chmod(0o777 if path.is_dir() else 0o666)
+SOURCE_NAMES = {
+    "c": "main.c",
+    "cpp": "main.cpp",
+    "java": "Main.java",
+    "python": "main.py",
+    "ipynb": "main.ipynb",
+}
+"""The file a test program's source is written to, by language."""
 
 
-def python_binary(path: Path, source: str) -> Path:
-    """Build a Python binary in compile's format at its simplest: a zip
-    application whose root `__main__.py` is the program itself, where compile
-    puts a launcher that runs the entry from the folder under `source/`.
-    """
-    app = path.parent / (path.name + ".app")
-    app.mkdir(parents=True)
-    (app / "__main__.py").write_text(source)
-    zipapp.create_archive(app, path, interpreter="/usr/bin/env python3")
-    return path
+def write_source(folder: Path, source: str | dict[str, str], language: str) -> None:
+    """Write a program's source folder: one file of the language's own
+    name, or each file of `source`, by its path in the folder."""
+    files = source if isinstance(source, dict) else {SOURCE_NAMES[language]: source}
+    for name, text in files.items():
+        (folder / name).parent.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_text(text)
 
 
 def batch_inputs(
     work: Path,
-    binary: bytes,
+    source: str | dict[str, str],
     items: list[tuple[str, str]],
     time_limit: float = 1.0,
     memory_limit: float = 64,
@@ -193,10 +173,12 @@ def batch_inputs(
     loads: dict[str, dict[str, bytes]] | None = None,
     manifest: dict[str, Any] | None = None,
     self_reported: bool = False,
+    language: str = "python",
 ) -> None:
-    """Write inputs.json, the program and one input per item under `in/`, as the
-    harness does: the program is `in/1/program` and the nth item's standard
-    input `in/<n + 1>/input`. A `manifest`, given every item, is
+    """Write inputs.json, the program's source and one input per item under
+    `in/`, as the harness does: the source is the folder `in/1/source`
+    (`write_source`), in `language`, and the nth item's standard input
+    `in/<n + 1>/input`. A `manifest`, given every item, is
     `in/manifest.json`, and `self_reported` is set on every item.
 
     `items` are (run, standard input) pairs, all run under the same limits;
@@ -204,8 +186,8 @@ def batch_inputs(
     none; `files` and `loads` give each run they name its named files, by
     name and content, under `in/<n + 1>/files/` and `in/<n + 1>/loads/`.
     """
-    (work / "in" / "1").mkdir(parents=True)
-    (work / "in" / "1" / "program").write_bytes(binary)
+    (work / "in" / "1" / "source").mkdir(parents=True)
+    write_source(work / "in" / "1" / "source", source, language)
     if manifest is not None:
         (work / "in" / "manifest.json").write_text(json.dumps(manifest))
     batch = []
@@ -213,7 +195,8 @@ def batch_inputs(
         (work / "in" / str(number)).mkdir()
         (work / "in" / str(number) / "input").write_text(stdin)
         inputs: dict[str, Any] = {
-            "program": {"file": "in/1/program"},
+            "source": {"folder": "in/1/source"},
+            "language": language,
             "stdin": {"file": f"in/{number}/input"},
             "time_limit": time_limit,
             "memory_limit": memory_limit,
@@ -505,7 +488,7 @@ elif case == "lock-scratch":
     for path, mode in (
         (os.path.dirname(os.path.abspath(sys.argv[0])), 0o500),
         (sys.argv[0], 0),
-        ("/work/in/1/program", 0),
+        ("/work/in/1/source/main.py", 0),
     ):
         try:
             os.chmod(path, mode)
@@ -811,7 +794,7 @@ def base_build_args() -> tuple[str, ...]:
 
 
 SIBLING_VERDICT = (
-    ROOT.parent / "deploy" / "workflows" / "interactive" / "v1" / "verdict"
+    ROOT.parent / "deploy" / "workflows" / "interactive" / "v2" / "verdict"
 )
 
 GUESSES = {"reports": {"guesses": {"better": "lower", "at_least": 1}}}
@@ -830,12 +813,13 @@ GAME_LINKS = ["entrant -> judge", "judge -> entrant"]
 
 @dataclass(frozen=True)
 class Spec:
-    """One program of a test item: its source, built as a Python zip
-    application, its arguments, limits and named files, by name and
-    content, the manifest it is given, and whether it stops the others."""
+    """One program of a test item: its source, which exec compiles, in its
+    language, its arguments, limits and named files, by name and content,
+    the manifest it is given, and whether it stops the others."""
 
     source: str
     args: str
+    language: str = "python"
     time_limit: float = 1.0
     memory_limit: float = 64
     files: dict[str, bytes] = field(default_factory=dict)
@@ -853,11 +837,14 @@ def programs_container_limits(items: list[TestItem]) -> dict[str, int]:
 
     Each limit is raised by `limits_from` for each item's programs, the sum
     or the largest of a number each takes, rounded up; a batch's time and
-    CPU are summed over its items, and the others are the largest.
+    CPU are summed over its items, and the others are the largest. The
+    time has `once_time_ms` added once, for the compile.
     """
     document = declaration("programs")
     limits: dict[str, int] = {}
     for name, floor in document["limits"].items():
+        if name == "once_time_ms":
+            continue
         rule = document.get("limits_from", {}).get(name)
         values = []
         for _, programs, _ in items:
@@ -872,36 +859,33 @@ def programs_container_limits(items: list[TestItem]) -> dict[str, int]:
                 value = max(floor, math.ceil(raised))
             values.append(value)
         limits[name] = sum(values) if name in ("time_ms", "cpu_ms") else max(values)
+    limits["time_ms"] += document["limits"]["once_time_ms"]
     return limits
 
 
-def programs_batch_inputs(
-    work: Path, items: list[TestItem], binaries: dict[str, bytes] | None = None
-) -> None:
-    """Write inputs.json and every program and file under `in/`, as the
-    harness does: each source once, as `in/programs/<k>`, and the `n`th
-    item's program `p`'s named files and manifest under `in/<n>/<p>/`.
-    `binaries` gives a program already built for a source, such as one from
-    compile; any other source is built here as a zip application.
+def programs_batch_inputs(work: Path, items: list[TestItem]) -> None:
+    """Write inputs.json and every source and file under `in/`, as the
+    harness does: each source once, as the folder `in/programs/<k>`, and
+    the `n`th item's program `p`'s named files and manifest under
+    `in/<n>/<p>/`.
     """
-    built = dict(binaries or {})
-    stored: dict[str, str] = {}
+    stored: dict[tuple[str, str], str] = {}
     (work / "in" / "programs").mkdir(parents=True)
     batch = []
     for number, (run, programs, links) in enumerate(items, 1):
         given: dict[str, Any] = {}
         for name, spec in programs.items():
-            if spec.source not in stored:
-                if spec.source not in built:
-                    build = work.parent / "build" / f"program-{len(built)}"
-                    built[spec.source] = python_binary(build, spec.source).read_bytes()
+            written = (spec.language, spec.source)
+            if written not in stored:
                 path = f"in/programs/{len(stored)}"
-                (work / path).write_bytes(built[spec.source])
-                stored[spec.source] = path
+                (work / path).mkdir()
+                write_source(work / path, spec.source, spec.language)
+                stored[written] = path
             folder = work / "in" / str(number) / name
             folder.mkdir(parents=True)
             inputs: dict[str, Any] = {
-                "program": {"file": stored[spec.source]},
+                "source": {"folder": stored[written]},
+                "language": spec.language,
                 "time_limit": spec.time_limit,
                 "memory_limit": spec.memory_limit,
             }
@@ -944,7 +928,7 @@ def game(entrant: str, judge: str = "guess", **limits: float) -> Programs:
     playing `judge`, with the secret and `GUESSES`. `limits` gives either's
     time or memory limit as `entrant_time_limit` and the like; the judge's
     time limit is 2 s and the entrant's 1 s, so the entrant's wall clock
-    runs out first, as `unicon/interactive@v1` asks."""
+    runs out first, as `unicon/interactive@v2` asks."""
     return {
         "entrant": Spec(
             ENTRANT,
