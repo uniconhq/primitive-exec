@@ -10,7 +10,7 @@
 # step and runs it in its own place anywhere else. BASE_IMAGE names the
 # runner release's image; a build against a runner checkout passes the one
 # built from it, as the tests and the shared CI do.
-ARG BASE_IMAGE=ghcr.io/uniconhq/primitive-base:v0.10.0
+ARG BASE_IMAGE=ghcr.io/uniconhq/primitive-base:v0.11.0
 
 # The stage that builds isolate is pinned by digest, python:3.14-slim
 # (Debian 13), pulled 2026-09-13, the base image's own pin, so isolate
