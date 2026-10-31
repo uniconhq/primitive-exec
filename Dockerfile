@@ -10,7 +10,7 @@
 # step and runs it in its own place anywhere else. BASE_IMAGE names the
 # runner release's image; a build against a runner checkout passes the one
 # built from it, as the tests and the shared CI do.
-ARG BASE_IMAGE=ghcr.io/uniconhq/primitive-base:v0.10.0
+ARG BASE_IMAGE=ghcr.io/uniconhq/primitive-base:v0.11.0
 
 # The stage that builds isolate is pinned by digest, python:3.14-slim
 # (Debian 13), pulled 2026-09-13, the base image's own pin, so isolate
@@ -44,23 +44,40 @@ RUN gcc -O2 -Wall -Wextra -Werror -static -o /out/usr/local/bin/box-launch \
 FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="primitive-exec" \
-      org.opencontainers.image.description="The Unicon exec primitive: run a program under limits and measure it." \
+      org.opencontainers.image.description="The Unicon exec primitive: compile a program, run it under limits and measure it." \
       org.opencontainers.image.source="https://github.com/uniconhq/primitive-exec" \
       org.opencontainers.image.licenses="MIT"
 
-# The Java runtime runs the jars compile builds, from the same Debian package
-# set as compile's JDK. Native programs are statically linked and Python
-# programs run on the image's own interpreter. The JRE's post-install scripts
-# expect the man directory the slim image leaves out.
+# The compilers exec runs in its compile box: gcc and g++ with the C library
+# to link statically against, and the JDK, whose runtime also runs the jars.
+# Python programs are checked and run by the image's own interpreter. The
+# JDK's post-install scripts expect the man directory the slim image leaves
+# out.
 RUN mkdir -p /usr/share/man/man1 \
     && apt-get update \
-    && apt-get install --yes --no-install-recommends openjdk-21-jre-headless \
+    && apt-get install --yes --no-install-recommends \
+        gcc g++ libc6-dev openjdk-21-jdk-headless \
     && rm -rf /var/lib/apt/lists/*
 
 # isolate links libcap2 and libseccomp2, which the base image has; box-launch
 # links nothing. Every box sees it, under the /usr isolate binds into each.
 COPY --from=isolate /out/ /
-COPY --chmod=0755 src/exec.py /usr/local/bin/exec
+
+# exec's package goes in a folder of its own outside site-packages, so nothing
+# else imports it, compiled at build so no step writes bytecode beside it;
+# /usr/local/bin/exec puts that folder on its path and runs it.
+COPY src/exec/ /usr/local/lib/unicon-exec/exec/
+RUN python3 -m compileall -q /usr/local/lib/unicon-exec
+COPY --chmod=0755 src/command.py /usr/local/bin/exec
+
+# The toolchain line, part of every compiled program's key in the machine's
+# cache: the installed packages and their versions, the interpreter, and
+# exec's own files, so two images that would compile differently never share
+# a program.
+RUN { dpkg-query -W; python3 -VV; \
+      find /usr/local/lib/unicon-exec/exec -name '*.py' -type f | sort \
+        | xargs sha256sum; } \
+    | sha256sum | cut -d' ' -f1 > /usr/local/lib/unicon-exec/toolchain
 
 # exec runs as root: it sets up the step's cgroup, mounts each box's tmpfs and
 # runs isolate, and each run is a box user of its own, never root.

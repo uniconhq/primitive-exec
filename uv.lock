@@ -274,7 +274,7 @@ wheels = [
 
 [[package]]
 name = "primitive-exec"
-version = "1.0.1"
+version = "2.0.0"
 source = { virtual = "." }
 
 [package.dev-dependencies]

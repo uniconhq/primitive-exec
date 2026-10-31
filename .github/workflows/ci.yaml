@@ -14,10 +14,9 @@ permissions:
 # from it.
 jobs:
   ci:
-    uses: uniconhq/runner/.github/workflows/primitive-ci.yaml@v0.10.0 # zizmor: ignore[unpinned-uses] our own repo, pinned by release tag
+    uses: uniconhq/runner/.github/workflows/primitive-ci.yaml@v0.11.0 # zizmor: ignore[unpinned-uses] our own repo, pinned by release tag
     with:
-      runner-ref: v0.10.0
-      compile-image: true
+      runner-ref: v0.11.0
 
   workflows:
     runs-on: ubuntu-latest
