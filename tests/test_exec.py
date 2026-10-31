@@ -24,7 +24,8 @@ from typing import Any
 
 import pytest
 
-import exec as primitive
+from exec import box, inputs, programs, report, shared
+from exec.main import main
 from support import (
     BOX_USERS,
     PROGRAM,
@@ -50,12 +51,12 @@ def boxes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Give exec the tests' box users and step memory, or skip a test that
     runs programs where exec cannot make boxes."""
     able = sys.platform == "linux" and os.geteuid() == 0
-    if not (able and Path(primitive.ISOLATE).is_file()):
+    if not (able and Path(box.ISOLATE).is_file()):
         if IN_BOXES:
             pytest.fail("the test container has no root with isolate")
         pytest.skip("runs programs in isolate boxes: run in the test container")
-    monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
-    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, STEP_MEMORY_MB)
+    monkeypatch.setenv(box.BOX_USERS_VARIABLE, BOX_USERS)
+    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, STEP_MEMORY_MB)
 
 
 @pytest.fixture
@@ -66,7 +67,7 @@ def run(boxes: None, tmp_path: Path) -> Any:
     def batch(items: list[tuple[str, str]], **options: Any) -> dict[str, Any]:
         work = tmp_path / "work"
         batch_inputs(work, binary, items, **options)
-        assert primitive.main(["exec", str(work)]) == 0
+        assert main(["exec", str(work)]) == 0
         document: dict[str, Any] = json.loads(
             (work / "outputs.json").read_text(encoding="utf-8")
         )
@@ -75,7 +76,7 @@ def run(boxes: None, tmp_path: Path) -> Any:
     return batch
 
 
-def make_run(**changes: Any) -> primitive.Run:
+def make_run(**changes: Any) -> box.Run:
     """A run that exited cleanly well inside every limit, with some fields changed."""
     fields: dict[str, Any] = {
         "status": "",
@@ -84,23 +85,18 @@ def make_run(**changes: Any) -> primitive.Run:
         "memory_kb": 1000,
         "output_bytes": 10,
     }
-    return primitive.Run(**(fields | changes))
-
-
-ITEM = primitive.Item(
-    "main-1", 1, Path("b"), Path("i"), time_limit=1.0, memory_limit=64
-)
+    return box.Run(**(fields | changes))
 
 
 @pytest.mark.parametrize(
     ("limit", "ms"), [(1.0, 1000), (0.1, 100), (0.3, 300), (2.5, 2500), (0.0005, 1)]
 )
 def test_the_time_limit_in_milliseconds_is_rounded_up(limit: float, ms: int) -> None:
-    item = primitive.Item("main-1", 1, Path("b"), Path("i"), limit, 64)
-    assert item.time_limit_ms == ms
+    entry = inputs.Entry("program", Path("b"), limit, 64)
+    assert entry.time_limit_ms == ms
 
 
-OVER = primitive.OUTPUT_LIMIT + 1
+OVER = shared.OUTPUT_LIMIT + 1
 JUDGED: list[tuple[dict[str, Any], str, str]] = [
     ({}, "native", "accepted"),
     (
@@ -131,7 +127,7 @@ between them."""
 @pytest.mark.parametrize(("changes", "kind", "outcome"), JUDGED)
 def test_judge(changes: dict[str, Any], kind: str, outcome: str) -> None:
     """Memory first, then time, then output, then how the program ended."""
-    assert primitive.judge(make_run(**changes), ITEM, kind) == outcome
+    assert report.judge(make_run(**changes), kind) == outcome
 
 
 def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
@@ -140,10 +136,9 @@ def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
     drawer.
     """
     reported = {
-        primitive.judge(make_run(**changes), ITEM, kind) for changes, kind, _ in JUDGED
+        report.judge(make_run(**changes), kind) for changes, kind, _ in JUDGED
     } | {
-        primitive.verdict_outcome(verdict)
-        for verdict in ("0", "1", *primitive.VERDICT_WORDS)
+        report.verdict_outcome(verdict) for verdict in ("0", "1", *report.VERDICT_WORDS)
     }
 
     outcomes = declaration()["outputs"]["outcome"]["outcomes"]
@@ -168,10 +163,8 @@ def test_the_declaration_says_every_outcome_judge_can_give() -> None:
     """
     outcomes = declaration()["outputs"]["outcome"]["outcomes"]
 
-    found = returned_outcomes(primitive.judge) | returned_outcomes(
-        primitive.verdict_outcome
-    )
-    assert set(outcomes) == found | returned_outcomes(primitive.reported)
+    found = returned_outcomes(report.judge) | returned_outcomes(report.verdict_outcome)
+    assert set(outcomes) == found | returned_outcomes(report.reported)
 
 
 def test_detect(tmp_path: Path) -> None:
@@ -184,11 +177,11 @@ def test_detect(tmp_path: Path) -> None:
         archive.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n")
     other = tmp_path / "other"
     other.write_text("#!/bin/sh\necho hi\n")
-    assert primitive.detect(native) == "native"
-    assert primitive.detect(python) == "python"
-    assert primitive.detect(java) == "java"
-    with pytest.raises(primitive.PrimitiveError, match="not a native executable"):
-        primitive.detect(other)
+    assert programs.detect(native) == "native"
+    assert programs.detect(python) == "python"
+    assert programs.detect(java) == "java"
+    with pytest.raises(shared.PrimitiveError, match="not a native executable"):
+        programs.detect(other)
 
 
 @pytest.mark.parametrize(
@@ -217,7 +210,7 @@ def test_inputs_it_cannot_use_are_an_error(
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["batch"][0]["inputs"].update(inputs)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
-    assert primitive.main(["exec", str(tmp_path)]) == 0
+    assert main(["exec", str(tmp_path)]) == 0
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert set(result) == {"schema_version", "error"}
     assert message in result["error"]
@@ -232,9 +225,55 @@ def test_a_limit_too_large_to_be_a_number_is_an_error(tmp_path: Path) -> None:
     (tmp_path / "inputs.json").write_text(
         json.dumps(document).replace("123456789", "1e999")
     )
-    assert primitive.main(["exec", str(tmp_path)]) == 0
+    assert main(["exec", str(tmp_path)]) == 0
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert "memory_limit of run main-1 is not a positive number" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("given", "message"),
+    [
+        ({"args": 3}, "the input named args of run main-1 is not text"),
+        (
+            {"self_reported": "yes"},
+            "the input named self_reported of run main-1 is not true or false",
+        ),
+        (
+            {"self_reported": True},
+            "the run main-1 is self_reported without a manifest, so it reports nothing",
+        ),
+        (
+            {"files": {"files": {"a b": {"file": "in/1/program"}}}},
+            "the input named files of run main-1 names a file 'a b', not a plain name",
+        ),
+    ],
+)
+def test_an_input_that_does_not_hold_is_named_with_its_run(
+    tmp_path: Path, given: dict[str, Any], message: str
+) -> None:
+    batch_inputs(tmp_path, b"", [("main-1", "")])
+    document = json.loads((tmp_path / "inputs.json").read_text())
+    document["batch"][0]["inputs"].update(given)
+    (tmp_path / "inputs.json").write_text(json.dumps(document))
+    with pytest.raises(shared.PrimitiveError) as raised:
+        inputs.read_inputs(tmp_path)
+    assert str(raised.value) == message
+
+
+def test_a_run_is_read_without_the_several_programs_forms_own_inputs(
+    tmp_path: Path,
+) -> None:
+    """`stops_others` is the several-programs form's alone, so a run of the
+    one-program form that gives it, whatever it holds, is read as without
+    it."""
+    batch_inputs(tmp_path, b"", [("main-1", "")])
+    document = json.loads((tmp_path / "inputs.json").read_text())
+    document["batch"][0]["inputs"]["stops_others"] = "yes"
+    (tmp_path / "inputs.json").write_text(json.dumps(document))
+    (read,) = inputs.read_inputs(tmp_path)
+    (program,) = read.programs
+    assert not read.several
+    assert not program.stops_others
 
 
 def test_a_version_5_batch_is_an_error(tmp_path: Path) -> None:
@@ -243,7 +282,7 @@ def test_a_version_5_batch_is_an_error(tmp_path: Path) -> None:
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["schema_version"] = 5
     (tmp_path / "inputs.json").write_text(json.dumps(document))
-    primitive.main(["exec", str(tmp_path)])
+    main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert "not written against contract version 6" in result["error"]
     assert result["schema_version"] == 6
@@ -269,7 +308,7 @@ def test_items_must_be_for_distinct_runs(
     for entry, run in zip(document["batch"], runs, strict=True):
         entry["run"] = run
     (tmp_path / "inputs.json").write_text(json.dumps(document))
-    primitive.main(["exec", str(tmp_path)])
+    main(["exec", str(tmp_path)])
     assert message in json.loads((tmp_path / "outputs.json").read_text())["error"]
 
 
@@ -295,7 +334,7 @@ def test_named_files_it_cannot_use_are_an_error(
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["batch"][0]["inputs"]["files"] = value
     (tmp_path / "inputs.json").write_text(json.dumps(document))
-    primitive.main(["exec", str(tmp_path)])
+    main(["exec", str(tmp_path)])
     assert message in json.loads((tmp_path / "outputs.json").read_text())["error"]
 
 
@@ -304,7 +343,7 @@ def test_a_name_in_both_files_and_loads_is_an_error(tmp_path: Path) -> None:
     have caught two."""
     named = {"main-1": {"solution.py": b"x"}}
     batch_inputs(tmp_path, b"", [("main-1", "")], files=named, loads=named)
-    primitive.main(["exec", str(tmp_path)])
+    main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert "names solution.py in both files and loads" in result["error"]
 
@@ -316,8 +355,8 @@ def test_a_name_in_both_files_and_loads_is_an_error(tmp_path: Path) -> None:
 def test_the_box_users_are_the_steps_range(
     monkeypatch: pytest.MonkeyPatch, given: str, users: range
 ) -> None:
-    monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, given)
-    assert primitive.box_users() == users
+    monkeypatch.setenv(box.BOX_USERS_VARIABLE, given)
+    assert box.box_users() == users
 
 
 @pytest.mark.parametrize(
@@ -337,11 +376,11 @@ def test_box_users_it_cannot_use_are_an_error(
     monkeypatch: pytest.MonkeyPatch, given: str | None, message: str
 ) -> None:
     if given is None:
-        monkeypatch.delenv(primitive.BOX_USERS_VARIABLE, raising=False)
+        monkeypatch.delenv(box.BOX_USERS_VARIABLE, raising=False)
     else:
-        monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, given)
-    with pytest.raises(primitive.PrimitiveError, match=re.escape(message)):
-        primitive.box_users()
+        monkeypatch.setenv(box.BOX_USERS_VARIABLE, given)
+    with pytest.raises(shared.PrimitiveError, match=re.escape(message)):
+        box.box_users()
 
 
 @pytest.mark.parametrize("first", ["0 0 4294967295", "  0   0 4294967295  ", ""])
@@ -352,9 +391,9 @@ def test_root_dockers_identity_map_is_refused(
     itself, and exec does not start; nor where it cannot read the map."""
     uid_map = tmp_path / "uid_map"
     uid_map.write_text(f"{first}\n" if first else "")
-    monkeypatch.setattr(primitive, "UID_MAP", uid_map)
-    with pytest.raises(primitive.PrimitiveError, match="machine's own root"):
-        primitive.check_shape()
+    monkeypatch.setattr(box, "UID_MAP", uid_map)
+    with pytest.raises(shared.PrimitiveError, match="machine's own root"):
+        box.check_shape()
 
 
 def test_root_docker_passes_with_the_development_switch_alone(
@@ -364,22 +403,22 @@ def test_root_docker_passes_with_the_development_switch_alone(
     other value of the switch, or no map to read, is still refused."""
     uid_map = tmp_path / "uid_map"
     uid_map.write_text("0 0 4294967295\n")
-    monkeypatch.setattr(primitive, "UID_MAP", uid_map)
+    monkeypatch.setattr(box, "UID_MAP", uid_map)
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    monkeypatch.setenv(primitive.DEV_ROOT_DOCKER_VARIABLE, "1")
-    primitive.check_shape()
+    monkeypatch.setenv(box.DEV_ROOT_DOCKER_VARIABLE, "1")
+    box.check_shape()
     assert "WARNING" in capsys.readouterr().err
     monkeypatch.setattr(os, "geteuid", lambda: 65532)
-    with pytest.raises(primitive.PrimitiveError, match="runs as root"):
-        primitive.check_shape()
+    with pytest.raises(shared.PrimitiveError, match="runs as root"):
+        box.check_shape()
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    monkeypatch.setenv(primitive.DEV_ROOT_DOCKER_VARIABLE, "yes")
-    with pytest.raises(primitive.PrimitiveError, match="machine's own root"):
-        primitive.check_shape()
-    monkeypatch.setenv(primitive.DEV_ROOT_DOCKER_VARIABLE, "1")
+    monkeypatch.setenv(box.DEV_ROOT_DOCKER_VARIABLE, "yes")
+    with pytest.raises(shared.PrimitiveError, match="machine's own root"):
+        box.check_shape()
+    monkeypatch.setenv(box.DEV_ROOT_DOCKER_VARIABLE, "1")
     uid_map.write_text("")
-    with pytest.raises(primitive.PrimitiveError, match="machine's own root"):
-        primitive.check_shape()
+    with pytest.raises(shared.PrimitiveError, match="machine's own root"):
+        box.check_shape()
 
 
 def test_a_rootless_map_passes_as_root_alone(
@@ -389,12 +428,12 @@ def test_a_rootless_map_passes_as_root_alone(
     uid_map.write_text(
         "         0       1000          1\n         1     100000      65536\n"
     )
-    monkeypatch.setattr(primitive, "UID_MAP", uid_map)
+    monkeypatch.setattr(box, "UID_MAP", uid_map)
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    primitive.check_shape()
+    box.check_shape()
     monkeypatch.setattr(os, "geteuid", lambda: 65532)
-    with pytest.raises(primitive.PrimitiveError, match="runs as root"):
-        primitive.check_shape()
+    with pytest.raises(shared.PrimitiveError, match="runs as root"):
+        box.check_shape()
 
 
 def test_on_root_docker_nothing_runs(
@@ -403,18 +442,18 @@ def test_on_root_docker_nothing_runs(
     """The whole batch is an error, before any of the step is touched."""
     uid_map = tmp_path / "uid_map"
     uid_map.write_text("0 0 4294967295\n")
-    monkeypatch.setattr(primitive, "UID_MAP", uid_map)
-    monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
-    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, STEP_MEMORY_MB)
+    monkeypatch.setattr(box, "UID_MAP", uid_map)
+    monkeypatch.setenv(box.BOX_USERS_VARIABLE, BOX_USERS)
+    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, STEP_MEMORY_MB)
 
     def touched() -> None:
         raise AssertionError("the cgroup was set up")
 
-    monkeypatch.setattr(primitive, "set_up_cgroup", touched)
+    monkeypatch.setattr(box, "set_up_cgroup", touched)
     work = tmp_path / "work"
     binary = python_binary(tmp_path / "p", "print(1)\n").read_bytes()
     batch_inputs(work, binary, [("main-1", "")])
-    primitive.main(["exec", str(work)])
+    main(["exec", str(work)])
     result = json.loads((work / "outputs.json").read_text())
     assert set(result) == {"schema_version", "error"}
     assert "machine's own root" in result["error"]
@@ -444,7 +483,7 @@ def test_a_run_without_stdin_reads_nothing(boxes: None, tmp_path: Path) -> None:
     document = json.loads((work / "inputs.json").read_text())
     del document["batch"][0]["inputs"]["stdin"]
     (work / "inputs.json").write_text(json.dumps(document))
-    primitive.main(["exec", str(work)])
+    main(["exec", str(work)])
     outputs = by_run(json.loads((work / "outputs.json").read_text()))["main-1"]
     assert outputs["outcome"] == "accepted"
     assert printed(work, outputs) == ""
@@ -491,7 +530,7 @@ def test_a_run_that_removes_or_changes_its_named_files_changes_no_later_run(
     for entry in document["batch"]:
         entry["inputs"]["files"] = {"files": {"answer": {"file": "in/shared/answer"}}}
     (work / "inputs.json").write_text(json.dumps(document))
-    primitive.main(["exec", str(work)])
+    main(["exec", str(work)])
     outputs = by_run(json.loads((work / "outputs.json").read_text()))
     assert printed(work, outputs["main-1"]) == "spoiled\n"
     assert printed(work, outputs["main-2"]) == "answer 0o444 3 42\n"
@@ -500,7 +539,7 @@ def test_a_run_that_removes_or_changes_its_named_files_changes_no_later_run(
 def test_a_binary_in_no_known_format_is_an_error(boxes: None, tmp_path: Path) -> None:
     """A program exec cannot run is the step failing, not the contestant."""
     batch_inputs(tmp_path, b"#!/bin/sh\n", [("main-1", "")])
-    primitive.main(["exec", str(tmp_path)])
+    main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert "not a native executable" in result["error"]
 
@@ -536,8 +575,8 @@ def test_every_outcome(run: Any, tmp_path: Path) -> None:
         assert entry["memory_kb"] > 0
     assert outputs["main-grow"]["memory_kb"] >= 64 * 1024
     assert outputs["samples-ok"]["memory_kb"] < 64 * 1024
-    assert not os.path.ismount(primitive.BOX_ROOT / str(primitive.BOX) / "box")
-    assert not (primitive.BOX_ROOT / str(primitive.BOX)).exists()
+    assert not os.path.ismount(box.BOX_ROOT / str(programs.BOX) / "box")
+    assert not (box.BOX_ROOT / str(programs.BOX)).exists()
 
 
 def test_a_run_stopped_at_its_time_limit_reports_at_least_the_limit(
@@ -617,7 +656,7 @@ def test_output_over_the_limit(run: Any, tmp_path: Path) -> None:
     assert outputs["outcome"] == "output_limit"
     assert outputs["memory_kb"] < 32 * 1024
     output = tmp_path / "work" / "out" / "1" / "output"
-    assert output.stat().st_size == primitive.OUTPUT_LIMIT
+    assert output.stat().st_size == shared.OUTPUT_LIMIT
 
 
 def test_processes_left_behind_are_killed(run: Any) -> None:
@@ -723,7 +762,7 @@ def test_memory_held_and_memory_in_a_child_read_as_held(run: Any) -> None:
 def read_outside_the_step(path: Path) -> None:
     """Read `path` into the page cache from a process in a cgroup of its own
     beside the step's, removed after; the pages stay charged above it."""
-    reader = primitive.CGROUP / "reader"
+    reader = box.CGROUP / "reader"
     reader.mkdir()
     try:
         subprocess.run(
@@ -763,7 +802,7 @@ def test_reading_a_large_input_counts_what_the_box_reads_in(
             read_outside_the_step(work / "in" / "3" / "input")
         else:
             os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-    primitive.main(["exec", str(work)])
+    main(["exec", str(work)])
     outputs = by_run(json.loads((work / "outputs.json").read_text()))
     read, base = outputs["main-read"], outputs["main-base"]
     assert read["outcome"] == "accepted"
@@ -778,7 +817,7 @@ def test_a_native_binary_the_kernel_will_not_run_is_a_runtime_error(
     boxes: None, tmp_path: Path
 ) -> None:
     batch_inputs(tmp_path, b"\x7fELF" + bytes(60), [("main-1", "")])
-    primitive.main(["exec", str(tmp_path)])
+    main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     outputs = by_run(result)["main-1"]
     assert outputs["outcome"] == "runtime_error"
@@ -789,7 +828,7 @@ def test_a_json_file_is_written_whole_past_a_planted_link(tmp_path: Path) -> Non
     target = tmp_path / "elsewhere"
     target.write_text("untouched")
     (tmp_path / "outputs.json.partial").symlink_to(target)
-    primitive.write_json(tmp_path / "outputs.json", {"schema_version": 5})
+    report.write_json(tmp_path / "outputs.json", {"schema_version": 5})
     assert target.read_text() == "untouched"
     assert not (tmp_path / "outputs.json").is_symlink()
     assert json.loads((tmp_path / "outputs.json").read_text()) == {"schema_version": 5}
@@ -1011,8 +1050,8 @@ def test_a_hard_limit_below_what_isolate_needs_stops_the_step(
 
     monkeypatch.setattr(resource, "getrlimit", low)
     monkeypatch.setattr(resource, "setrlimit", lambda *_: None)
-    with pytest.raises(primitive.PrimitiveError, match=f"hard limit on {name}, 1024"):
-        primitive.raise_limits()
+    with pytest.raises(shared.PrimitiveError, match=f"hard limit on {name}, 1024"):
+        box.raise_limits()
 
 
 def test_the_soft_limits_isolate_inherits_are_raised(
@@ -1025,13 +1064,13 @@ def test_the_soft_limits_isolate_inherits_are_raised(
     made: dict[int, tuple[int, int]] = {}
     monkeypatch.setattr(resource, "getrlimit", limits.__getitem__)
     monkeypatch.setattr(resource, "setrlimit", made.__setitem__)
-    primitive.raise_limits()
+    box.raise_limits()
     assert made == {
         resource.RLIMIT_STACK: (
-            primitive.ISOLATE_STACK,
+            box.ISOLATE_STACK,
             resource.RLIM_INFINITY,
         ),
-        resource.RLIMIT_NOFILE: (primitive.ISOLATE_OPEN_FILES, 524288),
+        resource.RLIMIT_NOFILE: (box.ISOLATE_OPEN_FILES, 524288),
     }
 
 
@@ -1049,7 +1088,7 @@ def test_a_stdin_file_others_can_write_is_not_changed_by_a_run(
     )
     for path in work.rglob("*"):
         path.chmod(0o777 if path.is_dir() else 0o666)
-    assert primitive.main(["exec", str(work)]) == 0
+    assert main(["exec", str(work)]) == 0
     outputs = by_run(json.loads((work / "outputs.json").read_text()))
     assert printed(work, outputs["main-1"]) == f"refused {errno.EACCES}\n"
     stdin = work / "in" / "2" / "input"
@@ -1065,10 +1104,10 @@ def test_a_run_reads_its_stdin_file_but_not_its_name(
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     batch_inputs(work, binary, [("main-1", "stdin-path\nrest\n")])
-    assert primitive.main(["exec", str(work)]) == 0
+    assert main(["exec", str(work)]) == 0
     outputs = by_run(json.loads((work / "outputs.json").read_text()))
     assert printed(work, outputs["main-1"]) == "/ rest\n"
-    assert not primitive.STDIN_MOUNT.is_mount()
+    assert not box.STDIN_MOUNT.is_mount()
 
 
 def test_a_stdin_file_a_box_user_owns_is_an_error(boxes: None, tmp_path: Path) -> None:
@@ -1076,7 +1115,7 @@ def test_a_stdin_file_a_box_user_owns_is_an_error(boxes: None, tmp_path: Path) -
     work = tmp_path / "work"
     batch_inputs(work, binary, [("main-1", "folders\n10\n")])
     os.chown(work / "in" / "2" / "input", 60000, 60000)
-    assert primitive.main(["exec", str(work)]) == 0
+    assert main(["exec", str(work)]) == 0
     result = json.loads((work / "outputs.json").read_text())
     assert set(result) == {"schema_version", "error"}
     assert (
@@ -1093,7 +1132,7 @@ def test_a_stdin_file_a_box_user_owns_is_an_error(boxes: None, tmp_path: Path) -
     ],
 )
 def test_what_isolate_said_when_it_failed(code: int, said: bytes, told: str) -> None:
-    assert told in primitive.isolate_said(code, said)
+    assert told in box.isolate_said(code, said)
 
 
 def exec_apart(work: Path, users: str, group: str) -> int:
@@ -1102,7 +1141,7 @@ def exec_apart(work: Path, users: str, group: str) -> int:
     a rootless Docker is: a cgroup namespace rooted at `group`, and its own
     mounts for the cgroup, `/run`, the box root and isolate's
     configuration. Return the child's process ID."""
-    cgroup = primitive.CGROUP / group
+    cgroup = box.CGROUP / group
     cgroup.mkdir(exist_ok=True)
     child = os.fork()
     if child:
@@ -1110,16 +1149,16 @@ def exec_apart(work: Path, users: str, group: str) -> int:
     try:
         (cgroup / "cgroup.procs").write_text(str(os.getpid()))
         os.unshare(os.CLONE_NEWNS | os.CLONE_NEWCGROUP)
-        primitive.mount("none", Path("/"), None, (1 << 14) | (1 << 18), None)
+        box.mount("none", Path("/"), None, (1 << 14) | (1 << 18), None)
         # The container's cgroup mount came from a more privileged mount
         # namespace and cannot be unmounted here, so a tmpfs goes over it
         # first, and the namespace's own cgroup over that.
-        primitive.mount("tmpfs", primitive.CGROUP, "tmpfs", 0, None)
-        primitive.mount("cgroup2", primitive.CGROUP, "cgroup2", 0, None)
+        box.mount("tmpfs", box.CGROUP, "tmpfs", 0, None)
+        box.mount("cgroup2", box.CGROUP, "cgroup2", 0, None)
         for folder in ("/run", "/var/local/lib", "/usr/local/etc"):
-            primitive.mount("tmpfs", Path(folder), "tmpfs", 0, "mode=0755")
-        os.environ[primitive.BOX_USERS_VARIABLE] = users
-        primitive.main(["exec", str(work)])
+            box.mount("tmpfs", Path(folder), "tmpfs", 0, "mode=0755")
+        os.environ[box.BOX_USERS_VARIABLE] = users
+        main(["exec", str(work)])
     except BaseException:
         traceback.print_exc()
         os._exit(1)
@@ -1138,7 +1177,7 @@ def test_two_steps_at_once_share_a_process_count_only_on_the_same_users(
     namespace, every step of one rootless Docker, so two steps given
     distinct box users each fork up to their limit at once, and two given
     the same one share it."""
-    primitive.set_up_step(primitive.box_users(), primitive.step_memory_kb())
+    box.set_up_step(box.box_users(), box.step_memory_kb())
     binary = python_binary(tmp_path / "b" / "p", PROGRAM).read_bytes()
     works = []
     for number in range(2):
@@ -1156,14 +1195,14 @@ def test_two_steps_at_once_share_a_process_count_only_on_the_same_users(
         outputs = by_run(json.loads((work / "outputs.json").read_text()))["main-1"]
         forked.append(int(printed(work, outputs).split()[1]))
     for number in range(2):
-        cgroup = primitive.CGROUP / f"apart-{number}"
+        cgroup = box.CGROUP / f"apart-{number}"
         for inner in ("step/isolate", "step/main", "step"):
             (cgroup / inner).rmdir()
         cgroup.rmdir()
     if apart:
-        assert min(forked) >= primitive.PROCESS_LIMIT - 8, forked
+        assert min(forked) >= box.PROCESS_LIMIT - 8, forked
     else:
-        assert sum(forked) <= primitive.PROCESS_LIMIT + 8, forked
+        assert sum(forked) <= box.PROCESS_LIMIT + 8, forked
 
 
 def test_a_box_a_dead_step_left_mounted_does_not_stop_the_next(
@@ -1171,10 +1210,10 @@ def test_a_box_a_dead_step_left_mounted_does_not_stop_the_next(
 ) -> None:
     """A step killed in the middle of an item leaves its box initialised and
     its tmpfs mounted; the next item unmounts it and starts afresh."""
-    primitive.set_up_step(primitive.box_users(), primitive.step_memory_kb())
-    primitive.isolate_box(primitive.BOX, "--init")
-    folder = primitive.BOX_ROOT / str(primitive.BOX) / "box"
-    primitive.mount("box-0", folder, "tmpfs", 0, "size=1m")
+    box.set_up_step(box.box_users(), box.step_memory_kb())
+    box.isolate_box(programs.BOX, "--init")
+    folder = box.BOX_ROOT / str(programs.BOX) / "box"
+    box.mount("box-0", folder, "tmpfs", 0, "size=1m")
     (folder / "left").write_text("hidden answer")
     outputs = by_run(run([("main-find", "find-files\n")]))
     assert outputs["main-find"]["outcome"] == "accepted"
@@ -1195,15 +1234,15 @@ def test_the_step_is_capped_at_the_memory_it_was_given(
         run([("main-1", "double\n21\n"), ("main-2", "double\n21\n")], files=files)
     )
     assert {each["outcome"] for each in outputs.values()} == {"accepted"}
-    capped = (primitive.STEP_CGROUP / "memory.max").read_text()
+    capped = (box.STEP_CGROUP / "memory.max").read_text()
     assert int(capped) == int(STEP_MEMORY_MB) * 2**20
-    assert primitive.BOX_CGROUPS.parent == primitive.STEP_CGROUP
-    assert str(os.getpid()) in (primitive.MAIN_CGROUP / "cgroup.procs").read_text()
+    assert box.BOX_CGROUPS.parent == box.STEP_CGROUP
+    assert str(os.getpid()) in (box.MAIN_CGROUP / "cgroup.procs").read_text()
 
 
 def test_the_steps_memory_is_what_it_was_given(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, "640")
-    assert primitive.step_memory_kb() == 640 * 1024
+    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, "640")
+    assert box.step_memory_kb() == 640 * 1024
 
 
 @pytest.mark.parametrize(
@@ -1221,17 +1260,17 @@ def test_a_steps_memory_it_cannot_use_is_an_error(
     monkeypatch: pytest.MonkeyPatch, given: str | None, message: str
 ) -> None:
     if given is None:
-        monkeypatch.delenv(primitive.STEP_MEMORY_VARIABLE, raising=False)
+        monkeypatch.delenv(box.STEP_MEMORY_VARIABLE, raising=False)
     else:
-        monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, given)
-    with pytest.raises(primitive.PrimitiveError, match=re.escape(message)):
-        primitive.step_memory_kb()
+        monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, given)
+    with pytest.raises(shared.PrimitiveError, match=re.escape(message)):
+        box.step_memory_kb()
 
 
 def test_a_step_that_cannot_be_set_up_runs_nothing(
     run: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(primitive, "STEP_CGROUP", Path("/proc/no-such/step"))
+    monkeypatch.setattr(box, "STEP_CGROUP", Path("/proc/no-such/step"))
     result = run([("main-ok", "double\n21\n")])
     assert set(result) == {"schema_version", "error"}
     assert "could not be set up for its boxes" in result["error"]
@@ -1239,8 +1278,8 @@ def test_a_step_that_cannot_be_set_up_runs_nothing(
 
 
 def test_the_box_launchers_self_test_passes_in_a_box(boxes: None) -> None:
-    primitive.set_up_step(primitive.box_users(), primitive.step_memory_kb())
-    primitive.check_launcher()
+    box.set_up_step(box.box_users(), box.step_memory_kb())
+    box.check_launcher()
 
 
 @pytest.mark.parametrize(
@@ -1260,7 +1299,7 @@ def test_a_box_launcher_that_fails_its_self_test_stops_the_step(
     """A launcher that cannot set its filter up would end every run as a
     runtime error, its message gone with the box's standard error: the
     step fails instead, saying what the launcher said, and no run starts."""
-    monkeypatch.setattr(primitive, "LAUNCHER", launcher)
+    monkeypatch.setattr(box, "LAUNCHER", launcher)
     result = run([("main-ok", "double\n21\n")])
     assert set(result) == {"schema_version", "error"}
     assert result["error"].startswith("the box launcher's self-test failed")
@@ -1275,25 +1314,25 @@ def test_cleanup_that_fails_after_an_error_does_not_hide_it(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     def fail(*_: object) -> None:
-        raise primitive.PrimitiveError("the first error")
+        raise shared.PrimitiveError("the first error")
 
     def fail_cleanup(*_: object) -> None:
-        raise primitive.PrimitiveError("the cleanup error")
+        raise shared.PrimitiveError("the cleanup error")
 
     batch_inputs(
         tmp_path,
         python_binary(tmp_path / "p", "print(1)\n").read_bytes(),
         [("main-1", "")],
     )
-    monkeypatch.setattr(primitive, "check_launcher", lambda: None)
-    monkeypatch.setattr(primitive, "execute", fail)
-    monkeypatch.setattr(primitive, "close_box", fail_cleanup)
-    assert primitive.main(["exec", str(tmp_path)]) == 0
+    monkeypatch.setattr(box, "check_launcher", lambda: None)
+    monkeypatch.setattr(programs, "execute", fail)
+    monkeypatch.setattr(box, "close_box", fail_cleanup)
+    assert main(["exec", str(tmp_path)]) == 0
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert result["error"] == "the first error"
     assert "the cleanup error" in capsys.readouterr().err
     monkeypatch.undo()
-    primitive.close_box(primitive.BOX, primitive.BOX_ROOT / "0" / "box")
+    box.close_box(programs.BOX, box.BOX_ROOT / "0" / "box")
 
 
 def write_manifest(tmp_path: Path, document: object) -> Path:
@@ -1317,11 +1356,11 @@ def test_a_manifest_reads_as_its_reports(tmp_path: Path) -> None:
             }
         },
     )
-    manifest = primitive.read_manifest(path, "the manifest")
+    manifest = inputs.read_manifest(path, "the manifest")
     assert manifest == {
-        "score": primitive.Declared("number", False, Decimal(0), Decimal(1)),
-        "error": primitive.Declared("number", False, Decimal("0.5"), None),
-        "feedback": primitive.Declared("text", True),
+        "score": inputs.Declared("number", False, Decimal(0), Decimal(1)),
+        "error": inputs.Declared("number", False, Decimal("0.5"), None),
+        "feedback": inputs.Declared("text", True),
     }
 
 
@@ -1361,8 +1400,8 @@ def test_a_manifest_it_cannot_use_is_an_error(
     tmp_path: Path, document: object, message: str
 ) -> None:
     path = write_manifest(tmp_path, document)
-    with pytest.raises(primitive.PrimitiveError, match=re.escape(message)):
-        primitive.read_manifest(path, "the manifest")
+    with pytest.raises(shared.PrimitiveError, match=re.escape(message)):
+        inputs.read_manifest(path, "the manifest")
 
 
 def write_report(folder: Path, files: dict[str, bytes]) -> Path:
@@ -1373,7 +1412,7 @@ def write_report(folder: Path, files: dict[str, bytes]) -> Path:
     return folder
 
 
-DIFF = {"score": primitive.Declared("number", False, Decimal(0), Decimal(1))}
+DIFF = {"score": inputs.Declared("number", False, Decimal(0), Decimal(1))}
 
 
 def test_a_report_gives_its_reports_and_texts_and_shows_the_rest(
@@ -1390,8 +1429,8 @@ def test_a_report_gives_its_reports_and_texts_and_shows_the_rest(
             "notes": b"anything\n",
         },
     )
-    report = primitive.read_report(folder, DIFF)
-    assert report == primitive.Report(
+    read = report.read_report(folder, DIFF)
+    assert read == report.Report(
         verdict="0",
         outputs={
             "score": 0.5,
@@ -1410,13 +1449,13 @@ def test_a_wrong_verdict_shows_its_reports_unchecked(tmp_path: Path) -> None:
         tmp_path / "report",
         {"verdict": b"1", "score": b"oops", "message": b"wrong on line 2"},
     )
-    report = primitive.read_report(folder, DIFF)
-    assert report.verdict == "1"
-    assert report.outputs == {"message": "wrong on line 2"}
-    assert report.shown == {"score": b"oops"}
+    read = report.read_report(folder, DIFF)
+    assert read.verdict == "1"
+    assert read.outputs == {"message": "wrong on line 2"}
+    assert read.shown == {"score": b"oops"}
 
 
-@pytest.mark.parametrize("word", primitive.VERDICT_WORDS)
+@pytest.mark.parametrize("word", report.VERDICT_WORDS)
 def test_an_outcome_word_is_a_verdict_and_shows_its_reports_unchecked(
     tmp_path: Path, word: str
 ) -> None:
@@ -1427,23 +1466,23 @@ def test_an_outcome_word_is_a_verdict_and_shows_its_reports_unchecked(
         tmp_path / "report",
         {"verdict": f"{word}\n".encode(), "score": b"oops", "label": b"slow"},
     )
-    report = primitive.read_report(folder, DIFF)
-    assert report.verdict == word
-    assert report.outputs == {"label": "slow"}
-    assert report.shown == {"score": b"oops"}
-    assert primitive.verdict_outcome(report.verdict) == word
+    read = report.read_report(folder, DIFF)
+    assert read.verdict == word
+    assert read.outputs == {"label": "slow"}
+    assert read.shown == {"score": b"oops"}
+    assert report.verdict_outcome(read.verdict) == word
 
 
 def test_an_optional_report_may_be_left_out(tmp_path: Path) -> None:
-    manifest = {"score": primitive.Declared("number", optional=True)}
+    manifest = {"score": inputs.Declared("number", optional=True)}
     folder = write_report(tmp_path / "report", {"verdict": b"0"})
-    assert primitive.read_report(folder, manifest).outputs == {}
+    assert report.read_report(folder, manifest).outputs == {}
 
 
 def test_a_text_report_is_an_output_too(tmp_path: Path) -> None:
-    manifest = {"feedback": primitive.Declared("text")}
+    manifest = {"feedback": inputs.Declared("text")}
     folder = write_report(tmp_path / "report", {"verdict": b"0", "feedback": b"ok\n\n"})
-    assert primitive.read_report(folder, manifest).outputs == {"feedback": "ok"}
+    assert report.read_report(folder, manifest).outputs == {"feedback": "ok"}
 
 
 @pytest.mark.parametrize(
@@ -1462,7 +1501,7 @@ def test_a_number_is_a_decimal_as_json_writes_one(
     tmp_path: Path, written: bytes, value: float
 ) -> None:
     folder = write_report(tmp_path / "report", {"verdict": b"0", "score": written})
-    reported = primitive.read_report(folder, DIFF).outputs["score"]
+    reported = report.read_report(folder, DIFF).outputs["score"]
     assert reported == value
     assert type(reported) is type(value)
 
@@ -1508,21 +1547,21 @@ def test_a_report_that_does_not_hold_is_a_fault(
 ) -> None:
     """Each check `SIMPLER-CORE.md` 13.1 names, and what exec relies on."""
     folder = write_report(tmp_path / "report", files)
-    with pytest.raises(primitive.ReportError, match=re.escape(message)):
-        primitive.read_report(folder, DIFF)
+    with pytest.raises(report.ReportError, match=re.escape(message)):
+        report.read_report(folder, DIFF)
 
 
 def test_a_text_of_64_kb_is_kept_whole(tmp_path: Path) -> None:
     text = b"x" * (64 * 1024)
     folder = write_report(tmp_path / "report", {"verdict": b"1", "message": text})
-    assert primitive.read_report(folder, DIFF).outputs["message"] == text.decode()
+    assert report.read_report(folder, DIFF).outputs["message"] == text.decode()
 
 
 def test_a_report_of_too_many_files_is_a_fault(tmp_path: Path) -> None:
-    files = {f"note{n}": b"" for n in range(primitive.REPORT_FILES)}
+    files = {f"note{n}": b"" for n in range(report.REPORT_FILES)}
     folder = write_report(tmp_path / "report", files | {"verdict": b"1"})
-    with pytest.raises(primitive.ReportError, match="more than 64 files"):
-        primitive.read_report(folder, DIFF)
+    with pytest.raises(report.ReportError, match="more than 64 files"):
+        report.read_report(folder, DIFF)
 
 
 @pytest.mark.parametrize("kind", ["link", "fifo", "folder"])
@@ -1540,8 +1579,8 @@ def test_a_report_file_that_is_not_a_plain_file_is_a_fault(
         os.mkfifo(folder / "message")
     else:
         (folder / "message").mkdir()
-    with pytest.raises(primitive.ReportError, match="holds message, not a plain file"):
-        primitive.read_report(folder, DIFF)
+    with pytest.raises(report.ReportError, match="holds message, not a plain file"):
+        report.read_report(folder, DIFF)
 
 
 def reporting(work: Path, result: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1714,7 +1753,7 @@ def test_a_manifest_or_self_report_it_cannot_use_is_an_error(
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["batch"][0]["inputs"].update(inputs)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
-    primitive.main(["exec", str(tmp_path)])
+    main(["exec", str(tmp_path)])
     assert message in json.loads((tmp_path / "outputs.json").read_text())["error"]
 
 
@@ -1763,8 +1802,8 @@ def test_a_run_the_step_holds_is_let_through(
     memory = tmp_path / "memory.max"
     if held is not None:
         memory.write_text(held)
-    monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
-    primitive.check_memory(needed_mb * 1024, given_mb * 1024, "main-1")
+    monkeypatch.setattr(box, "CONTAINER_MEMORY", memory)
+    box.check_memory(needed_mb * 1024, given_mb * 1024, "main-1")
 
 
 @pytest.mark.parametrize(
@@ -1777,9 +1816,9 @@ def test_a_run_the_step_cannot_hold_is_refused(
     little for the run."""
     memory = tmp_path / "memory.max"
     memory.write_text(held)
-    monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
-    with pytest.raises(primitive.PrimitiveError) as raised:
-        primitive.check_memory(144 * 1024 + 1, given_mb * 1024, "main-1")
+    monkeypatch.setattr(box, "CONTAINER_MEMORY", memory)
+    with pytest.raises(shared.PrimitiveError) as raised:
+        box.check_memory(144 * 1024 + 1, given_mb * 1024, "main-1")
     assert str(raised.value) == (
         "the run main-1 needs 145 MB for its memory limits and the files copied "
         "in beside them, and the step's 256 MB leaves 144 MB for them"
@@ -1793,15 +1832,15 @@ def test_a_batch_with_a_run_the_step_cannot_hold_runs_nothing(
     copied into the box's tmpfs, charged to the step: so a run whose limit
     fits but whose files do not is refused before any program runs, an
     error of the step, not a run the step's limit kills."""
-    monkeypatch.setattr(primitive, "CONTAINER_MEMORY", tmp_path / "none")
-    monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
-    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, "240")
+    monkeypatch.setattr(box, "CONTAINER_MEMORY", tmp_path / "none")
+    monkeypatch.setenv(box.BOX_USERS_VARIABLE, BOX_USERS)
+    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, "240")
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
     files = {"main-2": {"data": b"x" * (80 * MB)}}
     items = [("main-1", "double\n21\n"), ("main-2", "double\n21\n")]
     batch_inputs(work, binary, items, files=files)
-    assert primitive.main(["exec", str(work)]) == 0
+    assert main(["exec", str(work)]) == 0
     result = json.loads((work / "outputs.json").read_text())
     assert result["error"].startswith("the run main-2 needs 145 MB")
     assert "batch" not in result
@@ -1832,15 +1871,14 @@ def cached_work(tmp_path: Path, binary: bytes, stdin: str) -> Path:
 
 def test_a_cached_file_is_read_through_the_steps_cache_link(tmp_path: Path) -> None:
     work = cached_work(tmp_path, b"\x7fELF", "")
-    item = primitive.read_inputs(work)[0]
-    assert isinstance(item, primitive.Item)
+    (item,) = inputs.read_inputs(work)[0].programs
     found = (tmp_path / "cache" / "items" / "step-k2" / "Wq81").resolve()
     assert item.files == {"train.csv": found / "train.csv"}
     assert item.cached == found
     program_kb = 4 * -(-item.program.stat().st_size // 4096)
-    assert primitive.box_size_kb(item) == item.memory_limit_kb + program_kb
-    assert primitive.cache_binding(item.cached) == [f"--dir=cache={found}:noexec"]
-    assert primitive.cache_binding(None) == []
+    assert box.box_size_kb(item) == item.memory_limit_kb + program_kb
+    assert box.cache_binding(item.cached) == [f"--dir=cache={found}:noexec"]
+    assert box.cache_binding(None) == []
 
 
 @pytest.mark.parametrize(
@@ -1863,8 +1901,8 @@ def test_a_cached_file_not_straight_in_an_item_folder_is_refused(
     (item / "deeper").mkdir()
     (item / "deeper" / "train.csv").write_text("x")
     (item / "away").symlink_to(work / "in" / "1" / "program")
-    with pytest.raises(primitive.PrimitiveError) as raised:
-        primitive.in_file(work, {"file": path}, "the file")
+    with pytest.raises(shared.PrimitiveError) as raised:
+        inputs.in_file(work, {"file": path}, "the file")
     assert str(raised.value) in (
         "the file is not a cached file of an item",
         "the file is outside in/",
@@ -1881,8 +1919,8 @@ def test_cached_files_of_two_items_in_one_run_are_refused(tmp_path: Path) -> Non
     loads = {"test.csv": {"file": "cache/Zr3/test.csv"}}
     document["batch"][0]["inputs"]["loads"] = {"files": loads}
     (work / "inputs.json").write_text(json.dumps(document))
-    with pytest.raises(primitive.PrimitiveError) as raised:
-        primitive.read_inputs(work)
+    with pytest.raises(shared.PrimitiveError) as raised:
+        inputs.read_inputs(work)
     assert (
         str(raised.value) == "the run main-1 names cached files of more than one item"
     )
@@ -1895,8 +1933,8 @@ def test_an_item_folder_holding_another_runs_file_is_refused(tmp_path: Path) -> 
     item = tmp_path / "cache" / "items" / "step-k2" / "Wq81"
     item.chmod(0o755)
     (item / "answer").write_text("main-2's")
-    with pytest.raises(primitive.PrimitiveError) as raised:
-        primitive.read_inputs(work)
+    with pytest.raises(shared.PrimitiveError) as raised:
+        inputs.read_inputs(work)
     assert str(raised.value) == (
         "the run main-1 has an item folder in the cache that also holds "
         "'answer', a file not its own"
@@ -1911,8 +1949,7 @@ def test_a_cached_stdin_may_share_the_runs_item_folder(tmp_path: Path) -> None:
     document = json.loads((work / "inputs.json").read_text())
     document["batch"][0]["inputs"]["stdin"] = {"file": "cache/Wq81/input"}
     (work / "inputs.json").write_text(json.dumps(document))
-    read = primitive.read_inputs(work)[0]
-    assert isinstance(read, primitive.Item)
+    (read,) = inputs.read_inputs(work)[0].programs
     assert read.cached == item.resolve()
 
 
@@ -1925,7 +1962,7 @@ def test_a_cached_file_is_placed_as_a_link_into_the_bound_folder(
     (tmp_path / "answer").write_text("2")
     cwd = tmp_path / "run"
     files = {"data": item / "train.csv", "answer": tmp_path / "answer"}
-    primitive.place_files(cwd, files, item)
+    box.place_files(cwd, files, item)
     assert (cwd / "data").readlink() == Path("/cache/train.csv")
     assert not (cwd / "answer").is_symlink()
     assert (cwd / "answer").read_text() == "2"
@@ -1940,7 +1977,7 @@ def test_a_cached_file_is_bound_into_the_box_read_only_and_never_copied(
     printed for the record."""
     binary = python_binary(tmp_path / "build" / "program", PROGRAM).read_bytes()
     work = cached_work(tmp_path, binary, "cached\ntrain.csv\n")
-    assert primitive.main(["exec", str(work)]) == 0
+    assert main(["exec", str(work)]) == 0
     outputs = by_run(json.loads((work / "outputs.json").read_text()))["main-1"]
     assert outputs["outcome"] == "accepted", printed(work, outputs)
     lines = printed(work, outputs).splitlines()

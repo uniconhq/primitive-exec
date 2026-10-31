@@ -11,7 +11,7 @@ dependencies = []
 [project.urls]
 Source = "https://github.com/uniconhq/primitive-exec"
 
-# The program is one file with no dependencies, copied into the image as it is.
+# The program is a package with no dependencies, copied into the image as it is.
 # These are the tools that check it.
 [dependency-groups]
 dev = [

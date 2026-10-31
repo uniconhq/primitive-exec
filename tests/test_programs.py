@@ -19,7 +19,8 @@ from typing import Any
 
 import pytest
 
-import exec as primitive
+from exec import box, inputs, programs, report, shared
+from exec.main import main
 from support import (
     BOX_USERS,
     ENTRANT,
@@ -51,12 +52,12 @@ def boxes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Give interact the tests' box users and step memory, or skip a test
     that runs programs where interact cannot make boxes."""
     able = sys.platform == "linux" and os.geteuid() == 0
-    if not (able and Path(primitive.ISOLATE).is_file()):
+    if not (able and Path(box.ISOLATE).is_file()):
         if IN_BOXES:
             pytest.fail("the test container has no root with isolate")
         pytest.skip("runs programs in isolate boxes: run in the test container")
-    monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
-    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, STEP_MEMORY_MB)
+    monkeypatch.setenv(box.BOX_USERS_VARIABLE, BOX_USERS)
+    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, STEP_MEMORY_MB)
 
 
 class Batch:
@@ -84,7 +85,7 @@ def run(boxes: None, tmp_path: Path) -> Any:
     def batch(items: list[TestItem]) -> Batch:
         work = tmp_path / f"work-{next(count)}"
         batch_inputs(work, items)
-        assert primitive.main(["interact", str(work)]) == 0
+        assert main(["interact", str(work)]) == 0
         document: dict[str, Any] = json.loads(
             (work / "outputs.json").read_text(encoding="utf-8")
         )
@@ -616,15 +617,15 @@ def test_the_step_is_capped_at_the_memory_it_was_given(run: Any) -> None:
     two = {name: Spec(ENTRANT, "leave", memory_limit=96) for name in ("a", "b")}
     done = run([("main-1", {"a": Spec(ENTRANT, "leave")}, []), ("main-2", two, [])])
     assert "error" not in done.document, done.document
-    capped = (primitive.STEP_CGROUP / "memory.max").read_text()
+    capped = (box.STEP_CGROUP / "memory.max").read_text()
     assert int(capped) == int(STEP_MEMORY_MB) * 2**20
-    assert primitive.BOX_CGROUPS.parent == primitive.STEP_CGROUP
-    assert str(os.getpid()) in (primitive.MAIN_CGROUP / "cgroup.procs").read_text()
+    assert box.BOX_CGROUPS.parent == box.STEP_CGROUP
+    assert str(os.getpid()) in (box.MAIN_CGROUP / "cgroup.procs").read_text()
 
 
 def test_the_steps_memory_is_what_it_was_given(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, "640")
-    assert primitive.step_memory_kb() == 640 * 1024
+    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, "640")
+    assert box.step_memory_kb() == 640 * 1024
 
 
 @pytest.mark.parametrize(
@@ -642,16 +643,16 @@ def test_a_steps_memory_it_cannot_use_is_an_error(
     monkeypatch: pytest.MonkeyPatch, given: str | None, message: str
 ) -> None:
     if given is None:
-        monkeypatch.delenv(primitive.STEP_MEMORY_VARIABLE, raising=False)
+        monkeypatch.delenv(box.STEP_MEMORY_VARIABLE, raising=False)
     else:
-        monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, given)
-    with pytest.raises(primitive.PrimitiveError, match=re.escape(message)):
-        primitive.step_memory_kb()
+        monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, given)
+    with pytest.raises(shared.PrimitiveError, match=re.escape(message)):
+        box.step_memory_kb()
 
 
 def test_the_box_launchers_self_test_passes_in_a_box(boxes: None) -> None:
-    primitive.set_up_step(primitive.box_users(), primitive.step_memory_kb())
-    primitive.check_launcher()
+    box.set_up_step(box.box_users(), box.step_memory_kb())
+    box.check_launcher()
 
 
 @pytest.mark.parametrize(
@@ -667,7 +668,7 @@ def test_a_box_launcher_that_fails_its_self_test_stops_the_step(
     """A launcher that cannot set its filter up would end every program as
     a runtime error, its message gone with the box's standard error: the
     step fails instead, saying what the launcher said, and nothing runs."""
-    monkeypatch.setattr(primitive, "LAUNCHER", launcher)
+    monkeypatch.setattr(box, "LAUNCHER", launcher)
     done = run([("main-1", game("guess"), GAME_LINKS)])
     assert set(done.document) == {"schema_version", "error"}
     assert done.document["error"].startswith("the box launcher's self-test failed")
@@ -685,8 +686,8 @@ def test_a_hard_limit_below_what_isolate_needs_stops_the_step(
 
     monkeypatch.setattr(resource, "getrlimit", low)
     monkeypatch.setattr(resource, "setrlimit", lambda *_: None)
-    with pytest.raises(primitive.PrimitiveError, match="hard limit on open files"):
-        primitive.raise_limits()
+    with pytest.raises(shared.PrimitiveError, match="hard limit on open files"):
+        box.raise_limits()
 
 
 def test_the_soft_limits_isolate_inherits_are_raised(
@@ -699,10 +700,10 @@ def test_the_soft_limits_isolate_inherits_are_raised(
     made: dict[int, tuple[int, int]] = {}
     monkeypatch.setattr(resource, "getrlimit", limits.__getitem__)
     monkeypatch.setattr(resource, "setrlimit", made.__setitem__)
-    primitive.raise_limits()
+    box.raise_limits()
     assert made == {
-        resource.RLIMIT_STACK: (primitive.ISOLATE_STACK, resource.RLIM_INFINITY),
-        resource.RLIMIT_NOFILE: (primitive.ISOLATE_OPEN_FILES, 524288),
+        resource.RLIMIT_STACK: (box.ISOLATE_STACK, resource.RLIM_INFINITY),
+        resource.RLIMIT_NOFILE: (box.ISOLATE_OPEN_FILES, 524288),
     }
 
 
@@ -766,11 +767,11 @@ def test_a_report_of_a_program_that_did_not_finish_is_left_out_if_it_does_not_ho
 
 def test_the_declaration_names_every_fact() -> None:
     port = declaration("programs")["inputs"]["programs"]
-    assert tuple(port["outputs"]) == primitive.FACTS
+    assert tuple(port["outputs"]) == programs.FACTS
     ended = port["outputs"]["ended"]["options"]
     assert ended == ["finished", *EXEC_OUTCOMES]
-    assert set(primitive.FACTS) <= primitive.PROGRAMS_OWN_NAMES
-    assert tuple(primitive.VERDICT_WORDS) == EXEC_OUTCOMES
+    assert set(programs.FACTS) <= inputs.PROGRAMS_OWN_NAMES
+    assert tuple(report.VERDICT_WORDS) == EXEC_OUTCOMES
     assert len(port["inputs"]) == 7
 
 
@@ -846,9 +847,64 @@ def test_inputs_that_do_not_hold_are_refused(
     (tmp_path / "in" / "m").write_text(json.dumps({"reports": {"ended": {}}}))
     document = {"schema_version": 6, "batch": [given]}
     (tmp_path / "inputs.json").write_text(json.dumps(document))
-    with pytest.raises(primitive.PrimitiveError) as raised:
-        primitive.read_inputs(tmp_path)
+    with pytest.raises(shared.PrimitiveError) as raised:
+        inputs.read_inputs(tmp_path)
     assert fault in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("more", "message"),
+    [
+        (
+            {"time_limit": True},
+            "the input named time_limit of program a of run main-1 is not a "
+            "positive number",
+        ),
+        (
+            {"stops_others": "yes"},
+            "the input named stops_others of program a of run main-1 is not true "
+            "or false",
+        ),
+        (
+            {"files": {"files": {"a b": {"file": "in/p"}}}},
+            "the input named files of program a of run main-1 names a file "
+            "'a b', not a plain name",
+        ),
+        (
+            {"program": {"file": "../p"}},
+            "the input named program of program a of run main-1 is outside in/",
+        ),
+    ],
+)
+def test_an_input_that_does_not_hold_is_named_with_its_program(
+    tmp_path: Path, more: dict[str, Any], message: str
+) -> None:
+    (tmp_path / "in").mkdir()
+    (tmp_path / "in" / "p").write_bytes(b"")
+    document = {"schema_version": 6, "batch": [item({"a": entry(**more)})]}
+    (tmp_path / "inputs.json").write_text(json.dumps(document))
+    with pytest.raises(shared.PrimitiveError) as raised:
+        inputs.read_inputs(tmp_path)
+    assert str(raised.value) == message
+
+
+def test_a_program_is_read_without_the_one_program_forms_own_inputs(
+    tmp_path: Path,
+) -> None:
+    """`stdin`, `loads` and `self_reported` are the one-program form's alone,
+    so a program of this form that gives them, whatever they hold, is read as
+    without them."""
+    (tmp_path / "in").mkdir()
+    (tmp_path / "in" / "p").write_bytes(b"")
+    given = entry(stdin={"file": "in/none"}, loads="x", self_reported="yes")
+    document = {"schema_version": 6, "batch": [item({"a": given})]}
+    (tmp_path / "inputs.json").write_text(json.dumps(document))
+    (read,) = inputs.read_inputs(tmp_path)
+    (program,) = read.programs
+    assert read.several
+    assert program.stdin is None
+    assert program.loads == {}
+    assert not program.self_reported
 
 
 def test_a_batch_that_mixes_the_two_forms_is_refused(tmp_path: Path) -> None:
@@ -863,38 +919,38 @@ def test_a_batch_that_mixes_the_two_forms_is_refused(tmp_path: Path) -> None:
     second["run"] = "main-2"
     document = {"schema_version": 6, "batch": [one, second]}
     (tmp_path / "inputs.json").write_text(json.dumps(document))
-    with pytest.raises(primitive.PrimitiveError, match="mixes the one-program form"):
-        primitive.run_batch(tmp_path, primitive.read_inputs(tmp_path))
+    with pytest.raises(shared.PrimitiveError, match="mixes the one-program form"):
+        programs.run_batch(tmp_path, inputs.read_inputs(tmp_path))
 
 
 def test_a_batch_of_more_programs_than_box_users_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, "60000-60001")
-    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, STEP_MEMORY_MB)
+    monkeypatch.setenv(box.BOX_USERS_VARIABLE, "60000-60001")
+    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, STEP_MEMORY_MB)
     programs = {name: Spec(ENTRANT, "leave") for name in ("a", "b", "c")}
     batch_inputs(tmp_path / "work", [("main-1", programs, [])])
-    assert primitive.main(["interact", str(tmp_path / "work")]) == 0
+    assert main(["interact", str(tmp_path / "work")]) == 0
     result = json.loads((tmp_path / "work" / "outputs.json").read_text())
     assert "a run has 3 programs" in result["error"]
 
 
 def test_pipe_names_follow_the_order_of_the_links() -> None:
     entries = tuple(
-        primitive.Entry(name=name, program=Path("p"), time_limit=1, memory_limit=1)
+        inputs.Entry(name=name, program=Path("p"), time_limit=1, memory_limit=1)
         for name in ("a", "b", "c")
     )
     links = tuple(
-        primitive.Link(*text.split(" -> "))
+        inputs.Link(*text.split(" -> "))
         for text in ["a -> b", "a -> c", "c -> a", "b -> a", "c -> b"]
     )
-    named = primitive.pipe_names(primitive.ProgramsItem("main-1", 1, entries, links))
+    named = inputs.pipe_names(inputs.Item("main-1", 1, entries, links))
     assert named == {"a": ["to_c", "from_b"], "b": ["from_c"], "c": ["to_b"]}
 
 
 def test_a_signal_has_its_name() -> None:
-    assert primitive.signal_name(signal.SIGPIPE) == "SIGPIPE"
-    assert primitive.signal_name(200) == "signal 200"
+    assert programs.signal_name(signal.SIGPIPE) == "SIGPIPE"
+    assert programs.signal_name(200) == "signal 200"
 
 
 MB = 1024 * 1024
@@ -922,8 +978,8 @@ def test_a_run_the_step_holds_is_let_through(
     memory = tmp_path / "memory.max"
     if held is not None:
         memory.write_text(held)
-    monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
-    primitive.check_memory(needed_mb * 1024, given_mb * 1024, "main-1")
+    monkeypatch.setattr(box, "CONTAINER_MEMORY", memory)
+    box.check_memory(needed_mb * 1024, given_mb * 1024, "main-1")
 
 
 @pytest.mark.parametrize(
@@ -936,9 +992,9 @@ def test_a_run_the_step_cannot_hold_is_refused(
     little for the run."""
     memory = tmp_path / "memory.max"
     memory.write_text(held)
-    monkeypatch.setattr(primitive, "CONTAINER_MEMORY", memory)
-    with pytest.raises(primitive.PrimitiveError) as raised:
-        primitive.check_memory(144 * 1024 + 1, given_mb * 1024, "main-1")
+    monkeypatch.setattr(box, "CONTAINER_MEMORY", memory)
+    with pytest.raises(shared.PrimitiveError) as raised:
+        box.check_memory(144 * 1024 + 1, given_mb * 1024, "main-1")
     assert str(raised.value) == (
         "the run main-1 needs 145 MB for its memory limits and the files copied "
         "in beside them, and the step's 256 MB leaves 144 MB for them"
@@ -953,12 +1009,12 @@ def test_a_run_whose_programs_together_do_not_fit_runs_nothing(
     in what a step of 224 MB leaves, and the batch is refused before any
     program runs, an error of the step, not a program the step's limit
     kills."""
-    monkeypatch.setattr(primitive, "CONTAINER_MEMORY", tmp_path / "none")
-    monkeypatch.setenv(primitive.BOX_USERS_VARIABLE, BOX_USERS)
-    monkeypatch.setenv(primitive.STEP_MEMORY_VARIABLE, "224")
+    monkeypatch.setattr(box, "CONTAINER_MEMORY", tmp_path / "none")
+    monkeypatch.setenv(box.BOX_USERS_VARIABLE, BOX_USERS)
+    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, "224")
     work = tmp_path / "work"
     batch_inputs(work, [("main-1", game("guess"), GAME_LINKS)])
-    assert primitive.main(["interact", str(work)]) == 0
+    assert main(["interact", str(work)]) == 0
     result = json.loads((work / "outputs.json").read_text())
     assert result["error"].startswith("the run main-1 needs 129 MB")
     assert not (work / "out").exists()
@@ -988,14 +1044,14 @@ def test_a_cached_file_is_read_through_the_steps_cache_link(tmp_path: Path) -> N
     work = tmp_path / "work"
     batch_inputs(work, [("main-1", game("guess"), GAME_LINKS)])
     item = cache_the_secret(work).resolve()
-    read = primitive.read_inputs(work)[0]
-    assert isinstance(read, primitive.ProgramsItem)
+    read = inputs.read_inputs(work)[0]
+    assert read.several
     programs = read.programs
     judge = next(entry for entry in programs if entry.name == "judge")
     assert judge.files == {"secret": item / "secret"}
     assert judge.cached == item
     program_kb = 4 * -(-judge.program.stat().st_size // 4096)
-    assert primitive.programs_box_size_kb(judge) == judge.memory_limit_kb + program_kb
+    assert box.box_size_kb(judge) == judge.memory_limit_kb + program_kb
 
 
 def test_cached_files_of_two_items_in_one_program_are_refused(tmp_path: Path) -> None:
@@ -1016,8 +1072,8 @@ def test_cached_files_of_two_items_in_one_program_are_refused(tmp_path: Path) ->
         }
     }
     (work / "inputs.json").write_text(json.dumps(document))
-    with pytest.raises(primitive.PrimitiveError) as raised:
-        primitive.read_inputs(work)
+    with pytest.raises(shared.PrimitiveError) as raised:
+        inputs.read_inputs(work)
     assert str(raised.value) == (
         "the program solo of run main-1 names cached files of more than one item"
     )
@@ -1029,7 +1085,7 @@ def test_a_judge_reads_a_cached_file_bound_into_its_box(
     work = tmp_path / "work"
     batch_inputs(work, [("main-1", game("guess"), GAME_LINKS)])
     item = cache_the_secret(work)
-    assert primitive.main(["interact", str(work)]) == 0
+    assert main(["interact", str(work)]) == 0
     done = Batch(work, json.loads((work / "outputs.json").read_text()))
     assert "error" not in done.document, done.document
     assert done.outputs["main-1"]["outcome"] == "accepted"
@@ -1065,8 +1121,8 @@ def test_an_item_folder_holding_another_programs_file_is_refused(
     batch_inputs(work, [("main-1", game("guess"), GAME_LINKS)])
     folder = cache_named_files(work, "judge", "Wq81")
     (folder / "entrants-own").write_text("not the judge's")
-    with pytest.raises(primitive.PrimitiveError) as raised:
-        primitive.read_inputs(work)
+    with pytest.raises(shared.PrimitiveError) as raised:
+        inputs.read_inputs(work)
     assert str(raised.value) == (
         "the program judge of run main-1 has an item folder in the cache that "
         "also holds 'entrants-own', a file not its own"
@@ -1084,7 +1140,7 @@ def test_a_program_sees_only_its_own_cached_files(boxes: None, tmp_path: Path) -
     batch_inputs(work, [("main-1", programs, [])])
     cache_named_files(work, "judge", "Wq81")
     cache_named_files(work, "entrant", "Zr3")
-    assert primitive.main(["interact", str(work)]) == 0
+    assert main(["interact", str(work)]) == 0
     done = Batch(work, json.loads((work / "outputs.json").read_text()))
     assert "error" not in done.document, done.document
     facts = done.facts("main-1")

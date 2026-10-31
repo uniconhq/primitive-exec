@@ -15,7 +15,7 @@ for the workflow versions that use it.
 This repo holds the image, `ghcr.io/uniconhq/primitive-exec`, built from the
 `Dockerfile`, with [isolate](https://github.com/ioi/isolate) 2.7 built into
 it unpatched and our box launcher, `src/box-launch.c`, beside it; exec
-itself, the Python program the image runs, `src/exec.py`, which runs every
+itself, the Python package the image runs, `src/exec/`, which runs every
 program in an isolate box of its own; and `primitive.yaml`, the declaration the
 forge compiler reads to type-check a workflow that uses the primitive. exec
 speaks the primitive contract, `primitive.schema.json` version 6, published
@@ -589,7 +589,14 @@ Python or Java, is made in both repos together.
 
 ```
 Dockerfile                  the image: isolate and the box launcher built in a stage of their own, primitive-base, OpenJDK 21 runtime
-src/exec.py                 exec, installed as /usr/local/bin/exec, the image's command
+src/exec/                   exec, installed as /usr/local/lib/unicon-exec/exec/, by job:
+  shared.py                   what every module shares: the contract version, the output cap, the error that ends a step
+  inputs.py                   reading inputs.json: items, each program's inputs, manifests
+  box.py                      isolate and the step: setting up, each box made and thrown away, the isolate command line
+  report.py                   outcomes, what a program given a manifest reported, the JSON files exec writes
+  programs.py                 running the batch: one program alone, or several side by side joined by links
+  main.py                     read the batch, run it, write outputs.json
+src/command.py              installed as /usr/local/bin/exec, the image's command: puts the package on the path, runs main
 src/box-launch.c            the box launcher, installed as /usr/local/bin/box-launch: the keyring and watch calls refused
 primitive.yaml              the declaration, without the image line
 tests/                      unit tests, and image tests that run it on Docker

@@ -60,7 +60,13 @@ RUN mkdir -p /usr/share/man/man1 \
 # isolate links libcap2 and libseccomp2, which the base image has; box-launch
 # links nothing. Every box sees it, under the /usr isolate binds into each.
 COPY --from=isolate /out/ /
-COPY --chmod=0755 src/exec.py /usr/local/bin/exec
+
+# exec's package goes in a folder of its own outside site-packages, so nothing
+# else imports it, compiled at build so no step writes bytecode beside it;
+# /usr/local/bin/exec puts that folder on its path and runs it.
+COPY src/exec/ /usr/local/lib/unicon-exec/exec/
+RUN python3 -m compileall -q /usr/local/lib/unicon-exec
+COPY --chmod=0755 src/command.py /usr/local/bin/exec
 
 # exec runs as root: it sets up the step's cgroup, mounts each box's tmpfs and
 # runs isolate, and each run is a box user of its own, never root.
