@@ -155,14 +155,15 @@ def cache_binding(folder: Path | None) -> list[str]:
     return [f"--dir={CACHE_MOUNT.lstrip('/')}={folder}:noexec"]
 
 
-def box_size_kb(entry: Entry) -> int:
+def box_size_kb(entry: Entry, program: Path) -> int:
     """The size of a program's box tmpfs, in kilobytes: its memory limit,
     which holds what the program writes there before the size does, as every
-    page it writes is charged to the box's memory, plus the program and the
-    named files exec copies in, which are charged to exec's, each to whole
-    4 KB pages. A cached named file is not copied but bound in."""
+    page it writes is charged to the box's memory, plus the program, compiled
+    to `program`, and the named files exec copies in, which are charged to
+    exec's, each to whole 4 KB pages. A cached named file is not copied but
+    bound in."""
     named = [*entry.files.values(), *entry.loads.values()]
-    copied = [entry.program, *(path for path in named if path.parent != entry.cached)]
+    copied = [program, *(path for path in named if path.parent != entry.cached)]
     return entry.memory_limit_kb + sum(
         4 * -(-path.stat().st_size // 4096) for path in copied
     )
@@ -176,11 +177,7 @@ def check_memory(needed_kb: int, memory_kb: int, run: str) -> None:
     otherwise kill first: a program, which isolate reads as the box's own
     kill, a `memory_limit` that was not the program's, or the step itself,
     which then writes no outputs at all."""
-    held_kb = memory_kb
-    with contextlib.suppress(FileNotFoundError):
-        text = CONTAINER_MEMORY.read_text().strip()
-        if text != "max":
-            held_kb = min(held_kb, int(text) // 1024)
+    held_kb = held_memory_kb(memory_kb)
     if needed_kb + STEP_MEMORY_KB > held_kb:
         raise PrimitiveError(
             f"the run {run} needs {math.ceil(needed_kb / 1024)} MB for its "
@@ -188,6 +185,16 @@ def check_memory(needed_kb: int, memory_kb: int, run: str) -> None:
             f"step's {held_kb // 1024} MB leaves "
             f"{max(0, held_kb - STEP_MEMORY_KB) // 1024} MB for them"
         )
+
+
+def held_memory_kb(memory_kb: int) -> int:
+    """The memory the step holds, in kilobytes: its own, `memory_kb`, or
+    the container's, when that is less."""
+    with contextlib.suppress(FileNotFoundError):
+        text = CONTAINER_MEMORY.read_text().strip()
+        if text != "max":
+            return min(memory_kb, int(text) // 1024)
+    return memory_kb
 
 
 def place_files(cwd: Path, files: dict[str, Path], cached: Path | None) -> None:
@@ -218,6 +225,18 @@ def place_files(cwd: Path, files: dict[str, Path], cached: Path | None) -> None:
         placed.chmod(NAMED_FILE_MODE)
 
 
+@dataclass(frozen=True)
+class Limits:
+    """What isolate holds a box to: CPU seconds over all its processes,
+    wall-clock seconds, the box's memory and the stack in kilobytes, and
+    the box user's processes and threads."""
+
+    time: float
+    wall: float
+    memory_kb: int
+    processes: int = PROCESS_LIMIT
+
+
 def isolate_command(
     number: int,
     meta: Path,
@@ -227,24 +246,43 @@ def isolate_command(
     run: list[str],
 ) -> list[str]:
     """The isolate command line that runs `run`, one program, in box
-    `number`, already made and filled, writing its meta file to `meta`.
+    `number`, already made and filled, writing its meta file to `meta`
+    (`box_command`), under the entry's limits.
+
+    The environment holds only `PATH`, `HOME` and `TMPDIR`, both the working
+    directory, `LANG=C.UTF-8`, and for a program given a manifest
+    (`reports`) `UNICON_REPORT`. The options in `more` are the caller's own.
+    Standard error goes nowhere.
+    """
+    env = {"PATH": RUN_PATH, "HOME": "/box/run", "TMPDIR": "/box/run"}
+    env["LANG"] = "C.UTF-8"
+    if reports:
+        env["UNICON_REPORT"] = "/box/report"
+    limits = Limits(entry.time_limit, entry.wall_limit, entry.memory_limit_kb)
+    options = [*more, "--chdir=/box/run", "--stderr=/dev/null"]
+    return box_command(number, meta, limits, env, options, run)
+
+
+def box_command(
+    number: int,
+    meta: Path,
+    limits: Limits,
+    env: dict[str, str],
+    options: list[str],
+    run: list[str],
+) -> list[str]:
+    """The isolate command line that runs `run` in box `number`, already
+    made and filled, writing its meta file to `meta`.
 
     isolate holds every limit: CPU time over all the box's processes
     (`--time`), the wall clock (`--wall-time`), the box's memory in its
     cgroup, without swap (`--cg-mem`), the stack at the memory limit, and the
     box user's processes (`--processes`). The box gets `/tmp` and `/dev/shm`
     from its own tmpfs, the step's `/dev` of four devices, and of `/etc` only
-    `JAVA_CONFIG`, read-only, then the options in `more`, the caller's own.
-    The environment holds only `PATH`, `HOME` and `TMPDIR`, both the working
-    directory, `LANG=C.UTF-8`, and for a program given a manifest
-    (`reports`) `UNICON_REPORT`. Standard error goes nowhere. The program
-    starts through `LAUNCHER`, which runs it with that command line and
-    environment once its filter is on.
+    `JAVA_CONFIG`, read-only, then `options`, and `env` as its whole
+    environment. The program starts through `LAUNCHER`, which runs it with
+    that command line and environment once its filter is on.
     """
-    env = {"PATH": RUN_PATH, "HOME": "/box/run", "TMPDIR": "/box/run"}
-    env["LANG"] = "C.UTF-8"
-    if reports:
-        env["UNICON_REPORT"] = "/box/report"
     box = BOX_ROOT / str(number) / "box"
     return [
         ISOLATE,
@@ -252,18 +290,16 @@ def isolate_command(
         f"--box-id={number}",
         "--silent",
         f"--meta={meta}",
-        f"--time={entry.time_limit}",
-        f"--wall-time={entry.wall_limit}",
-        f"--cg-mem={entry.memory_limit_kb}",
-        f"--stack={entry.memory_limit_kb}",
-        f"--processes={PROCESS_LIMIT}",
+        f"--time={limits.time}",
+        f"--wall-time={limits.wall}",
+        f"--cg-mem={limits.memory_kb}",
+        f"--stack={limits.memory_kb}",
+        f"--processes={limits.processes}",
         f"--dir=tmp={box / 'tmp'}:rw",
         f"--dir=dev={BOX_DEV}:dev",
         f"--dir=dev/shm={box / 'shm'}:rw",
         f"--dir={JAVA_CONFIG.lstrip('/')}",
-        *more,
-        "--chdir=/box/run",
-        "--stderr=/dev/null",
+        *options,
         *(f"--env={name}={value}" for name, value in env.items()),
         "--run",
         "--",
@@ -314,6 +350,17 @@ def isolate_said(code: int, said: str | bytes) -> str:
     if code < 0:
         return f"it was killed by signal {-code} and said nothing"
     return f"it exited with code {code} and said nothing"
+
+
+def check_isolate(code: int, found: dict[str, str], errors: Path, what: str) -> None:
+    """Refuse the step when isolate itself failed to run `what`: it exited
+    other than 0 or 1, or its meta file, read as `found`, says `XX`. What it
+    said is its message, or its standard error, kept at `errors`."""
+    if code not in (0, 1) or found.get("status") == "XX":
+        said = found.get("message") or errors.read_bytes()
+        raise PrimitiveError(
+            f"isolate could not run {what}: {isolate_said(code, said)}"
+        )
 
 
 def read_meta(path: Path) -> dict[str, str]:

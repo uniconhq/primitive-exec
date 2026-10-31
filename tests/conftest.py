@@ -9,10 +9,8 @@ working directory at /work. They are skipped when Docker is not reachable.
 The contract checks use `primitive.schema.json` from `PRIMITIVE_SCHEMA`, or
 from a runner checkout beside this one, when it has the version 6 contract.
 
-Native and Java binaries come from the compile primitive's image, named by
-`COMPILE_IMAGE` or built from a primitive-compile checkout beside this one;
-the tests that need one are skipped when there is neither. The in-process
-tests import the program, which needs Linux, so elsewhere only the image
+Every test gives exec a program's source, which exec compiles itself. The
+in-process tests import the program, which needs Linux, so elsewhere only the image
 tests are collected; those that run programs need root and isolate too, so
 they are skipped elsewhere and run in the privileged test container
 (`tests/Dockerfile`), which one image test starts. The declaration is
@@ -37,16 +35,12 @@ from support import (
     NAME,
     ROOT,
     SCHEMA_VERSION,
-    SIBLING_COMPILE,
     SIBLING_SCHEMA,
     USERNS,
     Check,
-    Compiled,
     RunImage,
     base_build_args,
     declaration,
-    open_up,
-    sandbox_flags,
     step_flags,
 )
 
@@ -144,78 +138,6 @@ def docker(*arguments: str) -> str:
 
 
 @pytest.fixture(scope="session")
-def compile_image(image: str) -> str:
-    """The compile primitive's image: `COMPILE_IMAGE`, or built from its checkout."""
-    named = os.environ.get("COMPILE_IMAGE")
-    if named:
-        return named
-    if not (SIBLING_COMPILE / "Dockerfile").is_file():
-        pytest.skip("no compile image to build binaries with; set COMPILE_IMAGE")
-    tag = "primitive-compile:test"
-    command = ["docker", "build", "--quiet", *base_build_args(), "--tag", tag]
-    command.append(str(SIBLING_COMPILE))
-    subprocess.run(command, check=True)
-    return tag
-
-
-@pytest.fixture
-def compiled(compile_image: str, tmp_path_factory: pytest.TempPathFactory) -> Compiled:
-    """Compile a source with the compile primitive and return the program.
-
-    The source goes in as compile's `source` folder holding the one file, in
-    contract version 6, as compile@v3 takes it. A compile image that answers
-    it speaks another version, as compile@v2 speaks 5, is asked again in that
-    shape, so these tests run against either.
-    """
-
-    def build(language: str, name: str, source: str) -> bytes:
-        work = source_in(tmp_path_factory, name, source)
-        inputs = {"source": {"folder": "in/1/source"}, "language": language}
-        result = compile_once(
-            compile_image, work, {"schema_version": 6, "inputs": inputs}
-        )
-        if "contract version" in result.get("error", ""):
-            # compile@v2 speaks version 5 and names its output binary. A
-            # directory of its own: what the first run wrote belongs to the
-            # container's user, which this one cannot open up again.
-            work = source_in(tmp_path_factory, name, source)
-            document = {"schema_version": 5, "inputs": inputs}
-            result = compile_once(compile_image, work, document)
-        assert result["outputs"]["outcome"] == "accepted", result
-        outputs = result["outputs"]
-        program = outputs["program"] if "program" in outputs else outputs["binary"]
-        return (work / str(program["file"])).read_bytes()
-
-    return build
-
-
-def source_in(factory: pytest.TempPathFactory, name: str, source: str) -> Path:
-    """A fresh working directory holding the source as `in/1/source/<name>`."""
-    work = factory.mktemp("compile")
-    folder = work / "in" / "1" / "source"
-    folder.mkdir(parents=True)
-    (folder / name).write_text(source)
-    return work
-
-
-def compile_once(
-    compile_image: str, work: Path, document: dict[str, Any]
-) -> dict[str, Any]:
-    """Run the compile image once over `work` with `document` as inputs.json."""
-    (work / "inputs.json").write_text(json.dumps(document))
-    open_up(work)
-    flags = sandbox_flags(
-        {"cpu_ms": 60000, "memory_mb": 1024, "pids": 128, "output_mb": 64}
-    )
-    command = ["docker", "run", "--rm", *flags, "--volume", f"{work}:/work"]
-    subprocess.run([*command, compile_image], check=True, timeout=120)
-    result: dict[str, Any] = json.loads(
-        (work / "outputs.json").read_text(encoding="utf-8")
-    )
-    return result
-
-
-@pytest.fixture(scope="session")
 def schema() -> dict[str, Any]:
     """The runner's primitive.schema.json, when it has contract version 6."""
     named = os.environ.get("PRIMITIVE_SCHEMA")
@@ -256,6 +178,9 @@ def check(schema: dict[str, Any]) -> Check:
         else:
             entries = [document["outputs"]]
         for outputs in entries:
+            if outputs["outcome"] == "compile_error":
+                assert set(outputs) == {"log", "outcome"}, outputs
+                continue
             assert required <= set(outputs) <= set(declared) | reports, outputs
 
     return validate
@@ -288,6 +213,11 @@ def programs_check(schema: dict[str, Any]) -> Check:
         required = {name for name, port in facts.items() if not port.get("optional")}
         for entry in document["batch"]:
             outputs = entry["outputs"]
+            if outputs["outcome"] == "compile_error":
+                assert {key for key in outputs if not key.endswith(".log")} == {
+                    "outcome"
+                }, outputs
+                continue
             assert set(declared["outputs"]) == {
                 name for name in outputs if "." not in name
             }, outputs

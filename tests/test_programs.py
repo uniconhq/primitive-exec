@@ -767,12 +767,13 @@ def test_a_report_of_a_program_that_did_not_finish_is_left_out_if_it_does_not_ho
 
 def test_the_declaration_names_every_fact() -> None:
     port = declaration("programs")["inputs"]["programs"]
-    assert tuple(port["outputs"]) == programs.FACTS
+    assert tuple(port["outputs"]) == (*programs.FACTS, "log")
+    assert port["outputs"]["log"]["once"] is True
     ended = port["outputs"]["ended"]["options"]
     assert ended == ["finished", *EXEC_OUTCOMES]
     assert set(programs.FACTS) <= inputs.PROGRAMS_OWN_NAMES
     assert tuple(report.VERDICT_WORDS) == EXEC_OUTCOMES
-    assert len(port["inputs"]) == 7
+    assert len(port["inputs"]) == 9
 
 
 def item(programs: dict[str, Any], links: object = None) -> dict[str, Any]:
@@ -783,7 +784,8 @@ def item(programs: dict[str, Any], links: object = None) -> dict[str, Any]:
 
 
 def entry(**more: Any) -> dict[str, Any]:
-    return {"program": {"file": "in/p"}, "time_limit": 1, "memory_limit": 64} | more
+    source = {"source": {"folder": "in/p"}, "language": "python"}
+    return source | {"time_limit": 1, "memory_limit": 64} | more
 
 
 @pytest.mark.parametrize(
@@ -809,7 +811,7 @@ def entry(**more: Any) -> dict[str, Any]:
         (
             item(
                 {
-                    "a": entry(files={"files": {"to_c": {"file": "in/p"}}}),
+                    "a": entry(files={"files": {"to_c": {"file": "in/f"}}}),
                     "b": entry(),
                     "c": entry(),
                 },
@@ -822,7 +824,8 @@ def entry(**more: Any) -> dict[str, Any]:
         (item({"a": entry(memory_limit=0.0001)}), "under a kilobyte"),
         (item({"a": entry(time_limit=True)}), "is not a positive number"),
         (item({"a": entry(args=["x"])}), "args of program a of run main-1"),
-        (item({"a": entry(program={"file": "../p"})}), "is outside in/"),
+        (item({"a": entry(source={"folder": "../p"})}), "is outside in/"),
+        (item({"a": entry(language="go")}), "language of program a of run main-1"),
         (
             item({"a": entry(manifest={"file": "in/m"})}),
             "declares ended, a name exec gives already",
@@ -831,19 +834,19 @@ def entry(**more: Any) -> dict[str, Any]:
             {
                 "run": "main-1",
                 "inputs": {
-                    "program": {"file": "in/p"},
+                    "source": {"folder": "in/p"},
                     "programs": {"programs": {"a": entry()}},
                 },
             },
-            "gives both program and programs",
+            "gives both source and programs",
         ),
     ],
 )
 def test_inputs_that_do_not_hold_are_refused(
     tmp_path: Path, given: dict[str, Any], fault: str
 ) -> None:
-    (tmp_path / "in").mkdir()
-    (tmp_path / "in" / "p").write_bytes(b"")
+    (tmp_path / "in" / "p").mkdir(parents=True)
+    (tmp_path / "in" / "f").write_text("")
     (tmp_path / "in" / "m").write_text(json.dumps({"reports": {"ended": {}}}))
     document = {"schema_version": 6, "batch": [given]}
     (tmp_path / "inputs.json").write_text(json.dumps(document))
@@ -871,16 +874,15 @@ def test_inputs_that_do_not_hold_are_refused(
             "'a b', not a plain name",
         ),
         (
-            {"program": {"file": "../p"}},
-            "the input named program of program a of run main-1 is outside in/",
+            {"source": {"folder": "../p"}},
+            "the input named source of program a of run main-1 is outside in/",
         ),
     ],
 )
 def test_an_input_that_does_not_hold_is_named_with_its_program(
     tmp_path: Path, more: dict[str, Any], message: str
 ) -> None:
-    (tmp_path / "in").mkdir()
-    (tmp_path / "in" / "p").write_bytes(b"")
+    (tmp_path / "in" / "p").mkdir(parents=True)
     document = {"schema_version": 6, "batch": [item({"a": entry(**more)})]}
     (tmp_path / "inputs.json").write_text(json.dumps(document))
     with pytest.raises(shared.PrimitiveError) as raised:
@@ -894,14 +896,13 @@ def test_a_program_is_read_without_the_one_program_forms_own_inputs(
     """`stdin`, `loads` and `self_reported` are the one-program form's alone,
     so a program of this form that gives them, whatever they hold, is read as
     without them."""
-    (tmp_path / "in").mkdir()
-    (tmp_path / "in" / "p").write_bytes(b"")
+    (tmp_path / "in" / "p").mkdir(parents=True)
     given = entry(stdin={"file": "in/none"}, loads="x", self_reported="yes")
     document = {"schema_version": 6, "batch": [item({"a": given})]}
     (tmp_path / "inputs.json").write_text(json.dumps(document))
     (read,) = inputs.read_inputs(tmp_path)
     (program,) = read.programs
-    assert read.several
+    assert read.form == "programs"
     assert program.stdin is None
     assert program.loads == {}
     assert not program.self_reported
@@ -909,11 +910,15 @@ def test_a_program_is_read_without_the_one_program_forms_own_inputs(
 
 def test_a_batch_that_mixes_the_two_forms_is_refused(tmp_path: Path) -> None:
     """One item of each form is refused before any box is made."""
-    (tmp_path / "in").mkdir()
-    (tmp_path / "in" / "p").write_bytes(b"")
+    (tmp_path / "in" / "p").mkdir(parents=True)
     one = {
         "run": "main-1",
-        "inputs": {"program": {"file": "in/p"}, "time_limit": 1, "memory_limit": 64},
+        "inputs": {
+            "source": {"folder": "in/p"},
+            "language": "python",
+            "time_limit": 1,
+            "memory_limit": 64,
+        },
     }
     second = item({"a": entry()})
     second["run"] = "main-2"
@@ -937,7 +942,12 @@ def test_a_batch_of_more_programs_than_box_users_is_refused(
 
 def test_pipe_names_follow_the_order_of_the_links() -> None:
     entries = tuple(
-        inputs.Entry(name=name, program=Path("p"), time_limit=1, memory_limit=1)
+        inputs.Entry(
+            name=name,
+            source=inputs.Source(Path("p"), "python"),
+            time_limit=1,
+            memory_limit=1,
+        )
         for name in ("a", "b", "c")
     )
     links = tuple(
@@ -1002,21 +1012,22 @@ def test_a_run_the_step_cannot_hold_is_refused(
 
 
 def test_a_run_whose_programs_together_do_not_fit_runs_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    boxes: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The programs run side by side, so their memory limits and copies are
-    added up: two of 64 MB, each of which fits alone, do not fit together
-    in what a step of 224 MB leaves, and the batch is refused before any
+    added up: two of 512 MB, each of which fits alone, do not fit together
+    in what a step of 1136 MB leaves, and the batch is refused before any
     program runs, an error of the step, not a program the step's limit
     kills."""
     monkeypatch.setattr(box, "CONTAINER_MEMORY", tmp_path / "none")
     monkeypatch.setenv(box.BOX_USERS_VARIABLE, BOX_USERS)
-    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, "224")
+    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, "1136")
     work = tmp_path / "work"
-    batch_inputs(work, [("main-1", game("guess"), GAME_LINKS)])
+    played = game("guess", entrant_memory_limit=512, judge_memory_limit=512)
+    batch_inputs(work, [("main-1", played, GAME_LINKS)])
     assert main(["interact", str(work)]) == 0
     result = json.loads((work / "outputs.json").read_text())
-    assert result["error"].startswith("the run main-1 needs 129 MB")
+    assert result["error"].startswith("the run main-1 needs 1025 MB")
     assert not (work / "out").exists()
 
 
@@ -1045,13 +1056,14 @@ def test_a_cached_file_is_read_through_the_steps_cache_link(tmp_path: Path) -> N
     batch_inputs(work, [("main-1", game("guess"), GAME_LINKS)])
     item = cache_the_secret(work).resolve()
     read = inputs.read_inputs(work)[0]
-    assert read.several
+    assert read.form == "programs"
     programs = read.programs
     judge = next(entry for entry in programs if entry.name == "judge")
     assert judge.files == {"secret": item / "secret"}
     assert judge.cached == item
-    program_kb = 4 * -(-judge.program.stat().st_size // 4096)
-    assert box.box_size_kb(judge) == judge.memory_limit_kb + program_kb
+    program = tmp_path / "program"
+    program.write_bytes(b"x" * 5000)
+    assert box.box_size_kb(judge, program) == judge.memory_limit_kb + 8
 
 
 def test_cached_files_of_two_items_in_one_program_are_refused(tmp_path: Path) -> None:

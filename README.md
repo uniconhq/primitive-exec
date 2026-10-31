@@ -1,22 +1,30 @@
 # primitive-exec
 
-The `unicon/exec` primitive, at the forge `unicon/exec@v1`: it runs programs
-under limits. A batch item that gives `program` runs that one program,
-feeding it a file on standard input if given and any arguments on its
-command line, and reports what the program printed, the CPU time and memory
-it used, and an outcome. A batch item that gives `programs` runs up to 8
-named programs at once, each in a box of its own under limits of its own,
-linked by pipes, and reports how each ended. It is what runs code in the
-simpler core's workflows: an entrant's program in `unicon/classic@v3`, an
-organiser's checker or the diff script after it, and the entrant and judge
-of `unicon/interactive@v1`. It replaces `unicon/sandbox-run@v2`, which stays
-for the workflow versions that use it.
+The `unicon/exec` primitive, at the forge `unicon/exec@v2`: it compiles
+programs and runs them under limits. Every program is given as its source,
+a folder and a language, and exec compiles each source of the batch once,
+in an isolate box of its own, before any run, keeping the compiled program
+in the machine's cache, so a later step given the same source compiles
+nothing (see "Compiling"). A batch item that gives `source` runs that one
+program, feeding it a file on standard input if given and any arguments on
+its command line, and reports what the program printed, the CPU time and
+memory it used, the compile log, and an outcome. A batch item that gives
+`programs` runs up to 8 named programs at once, each in a box of its own
+under limits of its own, linked by pipes, and reports how each ended. A
+batch item that gives only the source compiles it and runs nothing, the
+`build` form. It is what compiles and runs code in the simpler core's
+workflows: an entrant's program in `unicon/classic@v4`, an organiser's
+checker or the diff script after it, and the entrant and judge of
+`unicon/interactive@v2`. It replaces `unicon/compile@v3` and
+`unicon/exec@v1`, which are retired, and `unicon/sandbox-run@v2`, which
+stays for the workflow versions that use it.
 
 This repo holds the image, `ghcr.io/uniconhq/primitive-exec`, built from the
 `Dockerfile`, with [isolate](https://github.com/ioi/isolate) 2.7 built into
-it unpatched and our box launcher, `src/box-launch.c`, beside it; exec
-itself, the Python package the image runs, `src/exec/`, which runs every
-program in an isolate box of its own; and `primitive.yaml`, the declaration the
+it unpatched and our box launcher, `src/box-launch.c`, beside it, and gcc,
+g++ and the OpenJDK 21 JDK; exec itself, the Python package the image runs,
+`src/exec/`, which compiles and runs every program in an isolate box of its
+own; and `primitive.yaml`, the declaration the
 forge compiler reads to type-check a workflow that uses the primitive. exec
 speaks the primitive contract, `primitive.schema.json` version 6, published
 by the [runner](https://github.com/uniconhq/runner).
@@ -29,9 +37,11 @@ one item run at once, each in its own box; items still run one at a time,
 in the order given. The primitive judges nothing: a later step reads
 `facts` and decides the run.
 
-Each program takes `program`, `time_limit` and `memory_limit`, and
-optionally `files`, `args`, `manifest` and `stops_others`. A name is a
-lowercase word of at most 64 characters, and not `wall_clock`. Each
+Each program takes `source`, `language`, `time_limit` and `memory_limit`,
+and optionally `entry`, `files`, `args`, `manifest` and `stops_others`.
+Programs with the same source, language and entry, a judge given to every
+item, compile once. A name is a lowercase word of at most 64 characters, and
+not `wall_clock`. Each program's compile log is `<name>.log`. Each
 program's facts are outputs named `<name>.time_ms`, `<name>.memory_kb`,
 `<name>.ended`, and optionally `<name>.signal`, `<name>.ended_at` and
 `<name>.stopped_by`. A program given a manifest also reports as the one
@@ -54,12 +64,16 @@ Each item of the batch is keyed by its run, an id of letters, digits, `_` and
 the same order under the same runs. **Items run one at a time, in the order
 the batch gives them, and never in another.** The forge relies on it: it
 puts the runs whose results entrants see sooner first, since a run can tell
-the runs after it a little (see "What a run can still learn"). Each item has
+the runs after it a little (see "What a run can still learn"). A step the
+forge does once, such as a build at the save, gives its inputs alone, not
+in a batch, and `outputs.json` answers with its outputs alone. Each item has
 these inputs and outputs.
 
 | | Name | Type | What it is |
 |---|---|---|---|
-| Input | `program` | file, `runs: true` | The program from compile, in one of the formats below |
+| Input | `source` | folder, `runs: true` | The program's source files, with their layout; one uploaded file arrives as a folder holding it (see "Compiling") |
+| Input | `language` | enum | `c`, `cpp`, `java`, `python` or `ipynb`, a Jupyter notebook |
+| Input | `entry` | text, optional | The file to start from, by its path in the folder, such as `src/Main.java` |
 | Input | `stdin` | file, optional, `runs: false` | What the program reads on standard input; with none, standard input is empty |
 | Input | `files` | named files, optional, `runs: false` | Files placed read-only in the program's working directory under their names, such as `input` or `answer` |
 | Input | `loads` | named files, optional, `runs: true` | Code the program loads, placed as `files` are, such as the entrant's module a test harness imports |
@@ -68,13 +82,14 @@ these inputs and outputs.
 | Input | `args` | text, optional | Appended to the program's command line, split on spaces |
 | Input | `time_limit` | number | Seconds of CPU time the run may use |
 | Input | `memory_limit` | number | Megabytes of memory the run may use |
+| Output | `log` | text, `once: true` | Everything the compiler printed, and any note of why the compile failed; the same for every item, as the source is compiled once |
 | Output | `output` | file | `out/<n>/output`, `n` the item's place in the batch from 1, what the program printed on standard output |
 | Output | `time_ms` | number, `better: lower`, `at_least: 0` | CPU time used, user plus system, in milliseconds; on `time_limit` at least the limit |
 | Output | `memory_kb` | number, `better: lower`, `at_least: 0` | Peak memory of the run's box, all it was charged for, its files and the file pages it read among them (below), in kilobytes |
 | Output | `label`, `message`, `staff_message` | text, optional | From a program given a manifest: a finer name for the outcome, a message shown with the run, and one for staff alone |
 | Output | `extras` | folder, optional | Every other file a program given a manifest reported, shown with the run and never a column |
 | Output | each report the manifest declares | number or text | From a program given a manifest, on `accepted` only (`outputs_from: manifest`) |
-| Output | `outcome` | outcome | `accepted`, `wrong_answer` (from a manifest's verdict alone), `time_limit`, `memory_limit`, `output_limit` or `runtime_error` (see "Limits and outcomes"); `primitive.yaml` says when each is given under `outcomes`, for the workflow editor |
+| Output | `outcome` | outcome | `accepted`, `wrong_answer` (from a manifest's verdict alone), `time_limit`, `memory_limit`, `output_limit`, `runtime_error` (see "Limits and outcomes") or `compile_error`, for every item alike (`once`); `primitive.yaml` says when each is given under `outcomes`, for the workflow editor |
 
 The output goes under the item's place in the batch, not its run id.
 
@@ -113,6 +128,202 @@ come after the program on the command line: `program <args>`, `python3 -I -B
 program <args>`, `java ... -jar program <args>`. An argument no command line
 can carry, one holding a NUL character or longer than the kernel takes, is
 the run failing to start, a `runtime_error`.
+
+## Compiling
+
+Before any run, exec compiles each source of the batch, once: items, and
+programs of an item, given the same `source` folder, `language` and `entry`
+share one compile. A source that does not compile ends the batch there:
+no program runs, and every item gives its logs and `compile_error`, and
+nothing else, since its outputs are not written (the contract: on any
+outcome but `accepted` only `outcome` need be). The `build` form, an item
+of `source`, `language` and optional `entry` alone, compiles and stops,
+every item giving its `log` and the batch's `outcome`, `compile_error`
+when any source did not compile, else `accepted`; a
+task's Save runs it to check an organiser's script compiles. A batch is
+one form only.
+
+**Nothing the source does can fault the step.** `source` is the entrant's,
+and the compilers run over it, so whatever it makes them do ends as
+`compile_error`, with a line in the log saying why: a source that does not
+compile; one that makes a compiler go over its time, memory, process or
+file-size limit, crash or print without end; a folder that is empty, holds
+too many files or takes too long to read; an entry that is not in the
+folder or not clear; a source or a program over 32 MB; a notebook that is
+not one, or that runs a magic. The log keeps the first 64 KB of what the compiler
+printed and ends with a line saying how much more was left out.
+
+### Which files are compiled, and the entry
+
+**A folder holding one file** is that file, whatever its name, and it is
+the entry. It is compiled under its own file name when that name is plain
+(letters, digits, `.`, `_` and `-`, starting with a letter or digit, with
+the language's usual extension), so the log names the entrant's file;
+anything else is compiled as `main.c`, `main.cpp` or `main.py`, and Java as
+below. This is how a single uploaded file is compiled.
+
+**A larger folder** is copied with its layout. Its sources are its files
+with the language's extensions; every other file, such as a header or a
+data file, is copied beside them.
+
+| Language | Sources |
+|---|---|
+| `c` | `.c` |
+| `cpp` | `.cpp`, `.cc`, `.cxx` |
+| `java` | `.java` |
+| `python` | `.py` |
+| `ipynb` | `.ipynb` |
+
+The entry is the file `entry` names, by its path from the top of the
+folder, `/` between folders; a leading `./` is allowed and `..` is not. It
+must be a file of the folder and, in a larger folder, one of its sources.
+An entry that is blank is taken as not given.
+
+With no entry given, the entry is the folder's one source, or else the one
+source that holds main:
+
+| Language | A source holds main when it |
+|---|---|
+| `c`, `cpp` | Defines a function named `main`: `main(...)` followed by a body. A member such as `Game::main` or a call such as `game.main()` does not count |
+| `java` | Declares a `static void main` method |
+| `python` | Has a top-level line `if __name__ == "__main__":`, either quotes, either side first |
+| `ipynb` | Never: a folder of two notebooks names the one to run |
+
+Comments and string and character literals (and Java's text blocks) are
+ignored for C, C++ and Java, each source read in one pass, in time linear
+in its size. When no source holds main, or more than one does, the outcome
+is `compile_error` and the log asks for the entry:
+
+```
+the entry is not clear: a.py, b/b.py each check __name__ == "__main__"; name the file to start from as the entry
+```
+
+What the entry decides, per language:
+
+- **C and C++.** The entry and every other source are compiled and linked
+  into one program, except a source other than the entry that defines its
+  own `main`, so a folder can keep a test driver beside the solution.
+- **Java.** Every source is compiled together. The entry gives the class
+  the jar runs: its public top-level type, or else its top-level type named
+  `Main`, or else its first, its `package` line followed. The only file of
+  a one-file folder is named after its public top-level type, or
+  `Main.java`, as javac requires. When the class did not come out of the
+  compile, the outcome is `compile_error` and the log names it.
+- **Python.** Every source is checked with `py_compile`, so a file with a
+  syntax error fails the compile even when nothing imports it. The program
+  holds every file of the folder and runs the entry as the main module,
+  with the entry's own folder first on the import path, as `python3
+  <entry>` does from the top of the folder.
+- **Notebooks.** The entry notebook, read as JSON, nbformat 4, becomes one
+  Python file: its code cells in order, each behind a line `# cell <n>`,
+  under a first line `# coding: utf-8`; markdown, raw cells and stored
+  outputs are passed over. It is checked with every `.py` file of the
+  folder and packed as Python is. A cell with a line only IPython runs, a
+  magic (`%pip install numpy`, `%%time`) or a shell command (`!ls`), is a
+  `compile_error` naming the cell, as is a notebook that is not JSON, not
+  nbformat 4, not UTF-8 or over 32 MB.
+
+### How each language is compiled
+
+| Language | Toolchain in the image | The compile |
+|---|---|---|
+| `c` | gcc 14 | `gcc -x c -std=gnu17 -O2 -pipe -static -DONLINE_JUDGE -iquote . -o /box/out/program <entry> <sources> -lm` |
+| `cpp` | g++ 14 | `g++ -x c++ -std=gnu++20 -O2 -pipe -static -DONLINE_JUDGE -iquote . -o /box/out/program <entry> <sources> -lm` |
+| `java` | OpenJDK 21 | `javac -encoding UTF-8 -proc:none -Xlint:none -XDsuppressNotes -d /box/out/classes <sources>`, then exec packs the classes into a jar |
+| `python` | Python 3.14 | `python3 -I -X pycache_prefix=/tmp/pycache -m py_compile <sources>`, then exec packs the folder into a zip application |
+| `ipynb` | Python 3.14 | exec joins the notebook's code cells, then as `python` |
+
+Each file is named by its path from the top of the folder, and one that
+does not start with a letter, a digit or `_` is written with `./` in
+front, so no file name is read as an option or, starting with `@`, as a
+file of arguments. `-iquote .` lets `#include "lib/util.h"` name a header by
+its path from the top of the folder. `ONLINE_JUDGE` is defined because
+contest code commonly checks for it. `-proc:none` means javac runs no
+annotation processors. gcc runs without `-Wall`, and javac quietly, since in
+the classic workflow a non-empty compile log becomes the verdict's summary.
+
+The compilers make the image about 1.05 GB, as compile's was, where exec@v1's
+was 0.5 GB with the Java runtime alone.
+
+### The compile box
+
+exec reads the folder first, as root, outside any box: it lists it, finds
+the entry and copies it into a folder of its own under `/work`, a notebook
+joined into its Python, in at most 1000 files and folders and 10 seconds,
+past which the outcome is `compile_error`. Links in the folder are neither
+followed nor copied.
+
+The compiler then runs in box 0, made fresh for each compile, before any
+run's box, as the box's user, through the box launcher, and under its own
+limits, held by isolate as a run's are:
+
+| Limit | Value |
+|---|---|
+| CPU and wall-clock time | 30 seconds each |
+| Memory | 1024 MB, the box's cgroup, without swap |
+| Processes and threads | 128 |
+| Any one file it writes | 32 MB (`--fsize`) |
+| The box's tmpfs | 64 MB: the program at its cap, and as much again for the compiler's own files |
+
+The process limit is decision 11 of the design: twice the most any
+compiler was measured to need, and at least 128. Measured in the image on
+Docker Desktop (arm64, 18 CPUs, all of which the JVM sees), with the
+box's peak memory, by isolate, at each compile:
+
+| Compile | Fewest processes it compiles under | Peak memory | CPU time |
+|---|---|---|---|
+| gcc, the C sample | 4 | 26 MB | 0.03 s |
+| g++, a sample including `bits/stdc++.h` | 4 | 309 MB | 0.78 s |
+| g++, a folder of two sources | 4 | 61 MB | 0.18 s |
+| javac, one source or a package tree of two | 16 | 43 to 45 MB | 0.2 s |
+| py_compile | 1 | 16 MB | 0.09 s |
+
+javac's threads grow with the CPUs the JVM sees, so a larger machine
+needs more; 128 is four times the most measured.
+
+The box sees exec's copy of the folder at `/source`, read-only and not
+executable, which is its working directory; it writes the program, or
+Java's classes, to `/box/out`, and its own files to its `/tmp`. Its
+environment holds `PATH`, `HOME` and `TMPDIR`, both `/tmp`, and
+`LANG=C.UTF-8`, and standard output and error go together into the log.
+Like a run's box, it sees the image's `/usr`, `/bin` and `/lib`, of `/etc`
+only Java's configuration, and nothing of `/work`, the machine's cache or
+another box, so `#include "/etc/passwd"` finds nothing. exec takes back
+only plain files, never through a link, writes the zip application or jar
+itself, and checks the program against 32 MB. A compile that goes over a
+limit is `compile_error`, the log saying which.
+
+The step must hold the compile box beside what it needs for itself, 1024
+MB and 112 MB, so `primitive.yaml` gives every form at least 1136 MB, and a
+step given less is an error before anything compiles.
+
+### The machine's cache
+
+A step given the machine's cache (`cache: true`; the job contract,
+`runner/schemas/job.schema.json`) has it at `/cache`, where exec keeps its
+compiled programs beside the step wrapper's task files:
+
+```
+/cache/programs/<key>/program      the compiled program, mode 0444
+/cache/programs/<key>/result.json  {outcome, log, program_sha256, created}
+/cache/locks/programs-<key>.lock   held while a step looks up, compiles or stores it
+```
+
+The key is the SHA-256 of the image's toolchain line, written when the
+image is built from its installed packages, its Python and exec's own
+files, then the language, the entry, the sources given the compiler, Java's
+main class and each file of the prepared copy by path and SHA-256. So two
+folders that prepare alike share a compile, and two images whose compilers
+differ never do. exec takes the key's lock, then looks the key up: a hit is
+copied out and checked against its SHA-256, and the folder's mtime touched,
+which the wrapper evicts by, least recently used first; a miss is compiled
+and stored, in a folder of its own renamed into place, so a folder under
+its key is whole. A `compile_error` is stored too, with its log, but not a
+compile stopped at a limit, which a busy machine can reach where another
+would not. A folder
+that does not hold what it says is removed and compiled again. A second
+step with the same source waits on the lock and then hits. No box sees the
+cache. A step with no cache compiles every time.
 
 ## A program that reports
 
@@ -195,6 +406,8 @@ manifest gets no folder and no `UNICON_REPORT`.
 
 The task's save does not check these; the scoring rules rely on them.
 
+- **The source cannot fault the run.** Everything the source makes the
+  compiler do is `compile_error` (see "Compiling").
 - **The program cannot fault the run.** Everything the program can do is an
   outcome of its own item: going over the time, memory or output limit is
   `time_limit`, `memory_limit` or `output_limit`, and crashing, exiting
@@ -205,8 +418,9 @@ The task's save does not check these; the scoring rules rely on them.
   container's own. The other runs still run.
   None of it is ever `error`, a container killed at its limit or an output
   over the harness's caps.
-- **Every item reports its time and memory, whatever its outcome.**
-  `output`, `time_ms`, `memory_kb` and `outcome` are written for every item.
+- **Every item that ran reports its time and memory, whatever its
+  outcome.** `log`, `output`, `time_ms`, `memory_kb` and `outcome` are
+  written for every item, unless the batch's source did not compile.
   `time_ms` is the CPU time, and on `time_limit` at least the time limit in
   milliseconds, rounded up, whether the CPU limit or the wall clock stopped
   the run: a run that sleeps or waits until the wall clock stops it reports
@@ -226,7 +440,10 @@ The task's save does not check these; the scoring rules rely on them.
 `outputs.json` carries `error` instead, and nothing else, only when the
 primitive could not work at all: `inputs.json` is missing, is not JSON or
 is for another contract version, or holds `NaN` or `Infinity`; a file is
-missing or lies outside `in/`; a limit is not a positive number, or a time
+missing or lies outside `in/`; a `source` is not a folder, the language
+is not one of the five or `entry` is not text; a batch mixes forms; the
+step has no room for the compile box beside itself; the image's toolchain
+line cannot be read; a limit is not a positive number, or a time
 limit under a millisecond or a memory limit under a kilobyte, which isolate
 would read as none, or `args` is not text; the `stdin` file is owned by one
 of the step's box users; a named file's name is not a plain name, or one
@@ -534,8 +751,8 @@ call.
 
 ## The container's limits
 
-`limits` in `primitive.yaml` are per run: 2 s of time and CPU, 256 MB of
-memory, 160 processes, 64 MB of output and no GPUs, with no network
+`limits` in `primitive.yaml` are per run: 2 s of time and CPU, 1136 MB of
+memory, for the compile box (see "Compiling"), 160 processes, 64 MB of output and no GPUs, with no network
 (`network: false`). The 160 processes are the box's 128 and room for exec
 and isolate. `limits_from` raises them from each run's own limits, so the
 box's own limit is the one a run meets, and they are raised for every run,
@@ -550,8 +767,15 @@ time_limit + 3` seconds, what one run can take at most:
   in all, and a batch 0.2 s to start, measured in the image on Docker
   Desktop with one CPU.
 
-Memory goes to `memory_limit + 256` MB: room for the step wrapper, exec
-and isolate beside the box. The copies of the program and the named files
+Every form adds `once_time_ms`, 40 s, once to the step's time: the compile's
+30 s, the folder's 10 s to read, and no more, since a step whose sources
+all come from the cache compiles nothing. A batch of several programs of
+different sources compiles each, so it may need more; the forge does not
+yet add it per source.
+
+Memory goes to `memory_limit + 256` MB, never under the 1136 MB the
+compile box needs: room for the step wrapper, exec and isolate beside the
+box. The copies of the program and the named files
 in the box's tmpfs are charged to exec, not the box, and the forge's
 planner adds them on top, each at the most it may be, and gives the step
 the sum (`UNICON_STEP_MEMORY_MB`). A run whose memory limit and copies,
@@ -567,34 +791,41 @@ is the one that stops a run.
 
 ## The program format
 
-`program` is one file, in one of three formats. compile writes them, and
-exec tells them apart by their content: an ELF header, or a zip
-holding a `__main__.py` at its root, or a zip holding a jar manifest.
+A compiled program is one file, in one of three formats. exec writes
+them from the compile, and tells them apart by their content: an ELF
+header, or a zip holding a `__main__.py` at its root, or a zip holding a
+jar manifest.
 
 | Language | The program | How exec runs it |
 |---|---|---|
 | `c`, `cpp` | A statically linked ELF executable | Its copy marked executable and run directly |
-| `python` | A Python zip application behind the line `#!/usr/bin/env python3`: the source folder under `source/` with its layout, and a `__main__.py` at the root that runs the entry | `python3 -I -B program` on its copy, on the image's Python 3.14 |
+| `python`, `ipynb` | A Python zip application behind the line `#!/usr/bin/env python3`: the source folder under `source/` with its layout, a notebook entry as its Python, and a `__main__.py` at the root that runs the entry | `python3 -I -B program` on its copy, on the image's Python 3.14 |
 | `java` | A runnable jar: the compiled classes and a manifest naming the main class | `java -Xmx<memory_limit>m -Xss64m -XX:+UseSerialGC -XX:-UsePerfData -XX:+ExitOnOutOfMemoryError -Djava.io.tmpdir=. -jar program`, on the image's OpenJDK 21, started by its real path, since `/usr/bin/java` goes through `/etc/alternatives` |
 
-Static linking means a native program needs nothing from the image it runs
-in. A Python or Java program needs the interpreter it was checked against, so
-both images build on the runner's `primitive-base`, the same pinned
-`python:3.14-slim`, and
-install the same Debian OpenJDK 21 packages: the JDK in compile, the runtime
-in exec. A change to any of the three formats, or to either image's
-Python or Java, is made in both repos together.
+The Python program's `__main__.py` puts the entry's folder inside the
+archive first on `sys.path` and runs the entry's code as a fresh
+`__main__` module whose `__file__` is the entry's path in the archive, so
+the entry imports the files beside it as it would from the folder. A
+Python or Java program runs on the interpreter it was checked against, the
+image's own.
 
 ## Layout
 
 ```
-Dockerfile                  the image: isolate and the box launcher built in a stage of their own, primitive-base, OpenJDK 21 runtime
+Dockerfile                  the image: isolate and the box launcher built in a stage of their own, primitive-base, gcc, g++, OpenJDK 21, the toolchain line
 src/exec/                   exec, installed as /usr/local/lib/unicon-exec/exec/, by job:
   shared.py                   what every module shares: the contract version, the output cap, the error that ends a step
   inputs.py                   reading inputs.json: items, each program's inputs, manifests
   box.py                      isolate and the step: setting up, each box made and thrown away, the isolate command line
   report.py                   outcomes, what a program given a manifest reported, the JSON files exec writes
-  programs.py                 running the batch: one program alone, or several side by side joined by links
+  programs.py                 running the batch: compiling its sources, then one program alone, or several side by side joined by links
+  compile/                    compiling a source:
+    shared.py                   the languages, the caps on the log and the program, copying a plain file
+    prepare.py                  reading the folder: its files, the entry, the copy the compiler reads
+    native.py, java.py,         each language's command line, and what exec writes from the compile
+      python.py, notebook.py
+    cache.py                    the machine's cache of compiled programs
+    build.py                    one compile: prepared, looked up, compiled in the compile box, stored
   main.py                     read the batch, run it, write outputs.json
 src/command.py              installed as /usr/local/bin/exec, the image's command: puts the package on the path, runs main
 src/box-launch.c            the box launcher, installed as /usr/local/bin/box-launch: the keyring and watch calls refused
@@ -609,7 +840,7 @@ digest, from the release manifest, into the version it creates at the forge.
 Its `title`, its `description`s and the `outcome` port's `outcomes`, each
 outcome exec can report with a line saying when, are what the
 workflow editor shows; a test keeps `outcomes` to exactly the outcomes
-`judge` gives.
+`judge` gives and `compile_error`.
 
 ## Running it locally
 
@@ -638,13 +869,15 @@ through `tests/userns.py`, which gives it a user namespace whose map is not
 the identity, so that exec's own checks run as they would under rootless
 Docker. Without Docker they are skipped.
 
-The in-process tests, `tests/test_exec.py`, import exec, which needs Linux,
-so elsewhere only the image tests are collected. Those that run programs
-need root and isolate too, so on a host they are skipped, and they run in
-the test container: `tests/Dockerfile` builds it on the image with the
-tests' tools, and the image test
-`test_the_in_process_tests_pass_in_the_test_container` runs
-`tests/test_exec.py` in it, privileged, where none is skipped.
+The in-process tests, `tests/test_exec.py` and `tests/test_programs.py`,
+need Linux, so elsewhere they are not collected; `tests/test_compile.py`'s
+tests of reading a folder and packing Python run anywhere. Those that
+compile or run programs need root and isolate too, so on a host they are
+skipped, and they run in the test container: `tests/Dockerfile` builds it
+on the image with the tests' tools, and the image tests
+`test_the_in_process_tests_pass_in_the_test_container` and its twin in
+`test_image_programs.py` run them in it, privileged, where none is
+skipped.
 
 The image builds on the runner's `primitive-base` (`ARG BASE_IMAGE`), whose
 step wrapper is the entrypoint and runs `exec` as the image's command in
@@ -659,17 +892,13 @@ docker build -t primitive-exec:test-container --build-arg IMAGE=primitive-exec:t
   -f tests/Dockerfile .
 docker run --rm --privileged --ulimit=nofile=1024:1048576 \
   --ulimit=stack=8388608:-1 --env=UNICON_BOX_USERS=60000-60009 \
-  --env=UNICON_STEP_MEMORY_MB=1024 -v "$PWD:/src:ro" \
-  primitive-exec:test-container python3 tests/userns.py pytest -p no:cacheprovider tests/test_exec.py
+  --env=UNICON_STEP_MEMORY_MB=1136 -v "$PWD:/src:ro" \
+  primitive-exec:test-container python3 tests/userns.py pytest -p no:cacheprovider \
+  tests/test_exec.py tests/test_compile.py
 ```
 
-The image tests build their C++, Java and Python programs with the compile
-primitive's own image, so they are also the check that the two primitives
-agree on the program format. That image is `COMPILE_IMAGE`, or built from a
-`primitive-compile` checkout beside this one; without either, those tests
-are skipped. CI builds it from `primitive-compile`'s `main`. The tests ask
-it in contract version 6, as compile@v3 speaks it, and ask a compile image
-that speaks version 5, compile@v2, again in its shape.
+The image tests give exec each language's source and have it compile in
+the image, as a step does.
 The checks on every `inputs.json` and `outputs.json` the tests see read the
 schema from `PRIMITIVE_SCHEMA`, or from a `runner` checkout beside this one.
 
@@ -687,12 +916,12 @@ two `uses:` lines and `runner-ref` together.
 
 ## Releasing
 
-Push a tag `v1.0.0` on `main`. The tag's major is the version at the forge:
-`v1.0.0` is a release of `unicon/exec@v1`, so a change to the ports is a new
+Push a tag `v2.0.0` on `main`. The tag's major is the version at the forge:
+`v2.0.0` is a release of `unicon/exec@v2`, so a change to the ports is a new
 major. The shared release workflow refuses a tag whose commit is not
 on `main` and a tag that differs from the version in `pyproject.toml`. It
 runs the same checks as CI, pushes the image as
-`ghcr.io/uniconhq/primitive-exec:v1.0.0`, and creates a GitHub release
+`ghcr.io/uniconhq/primitive-exec:v2.0.0`, and creates a GitHub release
 with `images.json`, which names the image by digest in the same shape as the
 runner's, and `primitive.yaml` attached, and the digest in the notes.
 `deploy/images.json` pins that digest, and bootstrap writes it into the

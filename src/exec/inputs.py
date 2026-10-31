@@ -6,15 +6,21 @@ before any box is made.
 import json
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
+from exec.compile.shared import LANGUAGES
 from exec.shared import FILE_NAME, SCHEMA_VERSION, PrimitiveError
 
 RUN_ID = re.compile(r"[A-Za-z0-9_-]+")
 """A run's id, which only the forge knows the meaning of. An item's output
 goes under its place in the batch, not its id."""
+ALONE_RUN = "alone"
+"""The run an `inputs.json` that gives its inputs alone, not in a batch, is
+read as: the forge does so for a step it does once, such as a build at the
+save."""
 REPORT_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 """A report a manifest declares, which becomes an output of that name and a
 file of that name in the report folder."""
@@ -29,6 +35,7 @@ OWN_NAMES = frozenset(
         "memory_kb",
         "outcome",
         "extras",
+        "log",
     }
 )
 """What no report may be named: the report folder's own files and exec's own
@@ -43,6 +50,12 @@ PROGRAMS_OWN_NAMES = OWN_NAMES | {
 }
 """`OWN_NAMES` plus what the several-programs form gives of each program."""
 REPORT_KEYS = frozenset({"type", "optional", "better", "at_least", "at_most"})
+BUILD_INPUTS = frozenset({"source", "language", "entry"})
+"""What an item of the build form gives, and an item gives nothing else
+only in that form: the one-program form also needs its limits."""
+
+type Form = Literal["one", "programs", "build"]
+FORM_NAMES = {"one": "one-program", "programs": "several-programs", "build": "build"}
 
 
 @dataclass(frozen=True)
@@ -60,8 +73,18 @@ class Declared:
 
 
 @dataclass(frozen=True)
+class Source:
+    """A program's source: its folder under `in/`, its language, and the
+    file it starts from when one was named."""
+
+    folder: Path
+    language: str
+    entry: str | None = None
+
+
+@dataclass(frozen=True)
 class Entry:
-    """One program of a run: the name the step gives it, the program, the
+    """One program of a run: the name the step gives it, its source, the
     two limits, the arguments, and the named files placed in its working
     directory: `files` it reads, and `loads`, code the program loads, such
     as the entrant's module a test harness imports. `stdin` is the file for
@@ -75,7 +98,7 @@ class Entry:
     """
 
     name: str
-    program: Path
+    source: Source
     time_limit: float
     memory_limit: float
     args: tuple[str, ...] = ()
@@ -124,19 +147,31 @@ class Link:
 class Item:
     """One run: its id, its place in the batch from 1, its programs in the
     order given, the `n`th in box `n`, the links between them in the order
-    given, which says which link is a program's first, and whether it is
-    of the several-programs form. An item of the one-program form is one
-    program and no links."""
+    given, which says which link is a program's first, and its form. An
+    item of the one-program form is one program and no links; one of the
+    build form runs nothing, and is the `source` it compiles alone."""
 
     run: str
     number: int
     programs: tuple[Entry, ...]
     links: tuple[Link, ...] = ()
-    several: bool = True
+    form: Form = "programs"
+    source: Source | None = None
+    alone: bool = False
+    """Whether the item is an `inputs.json`'s inputs alone, not a batch's,
+    and is answered with `outputs` alone."""
+
+    @property
+    def sources(self) -> tuple[Source, ...]:
+        """Every source the item compiles, in the order given."""
+        if self.source is not None:
+            return (self.source,)
+        return tuple(entry.source for entry in self.programs)
 
 
 def read_inputs(root: Path) -> list[Item]:
-    """Read `inputs.json` and return its items in order."""
+    """Read `inputs.json` and return its items in order: a batch's, or the
+    one item of inputs given alone, read as the run `ALONE_RUN`."""
     try:
         document = json.loads(
             (root / "inputs.json").read_bytes(), parse_constant=refuse_constant
@@ -151,6 +186,9 @@ def read_inputs(root: Path) -> list[Item]:
         raise PrimitiveError(
             f"inputs.json is not written against contract version {SCHEMA_VERSION}"
         )
+    if "batch" not in document and isinstance(document.get("inputs"), dict):
+        entry = {"run": ALONE_RUN, "inputs": document["inputs"]}
+        return [replace(read_item(root, entry, 1), alone=True)]
     batch = document.get("batch")
     if not isinstance(batch, list):
         raise PrimitiveError("inputs.json has no batch list")
@@ -162,19 +200,23 @@ def read_inputs(root: Path) -> list[Item]:
 
 def read_item(root: Path, entry: object, number: int) -> Item:
     """Check one batch entry, the `number`th, and return it as an item: of
-    the one-program form, `program` and its inputs, one program and no
-    links; or of the several-programs form, `programs` and `links`."""
+    the build form, a source and nothing else (`BUILD_INPUTS`); of the
+    one-program form, a source and its inputs, one program and no links; or
+    of the several-programs form, `programs` and `links`."""
     if not isinstance(entry, dict) or not isinstance(entry.get("inputs"), dict):
         raise PrimitiveError("a batch item has no inputs object")
     run = entry.get("run")
     if not isinstance(run, str) or len(run) > 255 or not RUN_ID.fullmatch(run):
         raise PrimitiveError(f"the batch item run {run!r} is not a run id")
     inputs = entry["inputs"]
-    if "program" in inputs and "programs" in inputs:
-        raise PrimitiveError("a batch item gives both program and programs")
+    if "source" in inputs and "programs" in inputs:
+        raise PrimitiveError("a batch item gives both source and programs")
+    if "programs" not in inputs and set(inputs) <= BUILD_INPUTS:
+        source = read_source(root, inputs, f"run {run}")
+        return Item(run=run, number=number, programs=(), form="build", source=source)
     if "programs" not in inputs:
         program = read_program(root, "program", inputs, f"run {run}", several=False)
-        return Item(run=run, number=number, programs=(program,), several=False)
+        return Item(run=run, number=number, programs=(program,), form="one")
     value = inputs["programs"]
     if not isinstance(value, dict) or set(value) != {"programs"}:
         raise PrimitiveError(f"the input named programs of run {run} is not programs")
@@ -244,14 +286,14 @@ def read_program(
         raise PrimitiveError(
             f"the {what} is self_reported without a manifest, so it reports nothing"
         )
-    program = input_file(root, inputs, "program", what)
+    source = read_source(root, inputs, what)
     stdin = None
     if not several and "stdin" in inputs:
         stdin = input_file(root, inputs, "stdin", what)
         given.append(stdin)
     entry = Entry(
         name=name,
-        program=program,
+        source=source,
         time_limit=positive_number(inputs, "time_limit", what),
         memory_limit=positive_number(inputs, "memory_limit", what),
         args=arguments(inputs, what),
@@ -263,7 +305,7 @@ def read_program(
         stops_others=stops_others,
         cached=cached_folder(
             root,
-            [program, *given, *files.values(), *loads.values()],
+            [*given, *files.values(), *loads.values()],
             f"the {what}",
         ),
     )
@@ -280,6 +322,31 @@ def read_program(
             "which isolate would read as no limit"
         )
     return entry
+
+
+def read_source(root: Path, inputs: dict[str, object], what: str) -> Source:
+    """Read the source of `what`, a program: `source`, a folder under `in/`,
+    `language`, one of `LANGUAGES`, and `entry`, optional text, none when
+    left out or blank."""
+    value = inputs.get("source")
+    named = value.get("folder") if isinstance(value, dict) else None
+    where = f"the input named source of {what}"
+    if not isinstance(named, str):
+        raise PrimitiveError(f"{where} is not a folder")
+    folder = (root / named).resolve()
+    if not folder.is_relative_to((root / "in").resolve()):
+        raise PrimitiveError(f"{where} is outside in/")
+    if not folder.is_dir():
+        raise PrimitiveError(f"{where} is not in the working directory")
+    language = inputs.get("language")
+    if language not in LANGUAGES:
+        raise PrimitiveError(
+            f"the input named language of {what} is not one of {', '.join(LANGUAGES)}"
+        )
+    entry = inputs.get("entry")
+    if entry is not None and not isinstance(entry, str):
+        raise PrimitiveError(f"the input named entry of {what} is not text")
+    return Source(folder, str(language), (entry or "").strip() or None)
 
 
 def read_manifest(

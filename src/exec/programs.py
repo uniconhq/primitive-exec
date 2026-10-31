@@ -28,19 +28,20 @@ from exec.box import (
     box_size_kb,
     box_users,
     cache_binding,
+    check_isolate,
     check_memory,
     exit_code,
     fresh_box,
     hand_over,
     isolate_command,
-    isolate_said,
     open_stdin,
     place_files,
     read_meta,
     set_up_step,
     step_memory_kb,
 )
-from exec.inputs import WALL_CLOCK, Entry, Item, Link, pipe_names
+from exec.compile.build import Built, build, check_room
+from exec.inputs import FORM_NAMES, WALL_CLOCK, Entry, Item, Link, Source, pipe_names
 from exec.report import TEXTS, ReportError, judge, read_report, reported, write_json
 from exec.shared import OUTPUT_LIMIT, RUN_PATH, PrimitiveError
 
@@ -52,6 +53,15 @@ ELF_MAGIC = b"\x7fELF"
 BOX = 0
 """The box every item of the one-program form runs in, one after another,
 made afresh each time."""
+
+
+@dataclass(frozen=True)
+class Compiled:
+    """A source's program as exec holds it: its format and its file, which
+    each run's box gets a copy of."""
+
+    kind: str
+    path: Path
 
 
 @dataclass(frozen=True)
@@ -91,20 +101,28 @@ class Program:
 
 
 def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
-    """Check the step has a box user for each program of a run and that its
-    memory holds each item's boxes side by side (`check_memory`), set the
-    step up for its boxes, capped at that memory (`step_memory_kb`), then
-    run the items one after another, in the order given, each in a fresh
-    set of boxes with fresh copies of its programs, and return one outputs
-    entry per item.
+    """Check the step has a box user for each program of a run and room for
+    the compile box (`check_room`), set the step up for its boxes, capped at
+    its memory (`step_memory_kb`), compile each source of the batch once,
+    then check that memory holds each item's boxes side by side
+    (`check_memory`) and run the items one after another, in the order
+    given, each in a fresh set of boxes with fresh copies of its programs,
+    and return one outputs entry per item.
+
+    When a source does not compile no program runs, and every item's
+    outcome is `compile_error`, with the logs (`not_compiled`).
 
     isolate's meta files and its own standard error, and the named pipes, go
     in a folder of exec's in the container's `/tmp`, which no box sees
-    but for its own folder of pipes.
+    but for its own folder of pipes. The compiles go in a folder of exec's
+    under the working directory, which holds a program up to 32 MB for
+    each source.
     """
-    if len({item.several for item in items}) > 1:
+    forms = sorted({item.form for item in items}, key=list(FORM_NAMES).index)
+    if len(forms) > 1:
         raise PrimitiveError(
-            "a batch mixes the one-program form and the several-programs form"
+            f"a batch mixes the {FORM_NAMES[forms[0]]} form and the "
+            f"{FORM_NAMES[forms[1]]} form"
         )
     users = box_users()
     most = max((len(item.programs) for item in items), default=0)
@@ -114,26 +132,67 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
             f"{len(users)} box users, one for each"
         )
     memory_kb = step_memory_kb()
-    for item in items:
-        needed = sum(box_size_kb(entry) for entry in item.programs)
-        check_memory(needed, memory_kb, item.run)
+    check_room(memory_kb)
     set_up_step(users, memory_kb)
     scratch = Path(tempfile.mkdtemp(prefix="exec-"))
-    kinds: dict[Path, str] = {}
-    results: list[dict[str, object]] = []
+    work = Path(tempfile.mkdtemp(prefix="compile-", dir=root))
     try:
+        built: dict[Source, Built] = {}
         for item in items:
-            for entry in item.programs:
-                if entry.program not in kinds:
-                    kinds[entry.program] = detect(entry.program)
-            if item.several:
-                outputs = run_programs(root, item, kinds, scratch, users)
+            for source in item.sources:
+                if source not in built:
+                    built[source] = build(
+                        source.folder,
+                        source.language,
+                        source.entry,
+                        work / str(len(built)),
+                    )
+        compiled = {
+            source: Compiled(detect(each.program), each.program)
+            for source, each in built.items()
+            if each.program is not None
+        }
+        if len(compiled) < len(built) or forms == ["build"]:
+            return [
+                {"run": item.run, "outputs": not_compiled(item, built)}
+                for item in items
+            ]
+        for item in items:
+            needed = sum(
+                box_size_kb(entry, compiled[entry.source].path)
+                for entry in item.programs
+            )
+            check_memory(needed, memory_kb, item.run)
+        results: list[dict[str, object]] = []
+        for item in items:
+            if item.form == "programs":
+                outputs = run_programs(root, item, compiled, scratch, users)
             else:
-                outputs = run_item(root, item, kinds, scratch, users)
-            results.append({"run": item.run, "outputs": outputs})
+                outputs = run_item(root, item, compiled, scratch, users)
+            results.append({"run": item.run, "outputs": outputs | logs(item, built)})
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
     return results
+
+
+def logs(item: Item, built: dict[Source, Built]) -> dict[str, object]:
+    """Each compile log of the item's programs: `log` for the one-program
+    form and the build form, `<name>.log` for the several-programs form."""
+    if item.form != "programs":
+        return {"log": built[item.sources[0]].log}
+    return {f"{entry.name}.log": built[entry.source].log for entry in item.programs}
+
+
+def not_compiled(item: Item, built: dict[Source, Built]) -> dict[str, object]:
+    """The outputs of an item when the batch ran nothing: its logs, and as
+    its outcome `compile_error` when any source of the batch did not
+    compile, else, for the build form, which runs nothing, `accepted`.
+    Every item gives the same outcome, even a build item whose own source
+    compiled, as the declaration's `once` says, so a forge reading items
+    one by one reads the right one."""
+    failed = any(each.program is None for each in built.values())
+    return logs(item, built) | {"outcome": "compile_error" if failed else "accepted"}
 
 
 def detect(program: Path) -> str:
@@ -158,10 +217,14 @@ def detect(program: Path) -> str:
 
 
 def run_item(
-    root: Path, item: Item, kinds: dict[Path, str], scratch: Path, users: range
+    root: Path,
+    item: Item,
+    compiled: dict[Source, Compiled],
+    scratch: Path,
+    users: range,
 ) -> dict[str, object]:
-    """Run an item of the one-program form, its program of the format
-    `kinds` gives it, in a fresh box and return its outputs, all of them
+    """Run an item of the one-program form, its program as `compiled` holds
+    it, in a fresh box and return its outputs, all of them
     whatever the outcome: what the program printed, its CPU time and its
     peak memory.
 
@@ -176,11 +239,11 @@ def run_item(
     the wall clock stopped, one that slept or waited, used little CPU.
     """
     (entry,) = item.programs
-    kind = kinds[entry.program]
+    own = compiled[entry.source]
     out = root / "out" / str(item.number)
     out.mkdir(parents=True, exist_ok=True)
-    with fresh_box(BOX, box_size_kb(entry)) as box:
-        program = prepare(item, entry, kind, box)
+    with fresh_box(BOX, box_size_kb(entry, own.path)) as box:
+        program = prepare(item, entry, own, box)
         place_files(box / "run", entry.files | entry.loads, entry.cached)
         for name in BOX_FOLDERS:
             (box / name).mkdir()
@@ -192,7 +255,7 @@ def run_item(
         reports = report is not None
         run = execute(item.run, entry, program, reports, out / "output", scratch, users)
         run = replace(run, no_inodes=os.statvfs(box).f_ffree == 0)
-        outcome = judge(run, kind)
+        outcome = judge(run, own.kind)
         time_ms = round(run.cpu_seconds * 1000)
         if outcome == "time_limit":
             time_ms = max(time_ms, entry.time_limit_ms)
@@ -207,8 +270,8 @@ def run_item(
     return outputs
 
 
-def prepare(item: Item, entry: Entry, kind: str, box: Path) -> Program:
-    """Copy a program of the item, of format `kind`, into its box, before
+def prepare(item: Item, entry: Entry, own: Compiled, box: Path) -> Program:
+    """Copy a program of the item, compiled as `own`, into its box, before
     its clock starts, executable for a native executable, since the file
     under `in/` may not be, and readable for the others.
 
@@ -216,14 +279,14 @@ def prepare(item: Item, entry: Entry, kind: str, box: Path) -> Program:
     mode, times or attributes; the copy goes with the box.
     """
     try:
-        shutil.copyfile(entry.program, box / "program")
+        shutil.copyfile(own.path, box / "program")
     except OSError as error:
-        which = entry.name if item.several else f"of run {item.run}"
+        which = entry.name if item.form == "programs" else f"of run {item.run}"
         raise PrimitiveError(
             f"the program {which} could not be copied: {error.strerror}"
         ) from error
-    (box / "program").chmod(0o755 if kind == "native" else 0o644)
-    return Program(kind, Path("/box/program"))
+    (box / "program").chmod(0o755 if own.kind == "native" else 0o644)
+    return Program(own.kind, Path("/box/program"))
 
 
 def execute(
@@ -298,11 +361,7 @@ def execute(
             code = keeper.wait()
     found = read_meta(meta)
     status = found.get("status", "")
-    if code not in (0, 1) or status == "XX":
-        said = found.get("message") or errors.read_bytes()
-        raise PrimitiveError(
-            f"isolate could not run the program: {isolate_said(code, said)}"
-        )
+    check_isolate(code, found, errors, "the program")
     return Run(
         status=status,
         returncode=exit_code(found, 0 if status == "" else -9),
@@ -384,10 +443,14 @@ class Running:
 
 
 def run_programs(
-    root: Path, item: Item, kinds: dict[Path, str], scratch: Path, users: range
+    root: Path,
+    item: Item,
+    compiled: dict[Source, Compiled],
+    scratch: Path,
+    users: range,
 ) -> dict[str, object]:
     """Run an item of the several-programs form, its programs side by side,
-    each of the format `kinds` gives it, in a fresh box, and return
+    each as `compiled` holds it, in a fresh box, and return
     its outputs: each program's facts as `<name>.<fact>`, the reports of
     each given a manifest whose verdict is `0` as `<name>.<report>`, the
     facts of all as the file `facts`, and the outcome, `accepted`.
@@ -406,16 +469,17 @@ def run_programs(
         running: list[Running] = []
         programs: list[Program] = []
         for number, entry in enumerate(item.programs):
-            box = stack.enter_context(fresh_box(number, box_size_kb(entry)))
+            own = compiled[entry.source]
+            box = stack.enter_context(fresh_box(number, box_size_kb(entry, own.path)))
             each = Running(
                 entry=entry,
                 number=number,
-                kind=kinds[entry.program],
+                kind=own.kind,
                 box=box,
                 meta=scratch / f"meta-{number}",
                 errors=scratch / f"errors-{number}",
             )
-            programs.append(prepare(item, entry, each.kind, box))
+            programs.append(prepare(item, entry, own, box))
             place_files(box / "run", entry.files, entry.cached)
             for name in named[entry.name]:
                 (box / "run" / name).symlink_to(f"{PIPES}/{name}")
@@ -754,12 +818,7 @@ def finish(each: Running, code: int) -> Run:
     asked = each.stopped_by is not None
     if asked and code == -signal.SIGTERM and not found:
         return Run("SG", -signal.SIGKILL, 0.0, 0, 0, interrupted=True)
-    if code not in (0, 1) or status == "XX":
-        said = found.get("message") or each.errors.read_bytes()
-        raise PrimitiveError(
-            f"isolate could not run the program {each.entry.name}: "
-            f"{isolate_said(code, said)}"
-        )
+    check_isolate(code, found, each.errors, f"the program {each.entry.name}")
     interrupted = asked and found.get("message") == INTERRUPTED
     if interrupted:
         returncode = -signal.SIGKILL

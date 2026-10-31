@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from exec import box, inputs, programs, report, shared
+from exec.compile.build import Built
 from exec.main import main
 from support import (
     BOX_USERS,
@@ -37,7 +38,6 @@ from support import (
     peek_input,
     peeked,
     printed,
-    python_binary,
     returned_outcomes,
 )
 
@@ -62,7 +62,7 @@ def boxes(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def run(boxes: None, tmp_path: Path) -> Any:
     """Run the program over a batch of the test program's cases."""
-    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    binary = PROGRAM
 
     def batch(items: list[tuple[str, str]], **options: Any) -> dict[str, Any]:
         work = tmp_path / "work"
@@ -92,7 +92,7 @@ def make_run(**changes: Any) -> box.Run:
     ("limit", "ms"), [(1.0, 1000), (0.1, 100), (0.3, 300), (2.5, 2500), (0.0005, 1)]
 )
 def test_the_time_limit_in_milliseconds_is_rounded_up(limit: float, ms: int) -> None:
-    entry = inputs.Entry("program", Path("b"), limit, 64)
+    entry = inputs.Entry("program", inputs.Source(Path("b"), "python"), limit, 64)
     assert entry.time_limit_ms == ms
 
 
@@ -131,9 +131,9 @@ def test_judge(changes: dict[str, Any], kind: str, outcome: str) -> None:
 
 
 def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
-    """The outcome port's outcomes are exactly the ones `judge` gives and a
-    report's verdict, each with a line saying when, for the workflow editor's
-    drawer.
+    """The outcome port's outcomes are exactly the ones `judge` gives, a
+    report's verdict and a compile that failed, each with a line saying
+    when, for the workflow editor's drawer.
     """
     reported = {
         report.judge(make_run(**changes), kind) for changes, kind, _ in JUDGED
@@ -150,20 +150,22 @@ def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
         "memory_limit",
         "output_limit",
         "runtime_error",
+        "compile_error",
     ]
-    assert set(outcomes) == reported
+    assert set(outcomes) == reported | {"compile_error"}
     assert all(isinstance(when, str) and "\n" not in when for when in outcomes.values())
 
 
 def test_the_declaration_says_every_outcome_judge_can_give() -> None:
-    """The declared outcomes are every one `judge`, a report's verdict and
-    a self-reported run's fault can give, read from their source rather than
-    from the runs `JUDGED` picks, so a new way to an outcome needs its line
-    too.
+    """The declared outcomes are every one `judge`, a report's verdict, a
+    self-reported run's fault and a batch that did not compile can give,
+    read from their source rather than from the runs `JUDGED` picks, so a
+    new way to an outcome needs its line too.
     """
     outcomes = declaration()["outputs"]["outcome"]["outcomes"]
 
     found = returned_outcomes(report.judge) | returned_outcomes(report.verdict_outcome)
+    found |= returned_outcomes(programs.not_compiled)
     assert set(outcomes) == found | returned_outcomes(report.reported)
 
 
@@ -171,7 +173,9 @@ def test_detect(tmp_path: Path) -> None:
     """The three formats are told apart by content, and anything else is an error."""
     native = tmp_path / "native"
     native.write_bytes(b"\x7fELF" + bytes(60))
-    python = python_binary(tmp_path / "python", "print(1)\n")
+    python = tmp_path / "python"
+    with zipfile.ZipFile(python, "w") as archive:
+        archive.writestr("__main__.py", "print(1)\n")
     java = tmp_path / "java"
     with zipfile.ZipFile(java, "w") as archive:
         archive.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n")
@@ -191,10 +195,11 @@ def test_detect(tmp_path: Path) -> None:
         ({"time_limit": True}, "time_limit of run main-1 is not a positive number"),
         ({"time_limit": float("nan")}, "inputs.json is not valid JSON"),
         ({"memory_limit": "64"}, "memory_limit of run main-1 is not a positive"),
-        (
-            {"program": {"file": "in/../inputs.json"}},
-            "program of run main-1 is outside",
-        ),
+        ({"source": {"folder": "in/.."}}, "source of run main-1 is outside"),
+        ({"source": {"file": "in/1/source"}}, "source of run main-1 is not a folder"),
+        ({"source": {"folder": "in/none"}}, "source of run main-1 is not in the"),
+        ({"language": "rust"}, "language of run main-1 is not one of c, cpp,"),
+        ({"entry": 3}, "the input named entry of run main-1 is not text"),
         ({"stdin": {"file": "in/none"}}, "stdin of run main-1 is not in the working"),
         ({"stdin": "in/2/input"}, "stdin of run main-1 is not a file"),
         ({"args": 3}, "args of run main-1 is not text"),
@@ -206,7 +211,7 @@ def test_inputs_it_cannot_use_are_an_error(
     tmp_path: Path, inputs: dict[str, Any], message: str
 ) -> None:
     """Anything that stops the primitive working is `error` alone, in one sentence."""
-    batch_inputs(tmp_path, b"", [("main-1", "")])
+    batch_inputs(tmp_path, "", [("main-1", "")])
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["batch"][0]["inputs"].update(inputs)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
@@ -218,7 +223,7 @@ def test_inputs_it_cannot_use_are_an_error(
 
 def test_a_limit_too_large_to_be_a_number_is_an_error(tmp_path: Path) -> None:
     """`1e999` is valid JSON, which Python reads as infinity."""
-    batch_inputs(tmp_path, b"", [("main-1", "")])
+    batch_inputs(tmp_path, "", [("main-1", "")])
     text = (tmp_path / "inputs.json").read_text()
     document = json.loads(text)
     document["batch"][0]["inputs"]["memory_limit"] = 123456789
@@ -243,7 +248,7 @@ def test_a_limit_too_large_to_be_a_number_is_an_error(tmp_path: Path) -> None:
             "the run main-1 is self_reported without a manifest, so it reports nothing",
         ),
         (
-            {"files": {"files": {"a b": {"file": "in/1/program"}}}},
+            {"files": {"files": {"a b": {"file": "in/2/input"}}}},
             "the input named files of run main-1 names a file 'a b', not a plain name",
         ),
     ],
@@ -251,7 +256,7 @@ def test_a_limit_too_large_to_be_a_number_is_an_error(tmp_path: Path) -> None:
 def test_an_input_that_does_not_hold_is_named_with_its_run(
     tmp_path: Path, given: dict[str, Any], message: str
 ) -> None:
-    batch_inputs(tmp_path, b"", [("main-1", "")])
+    batch_inputs(tmp_path, "", [("main-1", "")])
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["batch"][0]["inputs"].update(given)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
@@ -266,19 +271,35 @@ def test_a_run_is_read_without_the_several_programs_forms_own_inputs(
     """`stops_others` is the several-programs form's alone, so a run of the
     one-program form that gives it, whatever it holds, is read as without
     it."""
-    batch_inputs(tmp_path, b"", [("main-1", "")])
+    batch_inputs(tmp_path, "", [("main-1", "")])
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["batch"][0]["inputs"]["stops_others"] = "yes"
     (tmp_path / "inputs.json").write_text(json.dumps(document))
     (read,) = inputs.read_inputs(tmp_path)
     (program,) = read.programs
-    assert not read.several
+    assert read.form == "one"
     assert not program.stops_others
+
+
+def test_inputs_given_alone_are_one_item(tmp_path: Path) -> None:
+    """A step the forge does once gives its inputs alone, not in a batch:
+    they are read as one item, marked to be answered alone."""
+    batch_inputs(tmp_path, "", [("main-1", "")])
+    document = json.loads((tmp_path / "inputs.json").read_text())
+    alone = {"schema_version": 6, "inputs": document["batch"][0]["inputs"]}
+    (tmp_path / "inputs.json").write_text(json.dumps(alone))
+    (read,) = inputs.read_inputs(tmp_path)
+    assert (read.run, read.number, read.form, read.alone) == (
+        inputs.ALONE_RUN,
+        1,
+        "one",
+        True,
+    )
 
 
 def test_a_version_5_batch_is_an_error(tmp_path: Path) -> None:
     """exec speaks contract version 6 alone, whose items are keyed by run."""
-    batch_inputs(tmp_path, b"", [("main-1", "")])
+    batch_inputs(tmp_path, "", [("main-1", "")])
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["schema_version"] = 5
     (tmp_path / "inputs.json").write_text(json.dumps(document))
@@ -303,7 +324,7 @@ def test_items_must_be_for_distinct_runs(
 ) -> None:
     """Each item names one run, by an id of letters, digits, `_` and `-`, and no
     two the same one."""
-    batch_inputs(tmp_path, b"", [(f"main-{n}", "") for n in range(len(runs))])
+    batch_inputs(tmp_path, "", [(f"main-{n}", "") for n in range(len(runs))])
     document = json.loads((tmp_path / "inputs.json").read_text())
     for entry, run in zip(document["batch"], runs, strict=True):
         entry["run"] = run
@@ -330,7 +351,7 @@ def test_items_must_be_for_distinct_runs(
 def test_named_files_it_cannot_use_are_an_error(
     tmp_path: Path, value: object, message: str
 ) -> None:
-    batch_inputs(tmp_path, b"", [("main-1", "")])
+    batch_inputs(tmp_path, "", [("main-1", "")])
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["batch"][0]["inputs"]["files"] = value
     (tmp_path / "inputs.json").write_text(json.dumps(document))
@@ -342,7 +363,7 @@ def test_a_name_in_both_files_and_loads_is_an_error(tmp_path: Path) -> None:
     """Each name is one file in the run's working directory; the save should
     have caught two."""
     named = {"main-1": {"solution.py": b"x"}}
-    batch_inputs(tmp_path, b"", [("main-1", "")], files=named, loads=named)
+    batch_inputs(tmp_path, "", [("main-1", "")], files=named, loads=named)
     main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert "names solution.py in both files and loads" in result["error"]
@@ -451,7 +472,7 @@ def test_on_root_docker_nothing_runs(
 
     monkeypatch.setattr(box, "set_up_cgroup", touched)
     work = tmp_path / "work"
-    binary = python_binary(tmp_path / "p", "print(1)\n").read_bytes()
+    binary = "print(1)\n"
     batch_inputs(work, binary, [("main-1", "")])
     main(["exec", str(work)])
     result = json.loads((work / "outputs.json").read_text())
@@ -477,7 +498,7 @@ def box_user_processes() -> list[int]:
 
 def test_a_run_without_stdin_reads_nothing(boxes: None, tmp_path: Path) -> None:
     """With no `stdin`, standard input is empty, as `/dev/null` is."""
-    program = python_binary(tmp_path / "build" / "program", PROGRAM).read_bytes()
+    program = PROGRAM
     work = tmp_path / "work"
     batch_inputs(work, program, [("main-1", "")])
     document = json.loads((work / "inputs.json").read_text())
@@ -523,7 +544,7 @@ def test_a_run_that_removes_or_changes_its_named_files_changes_no_later_run(
     next run that names the same file under `in/` still gets it whole."""
     work = tmp_path / "work"
     items = [("main-1", "spoil\n"), ("main-2", "named\n")]
-    batch_inputs(work, python_binary(tmp_path / "b" / "p", PROGRAM).read_bytes(), items)
+    batch_inputs(work, PROGRAM, items)
     (work / "in" / "shared").mkdir()
     (work / "in" / "shared" / "answer").write_text("42\n")
     document = json.loads((work / "inputs.json").read_text())
@@ -536,9 +557,24 @@ def test_a_run_that_removes_or_changes_its_named_files_changes_no_later_run(
     assert printed(work, outputs["main-2"]) == "answer 0o444 3 42\n"
 
 
-def test_a_binary_in_no_known_format_is_an_error(boxes: None, tmp_path: Path) -> None:
+def built_as(monkeypatch: pytest.MonkeyPatch, content: bytes) -> None:
+    """Have every source compile to a program holding `content`, as no
+    compiler of exec's writes, to see what exec makes of it."""
+
+    def build(folder: Path, language: str, entry: str | None, work: Path) -> Built:
+        work.mkdir()
+        (work / "program").write_bytes(content)
+        return Built("", work / "program")
+
+    monkeypatch.setattr(programs, "build", build)
+
+
+def test_a_program_in_no_known_format_is_an_error(
+    boxes: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A program exec cannot run is the step failing, not the contestant."""
-    batch_inputs(tmp_path, b"#!/bin/sh\n", [("main-1", "")])
+    built_as(monkeypatch, b"#!/bin/sh\n")
+    batch_inputs(tmp_path, "", [("main-1", "")])
     main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert "not a native executable" in result["error"]
@@ -569,7 +605,7 @@ def test_every_outcome(run: Any, tmp_path: Path) -> None:
     assert printed(work, outputs["samples-ok"]) == "42\n"
     assert printed(work, outputs["main-fail"]) == "partial\n"
     for entry in outputs.values():
-        assert set(entry) == {"output", "time_ms", "memory_kb", "outcome"}
+        assert set(entry) == {"log", "output", "time_ms", "memory_kb", "outcome"}
         assert isinstance(entry["time_ms"], int)
         assert isinstance(entry["memory_kb"], int)
         assert entry["memory_kb"] > 0
@@ -643,7 +679,7 @@ def test_args_no_command_line_can_carry_are_a_runtime_error(
         "main-ok": "accepted",
     }
     for entry in outputs.values():
-        assert set(entry) == {"output", "time_ms", "memory_kb", "outcome"}
+        assert set(entry) == {"log", "output", "time_ms", "memory_kb", "outcome"}
     assert printed(tmp_path / "work", outputs["main-nul"]) == ""
 
 
@@ -789,7 +825,7 @@ def test_reading_a_large_input_counts_what_the_box_reads_in(
     the step's `main`, the file's pages would be taken back for the copy
     into the box. The run is `accepted` either way."""
     work = tmp_path / "work"
-    binary = python_binary(tmp_path / "b" / "p", PROGRAM).read_bytes()
+    binary = PROGRAM
     items = [("main-base", "double\n21\n"), ("main-read", "")]
     batch_inputs(work, binary, items, time_limit=5, memory_limit=64)
     with (work / "in" / "3" / "input").open("wb") as stream:
@@ -814,9 +850,10 @@ def test_reading_a_large_input_counts_what_the_box_reads_in(
 
 
 def test_a_native_binary_the_kernel_will_not_run_is_a_runtime_error(
-    boxes: None, tmp_path: Path
+    boxes: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    batch_inputs(tmp_path, b"\x7fELF" + bytes(60), [("main-1", "")])
+    built_as(monkeypatch, b"\x7fELF" + bytes(60))
+    batch_inputs(tmp_path, "", [("main-1", "")])
     main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     outputs = by_run(result)["main-1"]
@@ -1081,7 +1118,7 @@ def test_a_stdin_file_others_can_write_is_not_changed_by_a_run(
     by the file's own mode, so exec takes write away from group and others
     first: a run given a 0666 input cannot append to it for a later run, or
     a later step, to read."""
-    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    binary = PROGRAM
     work = tmp_path / "work"
     batch_inputs(
         work, binary, [("main-1", "append-stdin\n"), ("main-2", "folders\n10\n")]
@@ -1101,7 +1138,7 @@ def test_a_run_reads_its_stdin_file_but_not_its_name(
 ) -> None:
     """The path a box reads for its standard input is `/`, not the file's
     under `/work/in`, which may say which test it is."""
-    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    binary = PROGRAM
     work = tmp_path / "work"
     batch_inputs(work, binary, [("main-1", "stdin-path\nrest\n")])
     assert main(["exec", str(work)]) == 0
@@ -1111,7 +1148,7 @@ def test_a_run_reads_its_stdin_file_but_not_its_name(
 
 
 def test_a_stdin_file_a_box_user_owns_is_an_error(boxes: None, tmp_path: Path) -> None:
-    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    binary = PROGRAM
     work = tmp_path / "work"
     batch_inputs(work, binary, [("main-1", "folders\n10\n")])
     os.chown(work / "in" / "2" / "input", 60000, 60000)
@@ -1178,7 +1215,7 @@ def test_two_steps_at_once_share_a_process_count_only_on_the_same_users(
     distinct box users each fork up to their limit at once, and two given
     the same one share it."""
     box.set_up_step(box.box_users(), box.step_memory_kb())
-    binary = python_binary(tmp_path / "b" / "p", PROGRAM).read_bytes()
+    binary = PROGRAM
     works = []
     for number in range(2):
         work = tmp_path / f"work-{number}"
@@ -1313,15 +1350,21 @@ def test_cleanup_that_fails_after_an_error_does_not_hide_it(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    ran: list[bool] = []
+    close_box = box.close_box
+
     def fail(*_: object) -> None:
+        ran.append(True)
         raise shared.PrimitiveError("the first error")
 
-    def fail_cleanup(*_: object) -> None:
+    def fail_cleanup(number: int, folder: Path) -> None:
+        if not ran:
+            return close_box(number, folder)
         raise shared.PrimitiveError("the cleanup error")
 
     batch_inputs(
         tmp_path,
-        python_binary(tmp_path / "p", "print(1)\n").read_bytes(),
+        "print(1)\n",
         [("main-1", "")],
     )
     monkeypatch.setattr(box, "check_launcher", lambda: None)
@@ -1749,7 +1792,7 @@ def test_a_report_folder_swapped_for_a_link_reads_nothing_for_the_run(
 def test_a_manifest_or_self_report_it_cannot_use_is_an_error(
     tmp_path: Path, inputs: dict[str, Any], message: str
 ) -> None:
-    batch_inputs(tmp_path, b"", [("main-1", "not json")])
+    batch_inputs(tmp_path, "", [("main-1", "not json")])
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["batch"][0]["inputs"].update(inputs)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
@@ -1826,7 +1869,7 @@ def test_a_run_the_step_cannot_hold_is_refused(
 
 
 def test_a_batch_with_a_run_the_step_cannot_hold_runs_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    boxes: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The named files are counted with the memory limit, since they are
     copied into the box's tmpfs, charged to the step: so a run whose limit
@@ -1834,15 +1877,15 @@ def test_a_batch_with_a_run_the_step_cannot_hold_runs_nothing(
     error of the step, not a run the step's limit kills."""
     monkeypatch.setattr(box, "CONTAINER_MEMORY", tmp_path / "none")
     monkeypatch.setenv(box.BOX_USERS_VARIABLE, BOX_USERS)
-    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, "240")
-    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    monkeypatch.setenv(box.STEP_MEMORY_VARIABLE, "1136")
+    binary = PROGRAM
     work = tmp_path / "work"
     files = {"main-2": {"data": b"x" * (80 * MB)}}
     items = [("main-1", "double\n21\n"), ("main-2", "double\n21\n")]
-    batch_inputs(work, binary, items, files=files)
+    batch_inputs(work, binary, items, memory_limit=960, files=files)
     assert main(["exec", str(work)]) == 0
     result = json.loads((work / "outputs.json").read_text())
-    assert result["error"].startswith("the run main-2 needs 145 MB")
+    assert result["error"].startswith("the run main-2 needs 1041 MB")
     assert "batch" not in result
     assert not (work / "out").exists()
 
@@ -1850,12 +1893,12 @@ def test_a_batch_with_a_run_the_step_cannot_hold_runs_nothing(
 # Cached files: in the step's cache, bound into the box, never copied.
 
 
-def cached_work(tmp_path: Path, binary: bytes, stdin: str) -> Path:
+def cached_work(tmp_path: Path, source: str, stdin: str) -> Path:
     """A working directory whose one run names `train.csv`, a cached file
     in the item folder `Wq81` of a step folder elsewhere, which `cache`
     links to, as the step wrapper lays it out."""
     work = tmp_path / "work"
-    batch_inputs(work, binary, [("main-1", stdin)])
+    batch_inputs(work, source, [("main-1", stdin)])
     item = tmp_path / "cache" / "items" / "step-k2" / "Wq81"
     item.mkdir(parents=True)
     (item / "train.csv").write_text("1,2,3\n")
@@ -1870,13 +1913,14 @@ def cached_work(tmp_path: Path, binary: bytes, stdin: str) -> Path:
 
 
 def test_a_cached_file_is_read_through_the_steps_cache_link(tmp_path: Path) -> None:
-    work = cached_work(tmp_path, b"\x7fELF", "")
+    work = cached_work(tmp_path, "", "")
     (item,) = inputs.read_inputs(work)[0].programs
     found = (tmp_path / "cache" / "items" / "step-k2" / "Wq81").resolve()
     assert item.files == {"train.csv": found / "train.csv"}
     assert item.cached == found
-    program_kb = 4 * -(-item.program.stat().st_size // 4096)
-    assert box.box_size_kb(item) == item.memory_limit_kb + program_kb
+    program = tmp_path / "program"
+    program.write_bytes(b"x" * 5000)
+    assert box.box_size_kb(item, program) == item.memory_limit_kb + 8
     assert box.cache_binding(item.cached) == [f"--dir=cache={found}:noexec"]
     assert box.cache_binding(None) == []
 
@@ -1886,8 +1930,8 @@ def test_a_cached_file_is_read_through_the_steps_cache_link(tmp_path: Path) -> N
     [
         "cache/Wq81",
         "cache/Wq81/deeper/train.csv",
-        "cache/Wq81/../../in/1/program",
-        "cache/../in/1/program",
+        "cache/Wq81/../../in/1/source/main.py",
+        "cache/../in/1/source/main.py",
         "in/../cache/Wq81/train.csv",
         "cache/Wq81/away",
     ],
@@ -1895,12 +1939,12 @@ def test_a_cached_file_is_read_through_the_steps_cache_link(tmp_path: Path) -> N
 def test_a_cached_file_not_straight_in_an_item_folder_is_refused(
     tmp_path: Path, path: str
 ) -> None:
-    work = cached_work(tmp_path, b"\x7fELF", "")
+    work = cached_work(tmp_path, "", "")
     item = tmp_path / "cache" / "items" / "step-k2" / "Wq81"
     item.chmod(0o755)
     (item / "deeper").mkdir()
     (item / "deeper" / "train.csv").write_text("x")
-    (item / "away").symlink_to(work / "in" / "1" / "program")
+    (item / "away").symlink_to(work / "in" / "1" / "source" / "main.py")
     with pytest.raises(shared.PrimitiveError) as raised:
         inputs.in_file(work, {"file": path}, "the file")
     assert str(raised.value) in (
@@ -1911,7 +1955,7 @@ def test_a_cached_file_not_straight_in_an_item_folder_is_refused(
 
 
 def test_cached_files_of_two_items_in_one_run_are_refused(tmp_path: Path) -> None:
-    work = cached_work(tmp_path, b"\x7fELF", "")
+    work = cached_work(tmp_path, "", "")
     other = tmp_path / "cache" / "items" / "step-k2" / "Zr3"
     other.mkdir()
     (other / "test.csv").write_text("4\n")
@@ -1929,7 +1973,7 @@ def test_cached_files_of_two_items_in_one_run_are_refused(tmp_path: Path) -> Non
 def test_an_item_folder_holding_another_runs_file_is_refused(tmp_path: Path) -> None:
     """The run's item folder is bound whole into its box, so one that also
     holds a file not the run's own would put that file in its box."""
-    work = cached_work(tmp_path, b"\x7fELF", "")
+    work = cached_work(tmp_path, "", "")
     item = tmp_path / "cache" / "items" / "step-k2" / "Wq81"
     item.chmod(0o755)
     (item / "answer").write_text("main-2's")
@@ -1942,7 +1986,7 @@ def test_an_item_folder_holding_another_runs_file_is_refused(tmp_path: Path) -> 
 
 
 def test_a_cached_stdin_may_share_the_runs_item_folder(tmp_path: Path) -> None:
-    work = cached_work(tmp_path, b"\x7fELF", "")
+    work = cached_work(tmp_path, "", "")
     item = tmp_path / "cache" / "items" / "step-k2" / "Wq81"
     item.chmod(0o755)
     (item / "input").write_text("1\n")
@@ -1975,7 +2019,7 @@ def test_a_cached_file_is_bound_into_the_box_read_only_and_never_copied(
     as `/cache`, and can neither change the file nor add one beside it.
     What `/proc/self/mountinfo` shows of the bound folder's own path is
     printed for the record."""
-    binary = python_binary(tmp_path / "build" / "program", PROGRAM).read_bytes()
+    binary = PROGRAM
     work = cached_work(tmp_path, binary, "cached\ntrain.csv\n")
     assert main(["exec", str(work)]) == 0
     outputs = by_run(json.loads((work / "outputs.json").read_text()))["main-1"]
