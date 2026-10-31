@@ -1,9 +1,8 @@
 """The image, run on Docker as an interact step container is: privileged, as
 root, through `userns.py` (see `conftest.py`).
 
-Python programs are built here as zip applications whose `__main__.py` is
-the program itself; native ones come from the compile primitive's own
-image. The verdict script of `unicon/interactive@v1` is run on exec's image
+Every program is given as its source, which exec compiles before the
+runs. The verdict script of `unicon/interactive@v2` is run on exec's image
 over the facts interact wrote, the two chained by hand as the forge will
 chain them.
 """
@@ -29,7 +28,6 @@ from support import (
     SIBLING_VERDICT,
     STEP_MEMORY_MB,
     Check,
-    Compiled,
     RunImage,
     Spec,
     TestItem,
@@ -135,19 +133,21 @@ def test_the_guessing_game_through_the_image(
     assert outputs["main-slow"]["facts"] == {"file": "out/3/facts.json"}
 
 
-def test_native_programs_from_compile(
-    tmp_path: Path, run_image: RunImage, compiled: Compiled
-) -> None:
-    """A native judge and entrant play the game, and a native judge writing
-    to an entrant that left dies of `SIGPIPE`, after the entrant ended."""
-    entrant = compiled("cpp", "entrant.cpp", ENTRANT_CPP)
-    judge = compiled("cpp", "judge.cpp", JUDGE_CPP)
+def test_native_programs_compile_and_play(tmp_path: Path, run_image: RunImage) -> None:
+    """A native judge and entrant, each compiled once for the batch, play
+    the game, and a native judge writing to an entrant that left dies of
+    `SIGPIPE`, after the entrant ended."""
 
     def pair(entrant_case: str, judge_case: str) -> dict[str, Spec]:
         return {
-            "entrant": Spec("entrant", entrant_case),
+            "entrant": Spec(ENTRANT_CPP, entrant_case, language="cpp"),
             "judge": Spec(
-                "judge", judge_case, time_limit=2, files=SECRET, manifest=GUESSES
+                JUDGE_CPP,
+                judge_case,
+                language="cpp",
+                time_limit=2,
+                files=SECRET,
+                manifest=GUESSES,
             ),
         }
 
@@ -156,8 +156,9 @@ def test_native_programs_from_compile(
         ("main-guess", pair("guess", "plain"), GAME_LINKS),
         ("main-leave", pair("leave", "greet"), GAME_LINKS),
     ]
-    batch_inputs(work, items, binaries={"entrant": entrant, "judge": judge})
+    batch_inputs(work, items)
     outputs = by_run(run_image(work, container_limits(items)))
+    assert outputs["main-guess"]["entrant.log"] == ""
     assert outputs["main-guess"]["judge.guesses"] == 10
     left = facts_of(work, outputs["main-leave"])
     assert left["entrant"]["ended"] == "finished"
@@ -168,43 +169,47 @@ def test_native_programs_from_compile(
 def test_programs_the_container_cannot_hold_together_are_an_error_of_the_step(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """Two programs of 64 MB each, side by side, with their copies and the
-    step's own room, do not fit a step of 192 MB: interact says so before
-    any program runs, rather than leave the step's limit to kill one and be
-    read as its own memory limit."""
-    items: list[TestItem] = [("main-1", game("guess"), GAME_LINKS)]
+    """Two programs of 512 MB each, side by side, with their copies and the
+    step's own room, do not fit a step of 1136 MB, the least the declaration
+    gives: exec says so before any program runs, rather than leave the
+    step's limit to kill one and be read as its own memory limit."""
+    played = game("guess", entrant_memory_limit=512, judge_memory_limit=512)
+    items: list[TestItem] = [("main-1", played, GAME_LINKS)]
     batch_inputs(tmp_path / "work", items)
-    limits = container_limits(items) | {"memory_mb": 192}
+    limits = container_limits(items) | {"memory_mb": 1136}
     result = run_image(tmp_path / "work", limits)
-    assert result["error"].startswith("the run main-1 needs 129 MB")
-    assert "step's 192 MB leaves 80 MB" in result["error"]
+    assert result["error"].startswith("the run main-1 needs 1025 MB")
+    assert "step's 1136 MB leaves 1024 MB" in result["error"]
 
 
-EXEC_LIMITS = {"time_ms": 13000, "cpu_ms": 13000, "memory_mb": 320, "pids": 160}
+EXEC_LIMITS = {"time_ms": 13000, "cpu_ms": 13000, "memory_mb": 1136, "pids": 160}
 """What the harness gives an exec step running the verdict script per item,
-by exec's `limits_from`, under the workflow's time limit of 5 s and 64 MB."""
+by exec's `limits_from`, under the workflow's time limit of 5 s and 64 MB;
+`ONCE_TIME_MS` is added once for the batch."""
+ONCE_TIME_MS = 40000
 
 
 def verdicts(
     tmp_path: Path,
     run_image: RunImage,
-    script: bytes,
+    script: str,
     facts: list[tuple[str, bytes]],
 ) -> dict[str, Any]:
     """Run the verdict script on this image's one-program form over each
-    item's facts, as the `decide` step of `unicon/interactive@v1` does, and
+    item's facts, as the `decide` step of `unicon/interactive@v2` does, and
     return its outputs.json."""
     manifest = yaml.safe_load((SIBLING_VERDICT / "program.yaml").read_text())
     work = tmp_path / f"exec-{len(list(tmp_path.glob('exec-*')))}"
-    (work / "in").mkdir(parents=True)
-    (work / "in" / "verdict").write_bytes(script)
+    (work / "in" / "verdict").mkdir(parents=True)
+    (work / "in" / "verdict" / "verdict.py").write_text(script)
     (work / "in" / "manifest.json").write_text(json.dumps(manifest))
     batch = []
     for number, (run, content) in enumerate(facts, 1):
         (work / "in" / str(number)).mkdir()
         (work / "in" / str(number) / "facts").write_bytes(content)
         inputs = {
-            "program": {"file": "in/verdict"},
+            "source": {"folder": "in/verdict"},
+            "language": "python",
             "manifest": {"file": "in/manifest.json"},
             "time_limit": 5,
             "memory_limit": 64,
@@ -218,15 +223,16 @@ def verdicts(
         name: value * count if name.endswith("_ms") else value
         for name, value in EXEC_LIMITS.items()
     }
+    limits["time_ms"] += ONCE_TIME_MS
     return run_image(work, limits | {"output_mb": 64})
 
 
 def test_interactive_v1_judges_through_both_forms(
-    tmp_path: Path, run_image: RunImage, compiled: Compiled
+    tmp_path: Path, run_image: RunImage
 ) -> None:
-    """interact plays each game, and the verdict script, compiled by compile
-    and run by exec given its manifest and the facts, gives the verdict
-    `unicon/interactive@v1` promises: the judge's `0` or `1`, the entrant's
+    """interact plays each game, and the verdict script, compiled and run by
+    exec given its manifest and the facts, gives the verdict
+    `unicon/interactive@v2` promises: the judge's `0` or `1`, the entrant's
     limit, and the entrant's crash or a wrong answer for an entrant that
     left; a judge's `0` however it ended once the entrant had, by
     `SIGPIPE` or a raised error; and a judge that crashed, or raised with no
@@ -234,7 +240,7 @@ def test_interactive_v1_judges_through_both_forms(
     folder = Path(os.environ.get("VERDICT_SCRIPT", SIBLING_VERDICT))
     if not (folder / "verdict.py").is_file():
         pytest.skip("no verdict script; set VERDICT_SCRIPT to its folder")
-    script = compiled("python", "verdict.py", (folder / "verdict.py").read_text())
+    script = (folder / "verdict.py").read_text()
     expected = {
         "main-guess": (game("guess"), "accepted"),
         "main-wrong": (game("wrong"), "wrong_answer"),

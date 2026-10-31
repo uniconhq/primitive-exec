@@ -1,23 +1,31 @@
 title: Run programs
-description: Runs one program, or several linked by pipes, under limits, and records how each ended.
+description: Compiles one program, or several linked by pipes, once, runs them under limits, and records how each ended.
 schema_version: 6
 batch: true
 network: false
 cache: true
 forms:
   one:
-    description: Runs a program once under limits and records its output, time and memory.
+    description: Compiles a program once, runs it under limits and records its output, time and memory.
     outputs_from: manifest
-    limits: {time_ms: 2000, cpu_ms: 2000, memory_mb: 256, pids: 160, output_mb: 64, gpus: 0}
+    limits: {time_ms: 2000, cpu_ms: 2000, memory_mb: 1136, pids: 160, output_mb: 64, gpus: 0, once_time_ms: 40000}
     limits_from:
       time_ms: {input: time_limit, scale: 2000, add: 3000}
       cpu_ms: {input: time_limit, scale: 2000, add: 3000}
       memory_mb: {input: memory_limit, add: 256}
     inputs:
-      program:
-        type: file
+      source:
+        type: folder
         runs: true
-        description: The program to run.
+        description: The program's source files, with their layout.
+      language:
+        type: enum
+        options: [c, cpp, java, python, ipynb]
+        description: The language the source is written in; ipynb is a Jupyter notebook.
+      entry:
+        type: text
+        optional: true
+        description: The file the program starts from, when the folder holds more than one that could be.
       stdin:
         type: file
         runs: false
@@ -82,9 +90,14 @@ forms:
         type: folder
         optional: true
         description: Every other file a program given a manifest reported, shown with the run and never a column.
+      log:
+        type: text
+        once: true
+        description: What the compiler printed, up to 64 KB.
       outcome:
         type: outcome
-        description: How the program's run ended.
+        description: How the program's run ended, or that its source did not compile.
+        once: [compile_error]
         outcomes:
           accepted: the program finishes within its limits, and given a manifest reports a verdict of 0
           wrong_answer: the program given a manifest reports a verdict of 1
@@ -92,10 +105,11 @@ forms:
           memory_limit: it uses more memory than allowed, or a program given a manifest reports a verdict of memory_limit
           output_limit: it prints more than allowed, or a program given a manifest reports a verdict of output_limit
           runtime_error: it crashes or exits with an error, or a program given a manifest reports a verdict of runtime_error
+          compile_error: the source does not compile, so nothing runs
   programs:
-    description: Runs programs side by side, linked by pipes, each under its own limits, and records how each one ended.
+    description: Compiles programs once, runs them side by side, linked by pipes, each under its own limits, and records how each one ended.
     outputs_from: programs
-    limits: {time_ms: 4000, cpu_ms: 4000, memory_mb: 512, pids: 1056, output_mb: 64, gpus: 0}
+    limits: {time_ms: 4000, cpu_ms: 4000, memory_mb: 1136, pids: 1056, output_mb: 64, gpus: 0, once_time_ms: 40000}
     limits_from:
       time_ms: {max: programs.time_limit, scale: 4000, add: 6000}
       cpu_ms: {max: programs.time_limit, scale: 4000, add: 6000}
@@ -105,10 +119,18 @@ forms:
         type: programs
         description: The programs to run side by side, one to eight, by the names the step gives them.
         inputs:
-          program:
-            type: file
+          source:
+            type: folder
             runs: true
-            description: The program, in one of exec's formats.
+            description: The program's source files, with their layout.
+          language:
+            type: enum
+            options: [c, cpp, java, python, ipynb]
+            description: The language the source is written in; ipynb is a Jupyter notebook.
+          entry:
+            type: text
+            optional: true
+            description: The file the program starts from, when the folder holds more than one that could be.
           files:
             type: named_files
             runs: false
@@ -160,6 +182,10 @@ forms:
             type: text
             optional: true
             description: What stopped the program, wall_clock or the name of the program whose ending stopped it.
+          log:
+            type: text
+            once: true
+            description: What the compiler printed for the program, up to 64 KB.
       links:
         type: links
         optional: true
@@ -170,6 +196,36 @@ forms:
         description: Every program's facts and reports, as one JSON file, for a verdict script to read.
       outcome:
         type: outcome
-        description: Whether every program was started and measured.
+        description: Whether every program was started and measured, or a source did not compile.
+        once: [compile_error]
         outcomes:
           accepted: every program was started and measured, however it ended
+          compile_error: a program's source does not compile, so nothing runs
+  build:
+    description: Compiles a program and runs nothing, so saving a task can check that its programs compile.
+    limits: {time_ms: 1000, cpu_ms: 1000, memory_mb: 1136, pids: 160, output_mb: 64, gpus: 0, once_time_ms: 40000}
+    inputs:
+      source:
+        type: folder
+        runs: true
+        description: The program's source files, with their layout.
+      language:
+        type: enum
+        options: [c, cpp, java, python, ipynb]
+        description: The language the source is written in; ipynb is a Jupyter notebook.
+      entry:
+        type: text
+        optional: true
+        description: The file the program starts from, when the folder holds more than one that could be.
+    outputs:
+      log:
+        type: text
+        once: true
+        description: What the compiler printed, up to 64 KB.
+      outcome:
+        type: outcome
+        once: [compile_error]
+        description: Whether the source compiles.
+        outcomes:
+          accepted: the source compiles
+          compile_error: it does not
