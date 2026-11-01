@@ -52,8 +52,15 @@ is `accepted` when every program was started and measured.
 A link is a pipe made before any box starts. A program's first link out is
 its standard output and its first link in its standard input; without one,
 standard input is `/dev/null` and standard output is read and thrown away,
-up to 32 MB. Each further link is a named file, `<other>` in its working
-directory, opened for it.
+up to 32 MB. Each further link is a named file, `to_<reader>` for its
+writer and `from_<writer>` for its reader, in its working directory,
+opened for it. The input and output orders are counted independently.
+
+For links `a -> b`, `a -> c`, then `b -> c`, a prints to b on standard
+output and writes to c through `to_c`. b reads a on standard input and
+prints to c on standard output. c reads a on standard input and reads b
+through `from_b`. Reordering the links changes which end uses standard
+input or output.
 
 ## One program
 
