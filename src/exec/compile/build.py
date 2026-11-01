@@ -105,7 +105,14 @@ def check_room(memory_kb: int) -> None:
         )
 
 
-def build(folder: Path, language: str, entry: str | None, work: Path) -> Built:
+def build(
+    folder: Path,
+    language: str,
+    entry: str | None,
+    work: Path,
+    *,
+    environment: str | None = None,
+) -> Built:
     """Compile the source folder `folder` for `language`, starting from
     `entry`, into `work/program`, `work` a new folder of exec's own.
 
@@ -124,7 +131,7 @@ def build(folder: Path, language: str, entry: str | None, work: Path) -> Built:
         return Built(f"{error}\n", None)
     if not cache.in_use():
         return compile_sources(sources, copy, language, work)
-    key = cache.key(cache.toolchain(), language, sources, copy)
+    key = cache.key(cache.toolchain(), language, sources, copy, environment)
     with cache.locked(key):
         found = cache.look_up(key, program)
         if found is not None:

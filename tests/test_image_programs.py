@@ -2,7 +2,7 @@
 root, through `userns.py` (see `conftest.py`).
 
 Every program is given as its source, which exec compiles before the
-runs. The verdict script of `unicon/interactive@v2` is run on exec's image
+runs. The verdict script of `unicon/interactive@v3` is run on exec's image
 over the facts interact wrote, the two chained by hand as the forge will
 chain them.
 """
@@ -196,7 +196,7 @@ def verdicts(
     facts: list[tuple[str, bytes]],
 ) -> dict[str, Any]:
     """Run the verdict script on this image's one-program form over each
-    item's facts, as the `decide` step of `unicon/interactive@v2` does, and
+    item's facts, as the `decide` step of `unicon/interactive@v3` does, and
     return its outputs.json."""
     manifest = yaml.safe_load((SIBLING_VERDICT / "program.yaml").read_text())
     work = tmp_path / f"exec-{len(list(tmp_path.glob('exec-*')))}"
@@ -232,7 +232,7 @@ def test_interactive_v1_judges_through_both_forms(
 ) -> None:
     """interact plays each game, and the verdict script, compiled and run by
     exec given its manifest and the facts, gives the verdict
-    `unicon/interactive@v2` promises: the judge's `0` or `1`, the entrant's
+    `unicon/interactive@v3` promises: the judge's `0` or `1`, the entrant's
     limit, and the entrant's crash or a wrong answer for an entrant that
     left; a judge's `0` however it ended once the entrant had, by
     `SIGPIPE` or a raised error; and a judge that crashed, or raised with no

@@ -915,12 +915,12 @@ DIFF_CASES = [
     (b"12 3\n", b"1 23\n", False),
 ]
 """diff-check@v2's cases and two more, each an output, an answer and whether
-they match by words, as classic@v4 compares: leading whitespace, inner
+they match by words, as classic@v5 compares: leading whitespace, inner
 spacing and blank lines, which counted for diff-check, count no more."""
 
 
 def diff_script() -> tuple[str, dict[str, Any]]:
-    """The diff script of unicon/classic@v4 and its manifest in JSON, from
+    """The diff script of unicon/classic@v5 and its manifest in JSON, from
     `DIFF_SCRIPT` or a deploy checkout beside this one."""
     folder = Path(os.environ.get("DIFF_SCRIPT", SIBLING_DIFF))
     if not (folder / "diff.py").is_file():
@@ -1052,6 +1052,77 @@ def test_the_in_process_tests_pass_in_the_test_container(
     command += ["--volume", f"{ROOT}:/src:ro", tag]
     command += [] if rootless else ["python3", "tests/userns.py"]
     command += ["pytest", "-p", "no:cacheprovider", "tests/test_exec.py"]
-    command += ["tests/test_compile.py"]
+    command += [
+        "tests/test_compile.py",
+        "tests/test_programs.py",
+        "tests/test_environment.py",
+    ]
     done = subprocess.run(command, capture_output=True, text=True, timeout=1800)
     assert done.returncode == 0, done.stdout[-6000:] + done.stderr[-2000:]
+
+
+def test_a_locked_wheel_is_importable_by_the_box_user_from_read_only_env(
+    tmp_path: Path, run_image: RunImage, image: str
+) -> None:
+    import hashlib
+    import secrets
+    import zipfile
+
+    from conftest import docker
+
+    work = tmp_path / "work"
+    source = """import os
+import example
+assert os.statvfs('/env').f_flag & os.ST_RDONLY
+assert example.answer == 42
+print('42')
+"""
+    batch_inputs(work, source, [("main-wheel", "")], memory_limit=128)
+    piece = work / "cache/pieces/wheel"
+    piece.parent.mkdir(parents=True)
+    with zipfile.ZipFile(piece, "w") as archive:
+        archive.writestr("example/__init__.py", "answer = 42\n")
+    digest = hashlib.sha256(piece.read_bytes()).hexdigest()
+    entry = {
+        "fingerprint": "a" * 64,
+        "pypi": [{"sha256": digest, "size": piece.stat().st_size}],
+    }
+    (work / "in/environment.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "prefix": "/env",
+                "languages": {"python": entry},
+                "pieces": {digest: "cache/pieces/wheel"},
+            }
+        )
+    )
+    inputs = json.loads((work / "inputs.json").read_text())
+    inputs["batch"][0]["inputs"]["environment"] = {"file": "in/environment.json"}
+    (work / "inputs.json").write_text(json.dumps(inputs))
+    volume = "primitive-exec-environment-" + secrets.token_hex(4)
+    docker("volume", "create", volume)
+    try:
+        docker(
+            "run",
+            "--rm",
+            "--volume",
+            f"{volume}:/cache",
+            "--entrypoint",
+            "python3",
+            image,
+            "-I",
+            "-c",
+            "from pathlib import Path; "
+            "[(Path('/cache')/name).mkdir() for name in ('programs','locks','envs')]",
+        )
+        for _ in range(2):
+            outputs = by_run(
+                run_image(
+                    work, flags=["--network", "none", "--volume", f"{volume}:/cache"]
+                )
+            )
+            assert outputs["main-wheel"]["outcome"] == "accepted"
+            assert printed(work, outputs["main-wheel"]) == "42\n"
+    finally:
+        docker("volume", "rm", "--force", volume)

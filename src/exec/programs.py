@@ -41,6 +41,7 @@ from exec.box import (
     step_memory_kb,
 )
 from exec.compile.build import Built, build, check_room
+from exec.compile.environment import Environment, assembled
 from exec.inputs import FORM_NAMES, WALL_CLOCK, Entry, Item, Link, Source, pipe_names
 from exec.report import TEXTS, ReportError, judge, read_report, reported, write_json
 from exec.shared import OUTPUT_LIMIT, RUN_PATH, PrimitiveError
@@ -62,6 +63,7 @@ class Compiled:
 
     kind: str
     path: Path
+    environment: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,7 @@ class Program:
 
     kind: str
     path: Path
+    environment: Path | None = None
 
     def command(self, entry: Entry) -> list[str]:
         """The command line that runs this program, the entry's arguments
@@ -136,7 +139,25 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
     set_up_step(users, memory_kb)
     scratch = Path(tempfile.mkdtemp(prefix="exec-"))
     work = Path(tempfile.mkdtemp(prefix="compile-", dir=root))
+    environments: dict[Source, Environment | None] = {}
+    shared: dict[tuple[Path, str], Environment | None] = {}
+    stack = contextlib.ExitStack()
     try:
+        sources = {source for item in items for source in item.sources}
+        for source in sorted(
+            sources,
+            key=lambda source: (str(source.environment), source.language),
+        ):
+            if source.environment is None:
+                environments[source] = None
+                continue
+            language = "python" if source.language == "ipynb" else source.language
+            key = source.environment, language
+            if key not in shared:
+                shared[key] = stack.enter_context(
+                    assembled(root, source.environment, language)
+                )
+            environments[source] = shared[key]
         built: dict[Source, Built] = {}
         for item in items:
             for source in item.sources:
@@ -146,9 +167,18 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
                         source.language,
                         source.entry,
                         work / str(len(built)),
+                        environment=environment.fingerprint
+                        if (environment := environments[source]) is not None
+                        else None,
                     )
         compiled = {
-            source: Compiled(detect(each.program), each.program)
+            source: Compiled(
+                detect(each.program),
+                each.program,
+                environment.folder
+                if (environment := environments[source]) is not None
+                else None,
+            )
             for source, each in built.items()
             if each.program is not None
         }
@@ -171,6 +201,7 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
                 outputs = run_item(root, item, compiled, scratch, users)
             results.append({"run": item.run, "outputs": outputs | logs(item, built)})
     finally:
+        stack.close()
         shutil.rmtree(scratch, ignore_errors=True)
         shutil.rmtree(work, ignore_errors=True)
     return results
@@ -286,7 +317,7 @@ def prepare(item: Item, entry: Entry, own: Compiled, box: Path) -> Program:
             f"the program {which} could not be copied: {error.strerror}"
         ) from error
     (box / "program").chmod(0o755 if own.kind == "native" else 0o644)
-    return Program(own.kind, Path("/box/program"))
+    return Program(own.kind, Path("/box/program"), own.environment)
 
 
 def execute(
@@ -331,7 +362,11 @@ def execute(
     meta = scratch / "meta"
     errors = scratch / "errors"
     meta.unlink(missing_ok=True)
-    more = [*cache_binding(entry.cached), "--special-files"]
+    more = [
+        *cache_binding(entry.cached),
+        *environment_binding(program),
+        "--special-files",
+    ]
     command = isolate_command(BOX, meta, entry, reports, more, program.command(entry))
     if entry.stdin is None:
         descriptor = os.open(os.devnull, os.O_RDONLY)
@@ -641,7 +676,12 @@ def start(
         each.meta,
         entry,
         entry.manifest is not None,
-        [bound, *cache_binding(entry.cached), "--special-files"],
+        [
+            bound,
+            *cache_binding(entry.cached),
+            *environment_binding(program),
+            "--special-files",
+        ],
         program.command(entry),
     )
     if any("\0" in argument for argument in entry.args):
@@ -895,3 +935,9 @@ def signal_name(number: int) -> str:
         return signal.Signals(number).name
     except ValueError:
         return f"signal {number}"
+
+
+def environment_binding(program: Program) -> list[str]:
+    return (
+        [f"--dir=env={program.environment}"] if program.environment is not None else []
+    )

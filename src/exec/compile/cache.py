@@ -68,7 +68,13 @@ def toolchain() -> str:
         ) from error
 
 
-def key(tools: str, language: str, sources: Sources, source: Path) -> str:
+def key(
+    tools: str,
+    language: str,
+    sources: Sources,
+    source: Path,
+    environment: str | None = None,
+) -> str:
     """The key of a compile: the SHA-256 of a canonical JSON of the
     toolchain line, the language, what was given the compiler, and each
     file of the prepared copy at `source`, its path and its SHA-256, by
@@ -82,6 +88,8 @@ def key(tools: str, language: str, sources: Sources, source: Path) -> str:
         "main_class": sources.main_class,
         "files": sorted(files),
     }
+    if environment is not None:
+        document["environment"] = environment
     text = json.dumps(document, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -96,13 +104,13 @@ def file_sha256(path: Path) -> str:
 
 
 @contextlib.contextmanager
-def locked(key: str) -> Iterator[None]:
+def locked(key: str, *, kind: str = "programs") -> Iterator[None]:
     """Hold `locks/programs-<key>.lock` for the block: the wrapper evicts no
     folder whose lock is held, and a second step with the same source waits
     for the first to store its compile. The lock holds only while its path
     still names the file locked, since the wrapper's sweep removes a lock
     no one holds; a removed one is taken again under its new file."""
-    path = CACHE / "locks" / f"programs-{key}.lock"
+    path = CACHE / "locks" / f"{kind}-{key}.lock"
     while True:
         try:
             held = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CREAT, 0o444)

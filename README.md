@@ -1,6 +1,6 @@
 # primitive-exec
 
-The `unicon/exec` primitive, at the forge `unicon/exec@v2`: it compiles
+The `unicon/exec` primitive, at the forge `unicon/exec@v3`: it compiles
 programs and runs them under limits. Every program is given as its source,
 a folder and a language, and exec compiles each source of the batch once,
 in an isolate box of its own, before any run, keeping the compiled program
@@ -924,7 +924,7 @@ two `uses:` lines and `runner-ref` together.
 ## Releasing
 
 Push a tag `v2.0.0` on `main`. The tag's major is the version at the forge:
-`v2.0.0` is a release of `unicon/exec@v2`, so a change to the ports is a new
+`v3.0.0` is a release of `unicon/exec@v3`, so a change to the ports is a new
 major. The shared release workflow refuses a tag whose commit is not
 on `main` and a tag that differs from the version in `pyproject.toml`. It
 runs the same checks as CI, pushes the image as

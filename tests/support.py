@@ -20,7 +20,7 @@ NAME = "primitive-exec"
 SCHEMA_VERSION = 6
 SIBLING_SCHEMA = ROOT.parent / "runner" / "schemas" / "primitive.schema.json"
 SIBLING_RUNNER = ROOT.parent / "runner"
-SIBLING_DIFF = ROOT.parent / "deploy" / "workflows" / "classic" / "v4" / "diff"
+SIBLING_DIFF = ROOT.parent / "deploy" / "workflows" / "classic" / "v5" / "diff"
 USERNS = Path(__file__).resolve().parent / "userns.py"
 BOX_USERS = "60000-60009"
 """The box users the tests give exec: one step's range."""
@@ -794,7 +794,7 @@ def base_build_args() -> tuple[str, ...]:
 
 
 SIBLING_VERDICT = (
-    ROOT.parent / "deploy" / "workflows" / "interactive" / "v2" / "verdict"
+    ROOT.parent / "deploy" / "workflows" / "interactive" / "v3" / "verdict"
 )
 
 GUESSES = {"reports": {"guesses": {"better": "lower", "at_least": 1}}}
@@ -928,7 +928,7 @@ def game(entrant: str, judge: str = "guess", **limits: float) -> Programs:
     playing `judge`, with the secret and `GUESSES`. `limits` gives either's
     time or memory limit as `entrant_time_limit` and the like; the judge's
     time limit is 2 s and the entrant's 1 s, so the entrant's wall clock
-    runs out first, as `unicon/interactive@v2` asks."""
+    runs out first, as `unicon/interactive@v3` asks."""
     return {
         "entrant": Spec(
             ENTRANT,
