@@ -41,6 +41,13 @@ RUN gcc -O2 -Wall -Wextra -Werror -static -o /out/usr/local/bin/box-launch \
     /box-launch.c -lseccomp
 
 
+FROM isolate AS installer
+COPY requirements.txt /tmp/exec-requirements.txt
+RUN python3 -m pip install --no-cache-dir --no-compile --only-binary=:all: --require-hashes \
+        --target /rattler --requirement /tmp/exec-requirements.txt \
+    && strip --strip-unneeded /rattler/rattler/*.so
+
+
 FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="primitive-exec" \
@@ -48,16 +55,8 @@ LABEL org.opencontainers.image.title="primitive-exec" \
       org.opencontainers.image.source="https://github.com/uniconhq/primitive-exec" \
       org.opencontainers.image.licenses="MIT"
 
-# The compilers exec runs in its compile box: gcc and g++ with the C library
-# to link statically against, and the JDK, whose runtime also runs the jars.
-# Python programs are checked and run by the image's own interpreter. The
-# JDK's post-install scripts expect the man directory the slim image leaves
-# out.
-RUN mkdir -p /usr/share/man/man1 \
-    && apt-get update \
-    && apt-get install --yes --no-install-recommends \
-        gcc g++ libc6-dev openjdk-21-jdk-headless \
-    && rm -rf /var/lib/apt/lists/*
+# The installer is private to exec; every program toolchain comes from its lock.
+COPY --from=installer /rattler/ /usr/local/lib/unicon-exec/
 
 # isolate links libcap2 and libseccomp2, which the base image has; box-launch
 # links nothing. Every box sees it, under the /usr isolate binds into each.

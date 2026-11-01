@@ -238,7 +238,9 @@ def read_item(root: Path, entry: object, number: int) -> Item:
                     if "environment" in inputs
                     else {}
                 ),
-            },
+            }
+            if isinstance(each, dict)
+            else each,
             run,
         )
         for name, each in given.items()
@@ -366,9 +368,7 @@ def read_source(root: Path, inputs: dict[str, object], what: str) -> Source:
         folder,
         str(language),
         (entry or "").strip() or None,
-        input_file(root, inputs, "environment", what)
-        if "environment" in inputs
-        else None,
+        input_file(root, inputs, "environment", what),
     )
 
 

@@ -17,7 +17,6 @@ forms:
       environment:
         type: file
         runs: false
-        optional: true
         description: The locked environment and its cached pieces for this platform.
       source:
         type: folder
@@ -123,7 +122,6 @@ forms:
       environment:
         type: file
         runs: false
-        optional: true
         description: The locked environment and its cached pieces for this platform.
       programs:
         type: programs
@@ -218,7 +216,6 @@ forms:
       environment:
         type: file
         runs: false
-        optional: true
         description: The locked environment and its cached pieces for this platform.
       source:
         type: folder

@@ -217,6 +217,9 @@ def verdicts(
         }
         batch.append({"run": run, "inputs": inputs})
     document = {"schema_version": SCHEMA_VERSION, "batch": batch}
+    from toolchains import attach
+
+    attach(work, document)
     (work / "inputs.json").write_text(json.dumps(document))
     count = len(facts)
     limits = {
@@ -295,7 +298,7 @@ def test_on_root_docker_the_image_refuses_to_start(
 
 
 def test_the_in_process_tests_pass_in_the_test_container(
-    image: str, rootless: bool
+    image: str, rootless: bool, environment_cache: str
 ) -> None:
     """`test_interact.py` in the test container built on the image,
     privileged, as root through `userns.py`, or as it is on a rootless
@@ -308,7 +311,15 @@ def test_the_in_process_tests_pass_in_the_test_container(
     command = ["docker", "run", "--rm", "--privileged", *ISOLATE_LIMITS]
     command += [f"--env=UNICON_BOX_USERS={BOX_USERS}"]
     command += [f"--env=UNICON_STEP_MEMORY_MB={STEP_MEMORY_MB}"]
-    command += ["--volume", f"{ROOT}:/src:ro", tag]
+    command += [
+        "--volume",
+        f"{ROOT}:/src:ro",
+        "--volume",
+        f"{environment_cache}:/cache",
+        "--env",
+        "UNICON_TEST_LOCK=/cache/test-lock.json",
+        tag,
+    ]
     command += [] if rootless else ["python3", "tests/userns.py"]
     command += ["pytest", "-p", "no:cacheprovider", "tests/test_programs.py"]
     done = subprocess.run(command, capture_output=True, text=True, timeout=1800)

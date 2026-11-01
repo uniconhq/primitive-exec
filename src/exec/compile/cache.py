@@ -73,10 +73,11 @@ def key(
     language: str,
     sources: Sources,
     source: Path,
-    environment: str | None = None,
+    environment: str,
 ) -> str:
     """The key of a compile: the SHA-256 of a canonical JSON of the
-    toolchain line, the language, what was given the compiler, and each
+    toolchain line, the language, the fingerprint of the locked
+    `environment` it compiles in, what was given the compiler, and each
     file of the prepared copy at `source`, its path and its SHA-256, by
     path."""
     files = [[path, file_sha256(source / path)] for path in sources.files]
@@ -87,9 +88,8 @@ def key(
         "sources": sources.sources,
         "main_class": sources.main_class,
         "files": sorted(files),
+        "environment": environment,
     }
-    if environment is not None:
-        document["environment"] = environment
     text = json.dumps(document, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -104,12 +104,15 @@ def file_sha256(path: Path) -> str:
 
 
 @contextlib.contextmanager
-def locked(key: str, *, kind: str = "programs") -> Iterator[None]:
+def locked(
+    key: str, *, kind: str = "programs", shared: bool = False, wait: bool = True
+) -> Iterator[None]:
     """Hold `locks/programs-<key>.lock` for the block: the wrapper evicts no
     folder whose lock is held, and a second step with the same source waits
     for the first to store its compile. The lock holds only while its path
     still names the file locked, since the wrapper's sweep removes a lock
-    no one holds; a removed one is taken again under its new file."""
+    no one holds; a removed one is taken again under its new file. Without
+    `wait`, a lock someone else holds raises `BlockingIOError` at once."""
     path = CACHE / "locks" / f"{kind}-{key}.lock"
     while True:
         try:
@@ -120,7 +123,8 @@ def locked(key: str, *, kind: str = "programs") -> Iterator[None]:
                 f"{error.strerror}"
             ) from None
         try:
-            fcntl.flock(held, fcntl.LOCK_EX)
+            mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+            fcntl.flock(held, mode | (0 if wait else fcntl.LOCK_NB))
             with contextlib.suppress(FileNotFoundError):
                 if os.path.samestat(os.fstat(held), os.lstat(path)):
                     break

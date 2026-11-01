@@ -13,16 +13,15 @@ memory it used, the compile log, and an outcome. A batch item that gives
 under limits of its own, linked by pipes, and reports how each ended. A
 batch item that gives only the source compiles it and runs nothing, the
 `build` form. It is what compiles and runs code in the simpler core's
-workflows: an entrant's program in `unicon/classic@v4`, an organiser's
+workflows: an entrant's program in `unicon/classic@v5`, an organiser's
 checker or the diff script after it, and the entrant and judge of
-`unicon/interactive@v2`. It replaces `unicon/compile@v3` and
-`unicon/exec@v1`, which are retired, and `unicon/sandbox-run@v2`, which
-stays for the workflow versions that use it.
+`unicon/interactive@v3`. Earlier exec versions, compile and sandbox-run
+are retired; version 3 is the active exec contract.
 
 This repo holds the image, `ghcr.io/uniconhq/primitive-exec`, built from the
 `Dockerfile`, with [isolate](https://github.com/ioi/isolate) 2.7 built into
-it unpatched and our box launcher, `src/box-launch.c`, beside it, and gcc,
-g++ and the OpenJDK 21 JDK; exec itself, the Python package the image runs,
+it unpatched, our box launcher, `src/box-launch.c`, and the private offline
+installer. Task compilers and interpreters come from their lock. exec itself, the Python package the image runs,
 `src/exec/`, which compiles and runs every program in an isolate box of its
 own; and `primitive.yaml`, the declaration the
 forge compiler reads to type-check a workflow that uses the primitive. exec
@@ -232,13 +231,13 @@ What the entry decides, per language:
 
 ### How each language is compiled
 
-| Language | Toolchain in the image | The compile |
+| Language | Toolchain from the task’s lock | The compile |
 |---|---|---|
-| `c` | gcc 14 | `gcc -x c -std=gnu17 -O2 -pipe -static -DONLINE_JUDGE -iquote . -o /box/out/program <entry> <sources> -lm` |
-| `cpp` | g++ 14 | `g++ -x c++ -std=gnu++20 -O2 -pipe -static -DONLINE_JUDGE -iquote . -o /box/out/program <entry> <sources> -lm` |
-| `java` | OpenJDK 21 | `javac -encoding UTF-8 -proc:none -Xlint:none -XDsuppressNotes -d /box/out/classes <sources>`, then exec packs the classes into a jar |
-| `python` | Python 3.14 | `python3 -I -X pycache_prefix=/tmp/pycache -m py_compile <sources>`, then exec packs the folder into a zip application |
-| `ipynb` | Python 3.14 | exec joins the notebook's code cells, then as `python` |
+| `c` | conda-forge `gcc` | `gcc -x c -std=gnu17 -O2 -pipe -static -DONLINE_JUDGE -iquote . -o /box/out/program <entry> <sources> -lm` |
+| `cpp` | conda-forge `gxx` | `g++ -x c++ -std=gnu++20 -O2 -pipe -static -DONLINE_JUDGE -iquote . -o /box/out/program <entry> <sources> -lm` |
+| `java` | conda-forge `openjdk` | `javac -encoding UTF-8 -proc:none -Xlint:none -XDsuppressNotes -d /box/out/classes <sources>`, then exec packs the classes into a jar |
+| `python` | conda-forge `python` | `python3 -I -X pycache_prefix=/tmp/pycache -m py_compile <sources>`, then exec packs the folder into a zip application |
+| `ipynb` | the Python lock | exec joins the notebook's code cells, then as `python` |
 
 Each file is named by its path from the top of the folder, and one that
 does not start with a letter, a digit or `_` is written with `./` in
@@ -249,8 +248,10 @@ contest code commonly checks for it. `-proc:none` means javac runs no
 annotation processors. gcc runs without `-Wall`, and javac quietly, since in
 the classic workflow a non-empty compile log becomes the verdict's summary.
 
-The compilers make the image about 1.05 GB, as compile's was, where exec@v1's
-was 0.5 GB with the Java runtime alone.
+The image carries the offline installer, not the task's compilers or Java.
+The native ARM64 build is 291.6 MB. The required `environment` input names
+verified pieces and one fingerprint per language on the machine's platform;
+there is no fallback to an image toolchain.
 
 ### The compile box
 
@@ -272,30 +273,24 @@ limits, held by isolate as a run's are:
 | Any one file it writes | 32 MB (`--fsize`) |
 | The box's tmpfs | 64 MB: the program at its cap, and as much again for the compiler's own files |
 
-The process limit is decision 11 of the design: twice the most any
-compiler was measured to need, and at least 128. Measured in the image on
-Docker Desktop (arm64, 18 CPUs, all of which the JVM sees), with the
-box's peak memory, by isolate, at each compile:
-
-| Compile | Fewest processes it compiles under | Peak memory | CPU time |
-|---|---|---|---|
-| gcc, the C sample | 4 | 26 MB | 0.03 s |
-| g++, a sample including `bits/stdc++.h` | 4 | 309 MB | 0.78 s |
-| g++, a folder of two sources | 4 | 61 MB | 0.18 s |
-| javac, one source or a package tree of two | 16 | 43 to 45 MB | 0.2 s |
-| py_compile | 1 | 16 MB | 0.09 s |
-
-javac's threads grow with the CPUs the JVM sees, so a larger machine
-needs more; 128 is four times the most measured.
+The process cap remains 128. Native ARM64 phase 0 probes of conda-forge gcc/g++ 16.2,
+OpenJDK 25.0.2 and Python 3.15.0 passed with `/env` read-only, the network off,
+1024 MB and 30-second compile limits. C++'s `bits/stdc++.h` sample used
+335,788 KiB; Java needed 14 process slots. The native x86_64 probes run
+once before rollout.
 
 The box sees exec's copy of the folder at `/source`, read-only and not
 executable, which is its working directory; it writes the program, or
 Java's classes, to `/box/out`, and its own files to its `/tmp`. Its
 environment holds `PATH`, `HOME` and `TMPDIR`, both `/tmp`, and
 `LANG=C.UTF-8`, and standard output and error go together into the log.
-Like a run's box, it sees the image's `/usr`, `/bin` and `/lib`, of `/etc`
-only Java's configuration, and nothing of `/work`, the machine's cache or
-another box, so `#include "/etc/passwd"` finds nothing. exec takes back
+It also sees its language's folder read-only at `/env`, with tools started
+as `/env/bin/gcc`, `/env/bin/g++`, `/env/bin/javac` or `/env/bin/python3`.
+`PATH` begins with `/env/bin`; Java gets `JAVA_HOME` as the folder above
+its locked `java`'s own file, `/env/lib/jvm` for conda-forge's OpenJDK, in
+the compile box and each run's box alike.
+Like a run's box, it sees the image's `/usr`, `/bin` and `/lib`, no `/etc`
+configuration, and nothing of `/work`, the machine's cache or another box, so `#include "/etc/passwd"` finds nothing. exec takes back
 only plain files, never through a link, writes the zip application or jar
 itself, and checks the program against 32 MB. A compile that goes over a
 limit is `compile_error`, the log saying which.
@@ -314,11 +309,14 @@ compiled programs beside the step wrapper's task files:
 /cache/programs/<key>/program      the compiled program, mode 0444
 /cache/programs/<key>/result.json  {outcome, log, program_sha256, created}
 /cache/locks/programs-<key>.lock   held while a step looks up, compiles or stores it
+/cache/envs/<F>/ready.json         complete folder's fingerprint, /env prefix and the toolchain line of the image that assembled it
+/cache/locks/envs-<F>.lock         shared while used, exclusive while assembled
 ```
 
 The key is the SHA-256 of the image's toolchain line, written when the
 image is built from its installed packages, its Python and exec's own
-files, then the language, the entry, the sources given the compiler, Java's
+files, then the language, its environment fingerprint, the entry, the sources
+given the compiler, Java's
 main class and each file of the prepared copy by path and SHA-256. So two
 folders that prepare alike share a compile, and two images whose compilers
 differ never do. exec takes the key's lock, then looks the key up: a hit is
@@ -330,7 +328,21 @@ compile stopped at a limit, which a busy machine can reach where another
 would not. A folder
 that does not hold what it says is removed and compiled again. A second
 step with the same source waits on the lock and then hits. No box sees the
-cache. A step with no cache compiles every time.
+cache. Every exec step needs the machine's cache.
+
+Each conda archive is verified, linked under its file name inside the step's
+own item and installed offline with the target prefix `/env`, link scripts
+off and a scratch package cache removed afterwards. Wheels go into the
+locked Python's site-packages. Completed folders contain no second hard
+links, so eviction cannot damage objects. A second step reuses the folder
+and its compiled program; a folder an image of another toolchain line
+assembled is assembled again, the old one moved aside whole first. The
+compile key takes the fingerprint from the lock, and a folder is assembled
+only for a compile the cache does not hold or a program that runs on it:
+Python and Java run with read-only `/env`; static C and C++ programs run
+with no `/env` bind, so a C or C++ compile the cache holds assembles
+nothing. The wrapper sweeps incomplete
+folders and evicts whole unheld folders by last use.
 
 ## A program that reports
 
@@ -487,7 +499,7 @@ For each item, in order:
    and network namespaces of the box's own, under its limits (below),
    through the box launcher (see "The box launcher"). The
    box sees `/box`, the image's `/usr`, `/bin` and `/lib` directories and,
-   of `/etc`, only Java's `/etc/java-21-openjdk`, all read-only but `/box`,
+   its locked `/env` for Python and Java, all read-only but `/box`,
    its own `/proc`, a `/tmp` and a `/dev/shm` bound from the empty
    `/box/tmp` and `/box/shm` on the box's tmpfs, and a `/dev` of four
    devices. The environment holds only
@@ -806,20 +818,20 @@ jar manifest.
 | Language | The program | How exec runs it |
 |---|---|---|
 | `c`, `cpp` | A statically linked ELF executable | Its copy marked executable and run directly |
-| `python`, `ipynb` | A Python zip application behind the line `#!/usr/bin/env python3`: the source folder under `source/` with its layout, a notebook entry as its Python, and a `__main__.py` at the root that runs the entry | `python3 -I -B program` on its copy, on the image's Python 3.14 |
-| `java` | A runnable jar: the compiled classes and a manifest naming the main class | `java -Xmx<memory_limit>m -Xss64m -XX:+UseSerialGC -XX:-UsePerfData -XX:+ExitOnOutOfMemoryError -Djava.io.tmpdir=. -jar program`, on the image's OpenJDK 21, started by its real path, since `/usr/bin/java` goes through `/etc/alternatives` |
+| `python`, `ipynb` | A Python zip application behind the line `#!/usr/bin/env python3`: the source folder under `source/` with its layout, a notebook entry as its Python, and a `__main__.py` at the root that runs the entry | `/env/bin/python3 -I -B program` on its copy |
+| `java` | A runnable jar: the compiled classes and a manifest naming the main class | `java -Xmx<memory_limit>m -Xss64m -XX:+UseSerialGC -XX:-UsePerfData -XX:+ExitOnOutOfMemoryError -Djava.io.tmpdir=. -jar program`, using `/env/bin/java` from its lock |
 
 The Python program's `__main__.py` puts the entry's folder inside the
 archive first on `sys.path` and runs the entry's code as a fresh
 `__main__` module whose `__file__` is the entry's path in the archive, so
 the entry imports the files beside it as it would from the folder. A
 Python or Java program runs on the interpreter it was checked against, the
-image's own.
+task's locked environment.
 
 ## Layout
 
 ```
-Dockerfile                  the image: isolate and the box launcher built in a stage of their own, primitive-base, gcc, g++, OpenJDK 21, the toolchain line
+Dockerfile                  the image: isolate and the box launcher built in a stage of their own, primitive-base, the private offline installer, the toolchain line
 src/exec/                   exec, installed as /usr/local/lib/unicon-exec/exec/, by job:
   shared.py                   what every module shares: the contract version, the output cap, the error that ends a step
   inputs.py                   reading inputs.json: items, each program's inputs, manifests
@@ -923,12 +935,16 @@ two `uses:` lines and `runner-ref` together.
 
 ## Releasing
 
-Push a tag `v2.0.0` on `main`. The tag's major is the version at the forge:
+Version 2 is retired. Version 3 requires a task lock and the machine cache,
+and the image no longer supplies task toolchains. Build on runner 0.12.0’s
+primitive-base after that release is available.
+
+Push a tag `v3.0.0` on `main`. The tag's major is the version at the forge:
 `v3.0.0` is a release of `unicon/exec@v3`, so a change to the ports is a new
 major. The shared release workflow refuses a tag whose commit is not
 on `main` and a tag that differs from the version in `pyproject.toml`. It
 runs the same checks as CI, pushes the image as
-`ghcr.io/uniconhq/primitive-exec:v2.0.0`, and creates a GitHub release
+`ghcr.io/uniconhq/primitive-exec:v3.0.0`, and creates a GitHub release
 with `images.json`, which names the image by digest in the same shape as the
 runner's, and `primitive.yaml` attached, and the digest in the notes.
 `deploy/images.json` pins that digest, and bootstrap writes it into the

@@ -12,7 +12,6 @@ PYTHON_SHEBANG = b"#!/usr/bin/env python3\n"
 PYTHON_FOLDER = "source"
 """Where a Python program holds the source folder, beside its `__main__.py`."""
 PYTHON_LAUNCHER = """\
-import os
 import sys
 import zipimport
 from types import ModuleType
@@ -25,8 +24,6 @@ if sys.path and sys.path[0] == archive:
     sys.path[0] = folder
 else:
     sys.path.insert(0, folder)
-if os.path.isdir("/env/site-packages"):
-    sys.path.insert(1, "/env/site-packages")
 code = compile(zipimport.zipimporter(archive).get_data(path), path, "exec")
 main = ModuleType("__main__")
 main.__file__ = path

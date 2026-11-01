@@ -1,6 +1,6 @@
 [project]
 name = "primitive-exec"
-version = "3.0.0"
+version = "2.0.0"
 description = "The Unicon exec primitive: compile a program, run it under limits and measure the run."
 readme = "README.md"
 license = "MIT"
@@ -17,6 +17,7 @@ Source = "https://github.com/uniconhq/primitive-exec"
 dev = [
     "jsonschema==4.26.0",
     "mypy==2.3.1",
+    "py-rattler==0.28.1",
     "pytest==9.1.1",
     "pyyaml==6.0.3",
     "ruff==0.16.7",

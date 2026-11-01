@@ -105,10 +105,7 @@ BOX_FOLDERS = ("tmp", "shm")
 """The folders on the box's tmpfs that are the run's `/tmp` and `/dev/shm`,
 so they share its size and inode cap: isolate's own tmpfs for them takes
 no size or inode options, and held over a million files."""
-JAVA_CONFIG = "/etc/java-21-openjdk"
-"""The one folder of `/etc` a box sees: the Java runtime's own, where the
-links in its installation lead. The rest of the container's `/etc` names
-the container, its address and its name server."""
+
 WRITE_BY_OTHERS = 0o022
 MS_NOSUID = 2
 MS_NODEV = 4
@@ -244,18 +241,22 @@ def isolate_command(
     reports: bool,
     more: list[str],
     run: list[str],
+    java_home: str | None = None,
 ) -> list[str]:
     """The isolate command line that runs `run`, one program, in box
     `number`, already made and filled, writing its meta file to `meta`
     (`box_command`), under the entry's limits.
 
     The environment holds only `PATH`, `HOME` and `TMPDIR`, both the working
-    directory, `LANG=C.UTF-8`, and for a program given a manifest
+    directory, `LANG=C.UTF-8`, for a Java program its locked JDK's
+    `java_home` as `JAVA_HOME`, and for a program given a manifest
     (`reports`) `UNICON_REPORT`. The options in `more` are the caller's own.
     Standard error goes nowhere.
     """
     env = {"PATH": RUN_PATH, "HOME": "/box/run", "TMPDIR": "/box/run"}
     env["LANG"] = "C.UTF-8"
+    if java_home is not None:
+        env["JAVA_HOME"] = java_home
     if reports:
         env["UNICON_REPORT"] = "/box/report"
     limits = Limits(entry.time_limit, entry.wall_limit, entry.memory_limit_kb)
@@ -298,7 +299,6 @@ def box_command(
         f"--dir=tmp={box / 'tmp'}:rw",
         f"--dir=dev={BOX_DEV}:dev",
         f"--dir=dev/shm={box / 'shm'}:rw",
-        f"--dir={JAVA_CONFIG.lstrip('/')}",
         *options,
         *(f"--env={name}={value}" for name, value in env.items()),
         "--run",

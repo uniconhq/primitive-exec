@@ -10,7 +10,6 @@ import select
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -41,10 +40,10 @@ from exec.box import (
     step_memory_kb,
 )
 from exec.compile.build import Built, build, check_room
-from exec.compile.environment import Environment, assembled
+from exec.compile.environment import Toolchain, jdk_home, read_lock, tool
 from exec.inputs import FORM_NAMES, WALL_CLOCK, Entry, Item, Link, Source, pipe_names
 from exec.report import TEXTS, ReportError, judge, read_report, reported, write_json
-from exec.shared import OUTPUT_LIMIT, RUN_PATH, PrimitiveError
+from exec.shared import OUTPUT_LIMIT, PrimitiveError
 
 REFUSED_ARGUMENTS = frozenset({errno.E2BIG})
 """What the kernel answers when the command line is too long for it, which
@@ -58,22 +57,26 @@ made afresh each time."""
 
 @dataclass(frozen=True)
 class Compiled:
-    """A source's program as exec holds it: its format and its file, which
-    each run's box gets a copy of."""
+    """A source's program as exec holds it: its format, its file, which
+    each run's box gets a copy of, and its locked toolchain."""
 
     kind: str
     path: Path
-    environment: Path | None = None
+    toolchain: Toolchain
 
 
 @dataclass(frozen=True)
 class Program:
-    """A program ready to run: its format and the file the command starts,
-    as the box sees it."""
+    """A program ready to run: its format, the file the command starts,
+    as the box sees it, and its locked toolchain."""
 
     kind: str
     path: Path
-    environment: Path | None = None
+    toolchain: Toolchain
+
+    def java_home(self) -> str | None:
+        """`JAVA_HOME` for a Java program, its locked JDK's home."""
+        return jdk_home(self.toolchain.folder()) if self.kind == "java" else None
 
     def command(self, entry: Entry) -> list[str]:
         """The command line that runs this program, the entry's arguments
@@ -84,13 +87,15 @@ class Program:
         if self.kind == "native":
             return [str(self.path), *entry.args]
         if self.kind == "python":
-            interpreter = os.path.realpath(sys.executable)
-            return [interpreter, "-I", "-B", str(self.path), *entry.args]
-        java = shutil.which("java", path=RUN_PATH)
-        if java is None:
-            raise PrimitiveError("this image has no Java runtime to run a jar with")
+            return [
+                tool(self.toolchain.folder(), "python3"),
+                "-I",
+                "-B",
+                str(self.path),
+                *entry.args,
+            ]
         return [
-            os.path.realpath(java),
+            tool(self.toolchain.folder(), "java"),
             f"-Xmx{max(16, int(entry.memory_limit))}m",
             "-Xss64m",
             "-XX:+UseSerialGC",
@@ -139,8 +144,8 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
     set_up_step(users, memory_kb)
     scratch = Path(tempfile.mkdtemp(prefix="exec-"))
     work = Path(tempfile.mkdtemp(prefix="compile-", dir=root))
-    environments: dict[Source, Environment | None] = {}
-    shared: dict[tuple[Path, str], Environment | None] = {}
+    toolchains: dict[Source, Toolchain] = {}
+    shared: dict[str, Toolchain] = {}
     stack = contextlib.ExitStack()
     try:
         sources = {source for item in items for source in item.sources}
@@ -149,15 +154,11 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
             key=lambda source: (str(source.environment), source.language),
         ):
             if source.environment is None:
-                environments[source] = None
-                continue
-            language = "python" if source.language == "ipynb" else source.language
-            key = source.environment, language
-            if key not in shared:
-                shared[key] = stack.enter_context(
-                    assembled(root, source.environment, language)
-                )
-            environments[source] = shared[key]
+                raise PrimitiveError("the source has no locked environment")
+            lock = read_lock(source.environment, source.language)
+            if lock.fingerprint not in shared:
+                shared[lock.fingerprint] = Toolchain(root, lock, stack)
+            toolchains[source] = shared[lock.fingerprint]
         built: dict[Source, Built] = {}
         for item in items:
             for source in item.sources:
@@ -167,18 +168,10 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
                         source.language,
                         source.entry,
                         work / str(len(built)),
-                        environment=environment.fingerprint
-                        if (environment := environments[source]) is not None
-                        else None,
+                        toolchain=toolchains[source],
                     )
         compiled = {
-            source: Compiled(
-                detect(each.program),
-                each.program,
-                environment.folder
-                if (environment := environments[source]) is not None
-                else None,
-            )
+            source: Compiled(detect(each.program), each.program, toolchains[source])
             for source, each in built.items()
             if each.program is not None
         }
@@ -187,6 +180,11 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
                 {"run": item.run, "outputs": not_compiled(item, built)}
                 for item in items
             ]
+        # A Python or Java program runs on its toolchain at /env, which a
+        # compile the cache held did not assemble; a native one needs none.
+        for each in compiled.values():
+            if each.kind != "native":
+                each.toolchain.folder()
         for item in items:
             needed = sum(
                 box_size_kb(entry, compiled[entry.source].path)
@@ -317,7 +315,7 @@ def prepare(item: Item, entry: Entry, own: Compiled, box: Path) -> Program:
             f"the program {which} could not be copied: {error.strerror}"
         ) from error
     (box / "program").chmod(0o755 if own.kind == "native" else 0o644)
-    return Program(own.kind, Path("/box/program"), own.environment)
+    return Program(own.kind, Path("/box/program"), own.toolchain)
 
 
 def execute(
@@ -367,7 +365,15 @@ def execute(
         *environment_binding(program),
         "--special-files",
     ]
-    command = isolate_command(BOX, meta, entry, reports, more, program.command(entry))
+    command = isolate_command(
+        BOX,
+        meta,
+        entry,
+        reports,
+        more,
+        program.command(entry),
+        program.java_home(),
+    )
     if entry.stdin is None:
         descriptor = os.open(os.devnull, os.O_RDONLY)
     else:
@@ -683,6 +689,7 @@ def start(
             "--special-files",
         ],
         program.command(entry),
+        program.java_home(),
     )
     if any("\0" in argument for argument in entry.args):
         return None
@@ -938,6 +945,6 @@ def signal_name(number: int) -> str:
 
 
 def environment_binding(program: Program) -> list[str]:
-    return (
-        [f"--dir=env={program.environment}"] if program.environment is not None else []
-    )
+    if program.kind == "native":
+        return []
+    return [f"--dir=env={program.toolchain.folder()}"]

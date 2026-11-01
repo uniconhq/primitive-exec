@@ -15,6 +15,8 @@ from typing import Any
 
 import yaml
 
+from toolchains import attach
+
 ROOT = Path(__file__).resolve().parent.parent
 NAME = "primitive-exec"
 SCHEMA_VERSION = 6
@@ -221,6 +223,7 @@ def batch_inputs(
                 }
         batch.append({"run": run, "inputs": inputs})
     document = {"schema_version": SCHEMA_VERSION, "batch": batch}
+    attach(work, document)
     (work / "inputs.json").write_text(json.dumps(document))
 
 
@@ -387,7 +390,14 @@ elif case in ("file-memory", "unlinked-memory", "memfd-memory"):
     chunk = b"y" * (1024 * 1024)
     for name in ("one", "two"):
         if case == "memfd-memory":
-            kept = os.memfd_create(name)
+            if hasattr(os, "memfd_create"):
+                kept = os.memfd_create(name)
+            else:
+                # Some interpreters omit the wrapper; call the same kernel API.
+                import ctypes
+                kept = ctypes.CDLL(None, use_errno=True).memfd_create(name.encode(), 1)
+                if kept < 0:
+                    raise OSError(ctypes.get_errno(), "memfd_create")
         else:
             kept = os.open(name, os.O_RDWR | os.O_CREAT)
             if case == "unlinked-memory":
@@ -912,6 +922,7 @@ def programs_batch_inputs(work: Path, items: list[TestItem]) -> None:
             entry["links"] = links
         batch.append({"run": run, "inputs": entry})
     document = {"schema_version": SCHEMA_VERSION, "batch": batch}
+    attach(work, document)
     (work / "inputs.json").write_text(json.dumps(document))
 
 
@@ -1277,7 +1288,7 @@ elif case == "dev":
         blocked.append(attempt(lambda: open(path).close()))
     note(json.dumps({"dev": sorted(os.listdir("/dev")), "blocked": blocked}))
 elif case == "etc":
-    note(json.dumps(sorted(os.listdir("/etc"))))
+    note(json.dumps(sorted(os.listdir("/etc")) if os.path.isdir("/etc") else []))
 elif case == "net":
     import socket
 

@@ -12,7 +12,6 @@ box's user, who owns everything in the box while it runs.
 
 import errno
 import os
-import shutil
 import signal
 import stat
 import subprocess
@@ -33,6 +32,7 @@ from exec.box import (
     read_meta,
 )
 from exec.compile import cache, java, native, python
+from exec.compile.environment import Toolchain, jdk_home, tool
 from exec.compile.prepare import PREPARE_SECONDS, prepare
 from exec.compile.shared import (
     BINARY_LIMIT,
@@ -111,14 +111,16 @@ def build(
     entry: str | None,
     work: Path,
     *,
-    environment: str | None = None,
+    toolchain: Toolchain,
 ) -> Built:
     """Compile the source folder `folder` for `language`, starting from
-    `entry`, into `work/program`, `work` a new folder of exec's own.
+    `entry`, into `work/program`, `work` a new folder of exec's own, with
+    the locked `toolchain`.
 
     The folder is prepared first (`prepare`), into `work/source`, then the
-    machine's cache is asked for the compile, under the compile's key and
-    holding its lock, and on a miss it is compiled in a box and stored. A
+    machine's cache is asked for the compile, under the compile's key, which
+    holds the toolchain's fingerprint, and holding its lock, and on a miss
+    the toolchain is assembled and it is compiled in a box and stored. A
     step without the cache compiles every time.
     """
     work.mkdir()
@@ -130,8 +132,8 @@ def build(
     except CompileError as error:
         return Built(f"{error}\n", None)
     if not cache.in_use():
-        return compile_sources(sources, copy, language, work)
-    key = cache.key(cache.toolchain(), language, sources, copy, environment)
+        return compile_sources(sources, copy, language, work, toolchain.folder())
+    key = cache.key(cache.toolchain(), language, sources, copy, toolchain.fingerprint)
     with cache.locked(key):
         found = cache.look_up(key, program)
         if found is not None:
@@ -139,15 +141,22 @@ def build(
                 f"exec: took the compiled program {key} from the cache", file=sys.stderr
             )
             return Built(found.log, program if found.outcome == "accepted" else None)
-        built = compile_sources(sources, copy, language, work)
+        built = compile_sources(sources, copy, language, work, toolchain.folder())
         if built.lasting:
             cache.store(key, built.outcome, built.log, built.program)
     return built
 
 
-def compile_sources(sources: Sources, copy: Path, language: str, work: Path) -> Built:
+def compile_sources(
+    sources: Sources,
+    copy: Path,
+    language: str,
+    work: Path,
+    environment: Path,
+) -> Built:
     """Compile the prepared copy at `copy` in a fresh compile box into
-    `work/program`."""
+    `work/program`, with the assembled toolchain folder `environment` at
+    `/env`."""
     started = time.monotonic()
     program = work / "program"
     with fresh_box(COMPILE_BOX, COMPILE_BOX_KB) as box:
@@ -155,34 +164,37 @@ def compile_sources(sources: Sources, copy: Path, language: str, work: Path) -> 
             (box / name).mkdir()
             (box / name).chmod(0o1777)
         if language in ("python", "ipynb"):
-            interpreter = os.path.realpath(sys.executable)
+            interpreter = tool(environment, "python3")
             command = python.command(sources, interpreter)
         elif language == "java":
             (box / "out" / "classes").mkdir()
             command = java.command(sources, f"{OUT}/classes")
         else:
             command = native.command(sources, language, f"{OUT}/program")
-        tool = run_tool([installed(command[0]), *command[1:]], copy, work)
-        if tool.ok:
-            tool = take_program(tool, sources, copy, language, box / "out", program)
+        compiler = installed(command[0], environment)
+        print(f"exec: compiler {compiler}; network off", file=sys.stderr)
+        result = run_tool(
+            [compiler, *command[1:]],
+            copy,
+            work,
+            environment=environment,
+            java_home=jdk_home(environment) if language == "java" else None,
+        )
+        if result.ok:
+            result = take_program(result, sources, copy, language, box / "out", program)
     print(
         f"exec: compiled the {language} source in {time.monotonic() - started:.1f} s",
         file=sys.stderr,
     )
-    if not tool.ok:
+    if not result.ok:
         program.unlink(missing_ok=True)
-        return Built(tool.log, None, lasting=tool.returncode is not None)
-    return Built(tool.log, program)
+        return Built(result.log, None, lasting=result.returncode is not None)
+    return Built(result.log, program)
 
 
-def installed(name: str) -> str:
-    """The real path of the compiler `name` on `RUN_PATH`: the box
-    launcher starts a path, never a name, and the box has no
-    `/etc/alternatives` for a link through it to reach."""
-    found = shutil.which(name, path=RUN_PATH)
-    if found is None:
-        raise PrimitiveError(f"the compiler {name} is not in the image")
-    return os.path.realpath(found)
+def installed(name: str, environment: Path) -> str:
+    """Find a locked tool without following a link outside its folder."""
+    return tool(environment, Path(name).name)
 
 
 def take_program(
@@ -247,7 +259,14 @@ def plain_files(folder: Path) -> list[tuple[str, Path]]:
     return sorted(found)
 
 
-def run_tool(command: list[str], copy: Path, work: Path) -> Tool:
+def run_tool(
+    command: list[str],
+    copy: Path,
+    work: Path,
+    *,
+    environment: Path,
+    java_home: str | None = None,
+) -> Tool:
     """Run a compiler in the compile box, already made, with the prepared
     copy at `copy` bound read-only at `SOURCE`, its working directory, and
     return its exit code and its log.
@@ -265,7 +284,10 @@ def run_tool(command: list[str], copy: Path, work: Path) -> Tool:
         COMPILE_SECONDS, COMPILE_SECONDS, COMPILE_MEMORY_KB, COMPILE_PROCESSES
     )
     env = {"PATH": RUN_PATH, "HOME": "/tmp", "TMPDIR": "/tmp", "LANG": "C.UTF-8"}
+    if java_home is not None:
+        env["JAVA_HOME"] = java_home
     options = [
+        f"--dir=env={environment}",
         f"--dir={SOURCE.lstrip('/')}={copy}:noexec",
         f"--chdir={SOURCE}",
         f"--fsize={BINARY_LIMIT // 1024}",
