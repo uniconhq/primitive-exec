@@ -26,6 +26,7 @@ import pytest
 
 from exec import box, inputs, programs, report, shared
 from exec.compile.build import Built
+from exec.compile.environment import Toolchain
 from exec.main import main
 from support import (
     BOX_USERS,
@@ -561,7 +562,14 @@ def built_as(monkeypatch: pytest.MonkeyPatch, content: bytes) -> None:
     """Have every source compile to a program holding `content`, as no
     compiler of exec's writes, to see what exec makes of it."""
 
-    def build(folder: Path, language: str, entry: str | None, work: Path) -> Built:
+    def build(
+        folder: Path,
+        language: str,
+        entry: str | None,
+        work: Path,
+        *,
+        toolchain: Toolchain,
+    ) -> Built:
         work.mkdir()
         (work / "program").write_bytes(content)
         return Built("", work / "program")
