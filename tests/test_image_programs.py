@@ -2,7 +2,7 @@
 root, through `userns.py` (see `conftest.py`).
 
 Every program is given as its source, which exec compiles before the
-runs. The verdict script of `unicon/interactive@v2` is run on exec's image
+runs. The verdict script of `unicon/interactive@v3` is run on exec's image
 over the facts interact wrote, the two chained by hand as the forge will
 chain them.
 """
@@ -196,7 +196,7 @@ def verdicts(
     facts: list[tuple[str, bytes]],
 ) -> dict[str, Any]:
     """Run the verdict script on this image's one-program form over each
-    item's facts, as the `decide` step of `unicon/interactive@v2` does, and
+    item's facts, as the `decide` step of `unicon/interactive@v3` does, and
     return its outputs.json."""
     manifest = yaml.safe_load((SIBLING_VERDICT / "program.yaml").read_text())
     work = tmp_path / f"exec-{len(list(tmp_path.glob('exec-*')))}"
@@ -217,6 +217,9 @@ def verdicts(
         }
         batch.append({"run": run, "inputs": inputs})
     document = {"schema_version": SCHEMA_VERSION, "batch": batch}
+    from toolchains import attach
+
+    attach(work, document)
     (work / "inputs.json").write_text(json.dumps(document))
     count = len(facts)
     limits = {
@@ -232,7 +235,7 @@ def test_interactive_v1_judges_through_both_forms(
 ) -> None:
     """interact plays each game, and the verdict script, compiled and run by
     exec given its manifest and the facts, gives the verdict
-    `unicon/interactive@v2` promises: the judge's `0` or `1`, the entrant's
+    `unicon/interactive@v3` promises: the judge's `0` or `1`, the entrant's
     limit, and the entrant's crash or a wrong answer for an entrant that
     left; a judge's `0` however it ended once the entrant had, by
     `SIGPIPE` or a raised error; and a judge that crashed, or raised with no
@@ -295,7 +298,7 @@ def test_on_root_docker_the_image_refuses_to_start(
 
 
 def test_the_in_process_tests_pass_in_the_test_container(
-    image: str, rootless: bool
+    image: str, rootless: bool, environment_cache: str
 ) -> None:
     """`test_interact.py` in the test container built on the image,
     privileged, as root through `userns.py`, or as it is on a rootless
@@ -308,7 +311,15 @@ def test_the_in_process_tests_pass_in_the_test_container(
     command = ["docker", "run", "--rm", "--privileged", *ISOLATE_LIMITS]
     command += [f"--env=UNICON_BOX_USERS={BOX_USERS}"]
     command += [f"--env=UNICON_STEP_MEMORY_MB={STEP_MEMORY_MB}"]
-    command += ["--volume", f"{ROOT}:/src:ro", tag]
+    command += [
+        "--volume",
+        f"{ROOT}:/src:ro",
+        "--volume",
+        f"{environment_cache}:/cache",
+        "--env",
+        "UNICON_TEST_LOCK=/cache/test-lock.json",
+        tag,
+    ]
     command += [] if rootless else ["python3", "tests/userns.py"]
     command += ["pytest", "-p", "no:cacheprovider", "tests/test_programs.py"]
     done = subprocess.run(command, capture_output=True, text=True, timeout=1800)

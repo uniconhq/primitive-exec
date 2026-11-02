@@ -7,7 +7,7 @@ import re
 
 SCHEMA_VERSION = 6
 OUTPUT_LIMIT = 32 * 1024 * 1024
-RUN_PATH = "/usr/local/bin:/usr/bin:/bin"
+RUN_PATH = "/env/bin:/usr/local/bin:/usr/bin:/bin"
 FILE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 """A name a named file is placed under in the run's working directory: never
 `.` or `..`, never a path, never hidden."""

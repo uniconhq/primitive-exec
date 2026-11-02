@@ -705,7 +705,7 @@ def test_a_c_program_compiles_and_runs(tmp_path: Path, run_image: RunImage) -> N
 
 
 def test_a_java_program_compiles_and_runs(tmp_path: Path, run_image: RunImage) -> None:
-    """A jar exec compiled runs on the image's Java and gets its arguments;
+    """A jar exec compiled runs on the locked Java and gets its arguments;
     running out of heap is memory.
     """
     binary, language = {"Main.java": JAVA}, "java"
@@ -731,7 +731,7 @@ def test_a_java_program_compiles_and_runs(tmp_path: Path, run_image: RunImage) -
 def test_a_python_program_compiles_and_runs(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """A zip application exec made runs on the image's Python and gets
+    """A zip application exec made runs on the locked Python and gets
     its arguments.
     """
     source = "import sys\nprint(int(input()) * 2, *sys.argv[1:])\n"
@@ -915,12 +915,12 @@ DIFF_CASES = [
     (b"12 3\n", b"1 23\n", False),
 ]
 """diff-check@v2's cases and two more, each an output, an answer and whether
-they match by words, as classic@v4 compares: leading whitespace, inner
+they match by words, as classic@v5 compares: leading whitespace, inner
 spacing and blank lines, which counted for diff-check, count no more."""
 
 
 def diff_script() -> tuple[str, dict[str, Any]]:
-    """The diff script of unicon/classic@v4 and its manifest in JSON, from
+    """The diff script of unicon/classic@v5 and its manifest in JSON, from
     `DIFF_SCRIPT` or a deploy checkout beside this one."""
     folder = Path(os.environ.get("DIFF_SCRIPT", SIBLING_DIFF))
     if not (folder / "diff.py").is_file():
@@ -1035,7 +1035,7 @@ def test_a_hard_limit_on_open_files_too_low_for_isolate_stops_the_step(
 
 
 def test_the_in_process_tests_pass_in_the_test_container(
-    image: str, rootless: bool
+    image: str, rootless: bool, environment_cache: str
 ) -> None:
     """`test_exec.py` and `test_compile.py` in the test container built on
     the image, privileged,
@@ -1049,9 +1049,146 @@ def test_the_in_process_tests_pass_in_the_test_container(
     command = ["docker", "run", "--rm", "--privileged", *ISOLATE_LIMITS]
     command += [f"--env=UNICON_BOX_USERS={BOX_USERS}"]
     command += [f"--env=UNICON_STEP_MEMORY_MB={STEP_MEMORY_MB}"]
-    command += ["--volume", f"{ROOT}:/src:ro", tag]
+    command += [
+        "--volume",
+        f"{ROOT}:/src:ro",
+        "--volume",
+        f"{environment_cache}:/cache",
+        "--env",
+        "UNICON_TEST_LOCK=/cache/test-lock.json",
+        tag,
+    ]
     command += [] if rootless else ["python3", "tests/userns.py"]
     command += ["pytest", "-p", "no:cacheprovider", "tests/test_exec.py"]
-    command += ["tests/test_compile.py"]
+    command += [
+        "tests/test_compile.py",
+        "tests/test_programs.py",
+        "tests/test_environment.py",
+    ]
     done = subprocess.run(command, capture_output=True, text=True, timeout=1800)
     assert done.returncode == 0, done.stdout[-6000:] + done.stderr[-2000:]
+
+
+def test_a_locked_wheel_is_importable_by_the_box_user_from_read_only_env(
+    tmp_path: Path, run_image: RunImage, image: str
+) -> None:
+    import hashlib
+    import secrets
+    import zipfile
+
+    from conftest import docker
+
+    work = tmp_path / "work"
+    source = """import os
+import example
+assert os.statvfs('/env').f_flag & os.ST_RDONLY
+assert example.answer == 42
+print('42')
+"""
+    batch_inputs(work, source, [("main-wheel", "")], memory_limit=128)
+    piece = work / "cache/pieces/wheel"
+    piece.parent.mkdir(parents=True)
+    with zipfile.ZipFile(piece, "w") as archive:
+        archive.writestr("example/__init__.py", "answer = 42\n")
+    digest = hashlib.sha256(piece.read_bytes()).hexdigest()
+    import shutil
+
+    from toolchains import document, downloaded
+
+    platform = json.loads(docker("image", "inspect", image))[0]["Architecture"]
+    platform = "linux-aarch64" if platform == "arm64" else "linux-64"
+    locked = document(platform)
+    entry = locked["languages"]["python"]
+    entry["fingerprint"] = hashlib.sha256(
+        (entry["fingerprint"] + digest).encode()
+    ).hexdigest()
+    entry["pypi"].append({"sha256": digest, "size": piece.stat().st_size})
+    archives = downloaded(platform)
+    pieces = {digest: "cache/pieces/wheel"}
+    for record in entry["conda"] + entry["pypi"][:-1]:
+        sha = record["sha256"]
+        target = work / "cache/pieces" / sha
+        shutil.copyfile(archives / sha, target)
+        pieces[sha] = str(target.relative_to(work))
+    (work / "in/environment.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "prefix": "/env",
+                "languages": {"python": entry},
+                "pieces": pieces,
+                "platform": platform,
+            }
+        )
+    )
+    inputs = json.loads((work / "inputs.json").read_text())
+    inputs["batch"][0]["inputs"]["environment"] = {"file": "in/environment.json"}
+    (work / "inputs.json").write_text(json.dumps(inputs))
+    volume = "primitive-exec-environment-" + secrets.token_hex(4)
+    docker("volume", "create", volume)
+    try:
+        docker(
+            "run",
+            "--rm",
+            "--volume",
+            f"{volume}:/cache",
+            "--entrypoint",
+            "python3",
+            image,
+            "-I",
+            "-c",
+            "from pathlib import Path; "
+            "[(Path('/cache')/name).mkdir() for name in ('programs','locks','envs')]",
+        )
+        for _ in range(2):
+            outputs = by_run(run_image(work, flags=["--volume", f"{volume}:/cache"]))
+            assert outputs["main-wheel"]["outcome"] == "accepted"
+            assert printed(work, outputs["main-wheel"]) == "42\n"
+    finally:
+        docker("volume", "rm", "--force", volume)
+
+
+@pytest.mark.parametrize(
+    ("language", "source", "expected"),
+    [
+        ("python", "import numpy as np\nprint(int(np.array([2, 3]).sum()))\n", "5\n"),
+        (
+            "cpp",
+            "#include <boost/version.hpp>\n#include <fstream>\n#include <iostream>\n"
+            'int main() { std::cout << (BOOST_VERSION > 0) << " " '
+            '<< bool(std::ifstream("/env/bin/g++")) << "\\n"; }\n',
+            "1 0\n",
+        ),
+        (
+            "java",
+            "class Main { public static void main(String[] a) { "
+            'System.out.println(System.getProperty("java.version")'
+            '.startsWith("21.")); }}',
+            "true\n",
+        ),
+    ],
+)
+def test_locked_packages_and_named_tools_run_without_network(
+    tmp_path: Path, run_image: RunImage, language: str, source: str, expected: str
+) -> None:
+    work = tmp_path / "work"
+    batch_inputs(
+        work, source, [("locked-tools", "")], language=language, memory_limit=256
+    )
+    outputs = by_run(run_image(work))
+    assert outputs["locked-tools"]["outcome"] == "accepted"
+    assert printed(work, outputs["locked-tools"]) == expected
+
+
+def test_a_missing_toolchain_archive_is_a_step_fault(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    work = tmp_path / "work"
+    batch_inputs(work, "print(42)\n", [("missing-piece", "")])
+    path = work / "in/environment.json"
+    lock = json.loads(path.read_bytes())
+    lock["languages"]["python"]["fingerprint"] = "e" * 64
+    lock["pieces"] = {}
+    path.write_text(json.dumps(lock))
+    answer = run_image(work)
+    assert answer["error"] == "the environment is missing a safe conda piece"

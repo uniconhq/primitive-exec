@@ -15,12 +15,14 @@ from typing import Any
 
 import yaml
 
+from toolchains import attach
+
 ROOT = Path(__file__).resolve().parent.parent
 NAME = "primitive-exec"
 SCHEMA_VERSION = 6
 SIBLING_SCHEMA = ROOT.parent / "runner" / "schemas" / "primitive.schema.json"
 SIBLING_RUNNER = ROOT.parent / "runner"
-SIBLING_DIFF = ROOT.parent / "deploy" / "workflows" / "classic" / "v4" / "diff"
+SIBLING_DIFF = ROOT.parent / "deploy" / "workflows" / "classic" / "v5" / "diff"
 USERNS = Path(__file__).resolve().parent / "userns.py"
 BOX_USERS = "60000-60009"
 """The box users the tests give exec: one step's range."""
@@ -125,10 +127,13 @@ def step_flags(limits: dict[str, int]) -> list[str]:
     mounts the harness's, the tests' box users, that memory as the step's,
     and the network Docker gives it, as a Woodpecker step has one. Under
     root Docker, as on Docker Desktop and a CI machine, exec refuses to
-    start, so the tests start it through `USERNS`.
+    start, so the tests start it through `USERNS`. The CPU time has
+    `once_time_ms` added, as the time has, for the work done once in exec's
+    own process: assembling an environment the machine's cache lacks.
     """
     memory = f"{limits['memory_mb']}m"
-    cpu_seconds = math.ceil(limits["cpu_ms"] / 1000)
+    once_ms = declaration()["limits"]["once_time_ms"]
+    cpu_seconds = math.ceil((limits["cpu_ms"] + once_ms) / 1000)
     return [
         "--privileged",
         *ISOLATE_LIMITS,
@@ -221,6 +226,7 @@ def batch_inputs(
                 }
         batch.append({"run": run, "inputs": inputs})
     document = {"schema_version": SCHEMA_VERSION, "batch": batch}
+    attach(work, document)
     (work / "inputs.json").write_text(json.dumps(document))
 
 
@@ -387,7 +393,14 @@ elif case in ("file-memory", "unlinked-memory", "memfd-memory"):
     chunk = b"y" * (1024 * 1024)
     for name in ("one", "two"):
         if case == "memfd-memory":
-            kept = os.memfd_create(name)
+            if hasattr(os, "memfd_create"):
+                kept = os.memfd_create(name)
+            else:
+                # Some interpreters omit the wrapper; call the same kernel API.
+                import ctypes
+                kept = ctypes.CDLL(None, use_errno=True).memfd_create(name.encode(), 1)
+                if kept < 0:
+                    raise OSError(ctypes.get_errno(), "memfd_create")
         else:
             kept = os.open(name, os.O_RDWR | os.O_CREAT)
             if case == "unlinked-memory":
@@ -794,7 +807,7 @@ def base_build_args() -> tuple[str, ...]:
 
 
 SIBLING_VERDICT = (
-    ROOT.parent / "deploy" / "workflows" / "interactive" / "v2" / "verdict"
+    ROOT.parent / "deploy" / "workflows" / "interactive" / "v3" / "verdict"
 )
 
 GUESSES = {"reports": {"guesses": {"better": "lower", "at_least": 1}}}
@@ -912,6 +925,7 @@ def programs_batch_inputs(work: Path, items: list[TestItem]) -> None:
             entry["links"] = links
         batch.append({"run": run, "inputs": entry})
     document = {"schema_version": SCHEMA_VERSION, "batch": batch}
+    attach(work, document)
     (work / "inputs.json").write_text(json.dumps(document))
 
 
@@ -928,7 +942,7 @@ def game(entrant: str, judge: str = "guess", **limits: float) -> Programs:
     playing `judge`, with the secret and `GUESSES`. `limits` gives either's
     time or memory limit as `entrant_time_limit` and the like; the judge's
     time limit is 2 s and the entrant's 1 s, so the entrant's wall clock
-    runs out first, as `unicon/interactive@v2` asks."""
+    runs out first, as `unicon/interactive@v3` asks."""
     return {
         "entrant": Spec(
             ENTRANT,
@@ -1277,7 +1291,7 @@ elif case == "dev":
         blocked.append(attempt(lambda: open(path).close()))
     note(json.dumps({"dev": sorted(os.listdir("/dev")), "blocked": blocked}))
 elif case == "etc":
-    note(json.dumps(sorted(os.listdir("/etc"))))
+    note(json.dumps(sorted(os.listdir("/etc")) if os.path.isdir("/etc") else []))
 elif case == "net":
     import socket
 

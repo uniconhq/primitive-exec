@@ -50,7 +50,7 @@ PROGRAMS_OWN_NAMES = OWN_NAMES | {
 }
 """`OWN_NAMES` plus what the several-programs form gives of each program."""
 REPORT_KEYS = frozenset({"type", "optional", "better", "at_least", "at_most"})
-BUILD_INPUTS = frozenset({"source", "language", "entry"})
+BUILD_INPUTS = frozenset({"source", "language", "entry", "environment"})
 """What an item of the build form gives, and an item gives nothing else
 only in that form: the one-program form also needs its limits."""
 
@@ -80,6 +80,7 @@ class Source:
     folder: Path
     language: str
     entry: str | None = None
+    environment: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -226,7 +227,24 @@ def read_item(root: Path, entry: object, number: int) -> Item:
             f"the input named programs of run {run} does not hold one to "
             f"{MAX_PROGRAMS} programs"
         )
-    programs = tuple(read_entry(root, name, each, run) for name, each in given.items())
+    programs = tuple(
+        read_entry(
+            root,
+            name,
+            {
+                **each,
+                **(
+                    {"environment": inputs["environment"]}
+                    if "environment" in inputs
+                    else {}
+                ),
+            }
+            if isinstance(each, dict)
+            else each,
+            run,
+        )
+        for name, each in given.items()
+    )
     links = read_links(inputs.get("links", []), {each.name for each in programs}, run)
     item = Item(run=run, number=number, programs=programs, links=links)
     named = pipe_names(item)
@@ -346,7 +364,12 @@ def read_source(root: Path, inputs: dict[str, object], what: str) -> Source:
     entry = inputs.get("entry")
     if entry is not None and not isinstance(entry, str):
         raise PrimitiveError(f"the input named entry of {what} is not text")
-    return Source(folder, str(language), (entry or "").strip() or None)
+    return Source(
+        folder,
+        str(language),
+        (entry or "").strip() or None,
+        input_file(root, inputs, "environment", what),
+    )
 
 
 def read_manifest(

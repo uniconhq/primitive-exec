@@ -8,6 +8,7 @@ skipped elsewhere and run in the privileged test container
 `UNICON_TESTS_IN_BOXES` makes a skip a failure.
 """
 
+import contextlib
 import errno
 import json
 import os
@@ -23,9 +24,20 @@ from typing import Any
 import pytest
 
 from exec import box
-from exec.compile import build, cache, java, notebook, prepare, python, shared
+from exec.compile import (
+    build,
+    cache,
+    environment,
+    java,
+    notebook,
+    prepare,
+    python,
+    shared,
+)
+from exec.compile.environment import Lock, Toolchain
 from exec.main import main
 from support import BOX_USERS, STEP_MEMORY_MB, write_source
+from toolchains import attach, folder_for
 
 IN_BOXES = os.environ.get("UNICON_TESTS_IN_BOXES") == "1"
 
@@ -317,7 +329,17 @@ def test_a_folder_that_cannot_be_prepared_compiles_nothing(tmp_path: Path) -> No
     """A prepare that fails is the compile's log and no program, before any
     box or the cache is asked."""
     (tmp_path / "folder").mkdir()
-    built = build.build(tmp_path / "folder", "python", None, tmp_path / "work")
+    built = build.build(
+        tmp_path / "folder",
+        "python",
+        None,
+        tmp_path / "work",
+        toolchain=Toolchain(
+            tmp_path,
+            Lock("a" * 64, "linux-64", {}, [], []),
+            contextlib.ExitStack(),
+        ),
+    )
     assert built == build.Built("the source folder holds no files\n", None)
     assert built.outcome == "compile_error"
 
@@ -734,16 +756,19 @@ def test_a_cell_that_is_not_an_object_is_passed_over() -> None:
 def test_the_cache_key_is_the_compile_and_nothing_else(tmp_path: Path) -> None:
     """Two folders that prepare to the same copy share a key, as one file
     whose name could be an option and one already named `main.py`; a
-    change to a file's bytes, its path, the entry or the toolchain does
-    not."""
+    change to a file's bytes, its path, the entry, the toolchain or the
+    locked environment's fingerprint does not."""
 
     def key_of(
-        files: dict[str, str], tools: str = "t", entry: str | None = None
+        files: dict[str, str],
+        tools: str = "t",
+        entry: str | None = None,
+        fingerprint: str = "a" * 64,
     ) -> str:
         root = tmp_path / str(len(list(tmp_path.iterdir())))
         folder = make_folder(root / "folder", files)
         sources = prepare.prepare(folder, root / "copy", "python", entry)
-        return cache.key(tools, "python", sources, root / "copy")
+        return cache.key(tools, "python", sources, root / "copy", fingerprint)
 
     files = {"a.py": 'if __name__ == "__main__": pass\n', "b.py": "x = 1\n"}
     first = key_of(files)
@@ -752,6 +777,77 @@ def test_the_cache_key_is_the_compile_and_nothing_else(tmp_path: Path) -> None:
     assert key_of({"a.py": files["a.py"], "c/b.py": files["b.py"]}) != first
     assert key_of(files, entry="b.py") != first
     assert key_of(files, tools="u") != first
+    assert key_of(files, fingerprint="b" * 64) != first
+
+
+def test_a_compile_the_cache_holds_assembles_no_toolchain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A compile found under its key, which the lock's fingerprint makes,
+    is taken without assembling the toolchain folder it was compiled in."""
+    machine = tmp_path / "cache"
+    for name in ("programs", "locks"):
+        (machine / name).mkdir(parents=True)
+    monkeypatch.setattr(cache, "CACHE", machine)
+    (tmp_path / "toolchain").write_text("tools\n")
+    monkeypatch.setattr(cache, "TOOLCHAIN", tmp_path / "toolchain")
+
+    def unassembled(*_: object) -> None:
+        raise AssertionError("a compile the cache holds assembled its toolchain")
+
+    monkeypatch.setattr(environment, "assembled", unassembled)
+    folder = make_folder(tmp_path / "folder", {"main.cpp": "int main() {}\n"})
+    sources = prepare.prepare(folder, tmp_path / "copy", "cpp", None)
+    key = cache.key("tools", "cpp", sources, tmp_path / "copy", "a" * 64)
+    cache.store(key, "compile_error", "cached log\n", None)
+    toolchain = Toolchain(
+        tmp_path, Lock("a" * 64, "linux-64", {}, [], []), contextlib.ExitStack()
+    )
+    built = build.build(folder, "cpp", None, tmp_path / "work", toolchain=toolchain)
+    assert built == build.Built("cached log\n", None)
+    assert toolchain.environment is None
+
+
+def test_a_changed_fingerprint_of_the_same_language_compiles_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same source, its language's lock changed, is a miss: it is
+    compiled again in the new toolchain and stored beside the first."""
+    machine = tmp_path / "cache"
+    for name in ("programs", "locks"):
+        (machine / name).mkdir(parents=True)
+    monkeypatch.setattr(cache, "CACHE", machine)
+    (tmp_path / "toolchain").write_text("tools\n")
+    monkeypatch.setattr(cache, "TOOLCHAIN", tmp_path / "toolchain")
+
+    @contextlib.contextmanager
+    def assembled(
+        root: Path, lock: environment.Lock
+    ) -> Iterator[environment.Environment]:
+        yield environment.Environment(tmp_path / lock.fingerprint, lock.fingerprint)
+
+    compiled_in: list[Path] = []
+
+    def compiled(
+        sources: shared.Sources, copy: Path, language: str, work: Path, env: Path
+    ) -> build.Built:
+        compiled_in.append(env)
+        return build.Built(f"compiled in {env.name}\n", None)
+
+    monkeypatch.setattr(environment, "assembled", assembled)
+    monkeypatch.setattr(build, "compile_sources", compiled)
+    folder = make_folder(tmp_path / "folder", {"main.cpp": "int main() {}\n"})
+
+    def built(fingerprint: str, work: str) -> build.Built:
+        lock = environment.Lock(fingerprint, "linux-64", {}, [], [])
+        toolchain = Toolchain(tmp_path, lock, contextlib.ExitStack())
+        return build.build(folder, "cpp", None, tmp_path / work, toolchain=toolchain)
+
+    assert built("a" * 64, "first").log == f"compiled in {'a' * 64}\n"
+    assert built("a" * 64, "again").log == f"compiled in {'a' * 64}\n"
+    assert built("b" * 64, "changed").log == f"compiled in {'b' * 64}\n"
+    assert compiled_in == [tmp_path / ("a" * 64), tmp_path / ("b" * 64)]
+    assert len(list((machine / "programs").iterdir())) == 2
 
 
 @pytest.fixture
@@ -772,7 +868,7 @@ def machine_cache(boxes: None) -> Iterator[Path]:
     """The machine's cache at `/cache`, laid out as the wrapper lays it out
     for a step given one, and removed after."""
     for name in ("programs", "locks"):
-        (cache.CACHE / name).mkdir(parents=True)
+        (cache.CACHE / name).mkdir(parents=True, exist_ok=True)
     try:
         yield cache.CACHE
     finally:
@@ -810,6 +906,7 @@ def compile_step(
         inputs["entry"] = entry
     batch = [{"run": run, "inputs": inputs} for run in runs]
     document = {"schema_version": 6, "batch": batch}
+    attach(work, document)
     (work / "inputs.json").write_text(json.dumps(document))
     assert main(["exec", str(work)]) == 0
     result = json.loads((work / "outputs.json").read_text(encoding="utf-8"))
@@ -824,7 +921,9 @@ PYTHON = os.path.realpath(sys.executable)
 def test_the_log_is_cut_at_its_limit(compile_box: Path, tmp_path: Path) -> None:
     """A compiler that prints without end leaves a log of bounded size."""
     command = [PYTHON, "-c", "import sys; sys.stdout.write('e' * 300000)"]
-    tool = build.run_tool(command, compile_box, tmp_path)
+    tool = build.run_tool(
+        command, compile_box, tmp_path, environment=folder_for("python")
+    )
     assert tool.ok
     assert tool.log.startswith("e" * shared.LOG_LIMIT + "\n[compile log cut at")
     assert f"{300000 - shared.LOG_LIMIT} more bytes left out" in tool.log
@@ -840,7 +939,9 @@ def test_a_compiler_that_runs_too_long_is_stopped(
         "-c",
         "import time; print('started', flush=True); time.sleep(30)",
     ]
-    tool = build.run_tool(command, compile_box, tmp_path)
+    tool = build.run_tool(
+        command, compile_box, tmp_path, environment=folder_for("python")
+    )
     assert not tool.ok
     assert (
         tool.log == "started\n\ncompiling took longer than 1 seconds and was stopped\n"
@@ -852,7 +953,9 @@ def test_a_compiler_over_its_memory_is_stopped(
 ) -> None:
     monkeypatch.setattr(build, "COMPILE_MEMORY_KB", 64 * 1024)
     command = [PYTHON, "-c", "x = bytearray(256 << 20)"]
-    tool = build.run_tool(command, compile_box, tmp_path)
+    tool = build.run_tool(
+        command, compile_box, tmp_path, environment=folder_for("python")
+    )
     assert not tool.ok
     assert tool.log.endswith(
         "\ncompiling took more than 64 MB of memory and was stopped\n"
@@ -869,7 +972,9 @@ def test_a_compiler_writing_a_file_over_the_limit_is_stopped(
         "import signal; signal.signal(signal.SIGXFSZ, signal.SIG_DFL);"
         " open('/tmp/big', 'wb').write(bytes(2 << 20))",
     ]
-    tool = build.run_tool(command, compile_box, tmp_path)
+    tool = build.run_tool(
+        command, compile_box, tmp_path, environment=folder_for("python")
+    )
     assert not tool.ok
     assert tool.log.endswith(shared.TOO_LARGE)
 
@@ -879,7 +984,9 @@ def test_a_command_line_too_long_to_start_is_a_compile_error(
 ) -> None:
     """Paths the contestant chose can make a command too long for the system."""
     command = [PYTHON, "-c", "pass", "x" * (256 * 1024)]
-    tool = build.run_tool(command, compile_box, tmp_path)
+    tool = build.run_tool(
+        command, compile_box, tmp_path, environment=folder_for("python")
+    )
     assert not tool.ok
     assert tool.log == "the source folder's paths are too long to compile\n"
 
@@ -898,7 +1005,9 @@ def test_the_compiler_reads_the_source_and_cannot_change_it(
         "import os; print(os.getcwd(), open('main.c').read().strip(), flush=True);"
         " open('main.c', 'a')",
     ]
-    tool = build.run_tool(command, compile_box, tmp_path)
+    tool = build.run_tool(
+        command, compile_box, tmp_path, environment=folder_for("python")
+    )
     assert not tool.ok
     assert tool.log.startswith("/source int main(void) { return 0; }\n")
     assert "Read-only file system" in tool.log
@@ -933,6 +1042,7 @@ def test_a_build_given_alone_is_answered_alone(boxes: None, tmp_path: Path) -> N
     write_source(tmp_path / "in" / "1" / "source", "print(1)\n", "python")
     inputs = {"source": {"folder": "in/1/source"}, "language": "python"}
     document = {"schema_version": 6, "inputs": inputs}
+    attach(tmp_path, document)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
     assert main(["exec", str(tmp_path)]) == 0
     result = json.loads((tmp_path / "outputs.json").read_text(encoding="utf-8"))
@@ -1095,13 +1205,25 @@ def test_a_cached_compile_that_is_not_whole_is_compiled_again(
     assert cache.file_sha256(program) == sha256
 
 
-def test_without_the_cache_every_step_compiles(
-    boxes: None, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_without_the_cache_the_locked_environment_is_a_fault(
+    boxes: None,
+    tmp_path: Path,
 ) -> None:
-    name, text = SOURCES["python"]
-    for step in ("first", "second"):
-        compile_step(tmp_path / step, {name: text}, "python")
-        assert "exec: compiled the python source" in capsys.readouterr().err
+    for name in ("programs", "locks"):
+        shutil.rmtree(cache.CACHE / name)
+    write_source(tmp_path / "in/source", "print(1)\n", "python")
+    document = {
+        "schema_version": 6,
+        "inputs": {"source": {"folder": "in/source"}, "language": "python"},
+    }
+    attach(tmp_path, document)
+    (tmp_path / "inputs.json").write_text(json.dumps(document))
+    assert main(["exec", str(tmp_path)]) == 0
+    result = json.loads((tmp_path / "outputs.json").read_text())
+    assert result == {
+        "schema_version": 6,
+        "error": "the environment needs the machine's /cache volume",
+    }
 
 
 def test_a_compile_stopped_at_a_limit_is_not_cached(
