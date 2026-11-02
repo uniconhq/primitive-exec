@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ from support import (
     declaration,
     step_flags,
 )
+from toolchains import document, downloaded
 
 collect_ignore = [] if sys.platform == "linux" else ["test_exec.py", "test_programs.py"]
 
@@ -73,7 +75,7 @@ def rootless(image: str) -> bool:
 
 
 @pytest.fixture
-def run_image(image: str, rootless: bool) -> RunImage:
+def run_image(image: str, rootless: bool, environment_cache: str) -> RunImage:
     """Run the image once over a working directory and return its outputs.json.
 
     The directory is copied into a Docker volume, run there and copied back,
@@ -103,6 +105,9 @@ def run_image(image: str, rootless: bool) -> RunImage:
                 docker("cp", f"{work}/.", f"{holder}:/work")
                 command = ["docker", "run", "--rm", *step_flags(limits)]
                 command += flags or []
+                command += ["--network", "none"]
+                if not any(value.endswith(":/cache") for value in (flags or [])):
+                    command += ["--volume", f"{environment_cache}:/cache"]
                 command += ["--volume", f"{volume}:/work"]
                 if root_docker or rootless:
                     command += [image]
@@ -230,3 +235,58 @@ def programs_check(schema: dict[str, Any]) -> Check:
                 assert required <= given <= set(facts) | reports, outputs
 
     return validate
+
+
+@pytest.fixture(scope="session")
+def environment_cache(
+    image: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[str]:
+    architecture = docker(
+        "image", "inspect", image, "--format", "{{.Architecture}}"
+    ).strip()
+    platform = {"arm64": "linux-aarch64", "amd64": "linux-64"}[architecture]
+    root = tmp_path_factory.mktemp("toolchains")
+    template = root / "environment.json"
+    template.write_text(json.dumps(document(platform)))
+    archives = downloaded(platform)
+    volume = "primitive-exec-toolchains-" + secrets.token_hex(4)
+    docker("volume", "create", volume)
+    previous = os.environ.get("UNICON_TEST_LOCK")
+    try:
+        os.environ["UNICON_TEST_LOCK"] = str(template)
+        docker(
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--volume",
+            f"{volume}:/cache",
+            "--volume",
+            f"{archives}:/archives:ro",
+            "--volume",
+            f"{template}:/fixture.json:ro",
+            "--volume",
+            f"{ROOT / 'tests/prepare_environments.py'}:/prepare.py:ro",
+            "--entrypoint",
+            "python3",
+            image,
+            "-I",
+            "/prepare.py",
+        )
+        yield volume
+    finally:
+        if previous is None:
+            os.environ.pop("UNICON_TEST_LOCK", None)
+        else:
+            os.environ["UNICON_TEST_LOCK"] = previous
+        docker("volume", "rm", "--force", volume)
+
+
+@pytest.fixture(autouse=True)
+def compiled_programs_are_private_to_a_test() -> None:
+    if os.environ.get("UNICON_TESTS_IN_BOXES") == "1":
+        from exec.compile import cache
+
+        shutil.rmtree(cache.CACHE / "programs", ignore_errors=True)
+        for name in ("programs", "locks", "envs"):
+            (cache.CACHE / name).mkdir(parents=True, exist_ok=True)

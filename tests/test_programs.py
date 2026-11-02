@@ -42,6 +42,7 @@ from support import (
 from support import (
     programs_batch_inputs as batch_inputs,
 )
+from toolchains import attach
 
 IN_BOXES = os.environ.get("UNICON_TESTS_IN_BOXES") == "1"
 EXEC_OUTCOMES = ("time_limit", "memory_limit", "output_limit", "runtime_error")
@@ -555,9 +556,9 @@ def test_a_box_dev_holds_only_its_devices(run: Any) -> None:
     assert seen["blocked"] == ["ENOENT", "ENOENT", "ENOENT"]
 
 
-def test_a_box_etc_holds_only_java(run: Any) -> None:
+def test_a_box_has_no_image_jdk_configuration(run: Any) -> None:
     programs = {"a": program("etc", manifest=NOTES)}
-    assert json.loads(one(run, programs, [])["a"]["message"]) == ["java-21-openjdk"]
+    assert json.loads(one(run, programs, [])["a"]["message"]) == []
 
 
 def test_a_box_reaches_no_network(run: Any) -> None:
@@ -849,6 +850,7 @@ def test_inputs_that_do_not_hold_are_refused(
     (tmp_path / "in" / "f").write_text("")
     (tmp_path / "in" / "m").write_text(json.dumps({"reports": {"ended": {}}}))
     document = {"schema_version": 6, "batch": [given]}
+    attach(tmp_path, document)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
     with pytest.raises(shared.PrimitiveError) as raised:
         inputs.read_inputs(tmp_path)
@@ -884,6 +886,7 @@ def test_an_input_that_does_not_hold_is_named_with_its_program(
 ) -> None:
     (tmp_path / "in" / "p").mkdir(parents=True)
     document = {"schema_version": 6, "batch": [item({"a": entry(**more)})]}
+    attach(tmp_path, document)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
     with pytest.raises(shared.PrimitiveError) as raised:
         inputs.read_inputs(tmp_path)
@@ -899,6 +902,7 @@ def test_a_program_is_read_without_the_one_program_forms_own_inputs(
     (tmp_path / "in" / "p").mkdir(parents=True)
     given = entry(stdin={"file": "in/none"}, loads="x", self_reported="yes")
     document = {"schema_version": 6, "batch": [item({"a": given})]}
+    attach(tmp_path, document)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
     (read,) = inputs.read_inputs(tmp_path)
     (program,) = read.programs
@@ -923,6 +927,7 @@ def test_a_batch_that_mixes_the_two_forms_is_refused(tmp_path: Path) -> None:
     second = item({"a": entry()})
     second["run"] = "main-2"
     document = {"schema_version": 6, "batch": [one, second]}
+    attach(tmp_path, document)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
     with pytest.raises(shared.PrimitiveError, match="mixes the one-program form"):
         programs.run_batch(tmp_path, inputs.read_inputs(tmp_path))

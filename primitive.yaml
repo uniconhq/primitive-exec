@@ -14,6 +14,10 @@ forms:
       cpu_ms: {input: time_limit, scale: 2000, add: 3000}
       memory_mb: {input: memory_limit, add: 256}
     inputs:
+      environment:
+        type: file
+        runs: false
+        description: The locked environment and its cached pieces for this platform.
       source:
         type: folder
         runs: true
@@ -115,6 +119,10 @@ forms:
       cpu_ms: {max: programs.time_limit, scale: 4000, add: 6000}
       memory_mb: {sum: programs.memory_limit, add: 512}
     inputs:
+      environment:
+        type: file
+        runs: false
+        description: The locked environment and its cached pieces for this platform.
       programs:
         type: programs
         description: The programs to run side by side, one to eight, by the names the step gives them.
@@ -205,6 +213,10 @@ forms:
     description: Compiles a program and runs nothing, so saving a task can check that its programs compile.
     limits: {time_ms: 1000, cpu_ms: 1000, memory_mb: 1136, pids: 160, output_mb: 64, gpus: 0, once_time_ms: 40000}
     inputs:
+      environment:
+        type: file
+        runs: false
+        description: The locked environment and its cached pieces for this platform.
       source:
         type: folder
         runs: true
