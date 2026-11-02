@@ -127,10 +127,13 @@ def step_flags(limits: dict[str, int]) -> list[str]:
     mounts the harness's, the tests' box users, that memory as the step's,
     and the network Docker gives it, as a Woodpecker step has one. Under
     root Docker, as on Docker Desktop and a CI machine, exec refuses to
-    start, so the tests start it through `USERNS`.
+    start, so the tests start it through `USERNS`. The CPU time has
+    `once_time_ms` added, as the time has, for the work done once in exec's
+    own process: assembling an environment the machine's cache lacks.
     """
     memory = f"{limits['memory_mb']}m"
-    cpu_seconds = math.ceil(limits["cpu_ms"] / 1000)
+    once_ms = declaration()["limits"]["once_time_ms"]
+    cpu_seconds = math.ceil((limits["cpu_ms"] + once_ms) / 1000)
     return [
         "--privileged",
         *ISOLATE_LIMITS,
