@@ -36,6 +36,7 @@ from exec.compile import (
 )
 from exec.compile.environment import Lock, Toolchain
 from exec.main import main
+from exec.shared import SCHEMA_VERSION, PrimitiveError
 from support import BOX_USERS, STEP_MEMORY_MB, write_source
 from toolchains import attach, folder_for
 
@@ -473,18 +474,39 @@ def test_an_entry_problem_is_a_compile_error(
 def test_a_folder_that_cannot_be_copied_is_a_compile_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A folder too large for the scratch space is the contestant's."""
+    """A folder that cannot be copied is the contestant's."""
+
+    def failed(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EACCES, "Permission denied")
+
+    folder = make_folder(tmp_path / "folder", {"a.py": "", "b.py": ""})
+    monkeypatch.setattr(shutil, "copyfile", failed)
+    with pytest.raises(shared.CompileError) as raised:
+        prepare.prepare(folder, tmp_path / "copy", "python", "a.py")
+    assert str(raised.value) == (
+        "the source folder could not be copied to compile it: Permission denied"
+    )
+
+
+def test_a_full_disk_copying_the_folder_or_the_notebook_is_the_steps_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The step's disk is the machine's, so a write it has no room for ends
+    the step, never as the contestant's compile error (#287)."""
 
     def full(*args: object, **kwargs: object) -> None:
         raise OSError(errno.ENOSPC, "No space left on device")
 
     folder = make_folder(tmp_path / "folder", {"a.py": "", "b.py": ""})
     monkeypatch.setattr(shutil, "copyfile", full)
-    with pytest.raises(shared.CompileError) as raised:
+    with pytest.raises(PrimitiveError, match="the step's disk is full: No space"):
         prepare.prepare(folder, tmp_path / "copy", "python", "a.py")
-    assert str(raised.value) == (
-        "the source folder could not be copied to compile it: No space left on device"
-    )
+    monkeypatch.undo()
+    notebook = notebook_of(("code", "print(1)\n"))
+    folder = make_folder(tmp_path / "notebook", {"main.ipynb": notebook})
+    monkeypatch.setattr(Path, "write_text", full)
+    with pytest.raises(PrimitiveError, match="the step's disk is full: No space"):
+        prepare.prepare(folder, tmp_path / "notebook-copy", "ipynb", None)
 
 
 @pytest.mark.parametrize(
@@ -1274,27 +1296,81 @@ def test_a_program_left_as_a_link_is_no_program(
     assert not (tmp_path / "program").exists()
 
 
-def test_a_python_program_that_cannot_be_written_is_a_compile_error(
+@pytest.mark.parametrize("language", ["python", "c"])
+def test_a_program_that_cannot_be_written_is_a_compile_error_but_on_a_full_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str
+) -> None:
+    """The folder is the entrant's, so packing or taking its program failing
+    is theirs too, but a write the step's disk has no room for is the
+    step's error (#287)."""
+    raised = OSError(errno.EFBIG, "File too large")
+
+    def failed(*args: object) -> None:
+        raise raised
+
+    monkeypatch.setattr(python, "write_zip_application", failed)
+    monkeypatch.setattr(build, "copy_plain", failed)
+    name = "main.py" if language == "python" else "main.c"
+    folder = make_folder(tmp_path / "folder", {name: "int main() {}\n"})
+    sources = prepare.prepare(folder, tmp_path / "copy", language, None)
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out/program").write_bytes(b"program")
+
+    def taken() -> build.Tool:
+        return build.take_program(
+            build.Tool(0, ""),
+            sources,
+            tmp_path / "copy",
+            language,
+            tmp_path / "out",
+            tmp_path / "program",
+        )
+
+    log = (
+        shared.TOO_LARGE if language == "python" else "the compiler wrote no program\n"
+    )
+    assert taken() == build.Tool(1, log)
+    raised = OSError(errno.ENOSPC, "No space left on device")
+    with pytest.raises(PrimitiveError, match="the step's disk is full: No space"):
+        taken()
+
+
+def test_a_full_disk_anywhere_is_written_as_the_steps_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The folder is the entrant's, so packing it failing is theirs too."""
+    """A write the step's disk has no room for, wherever exec makes it,
+    ends the step with its error in `outputs.json`, which the harness
+    takes as a `system_error`, rather than crash exec (#287), what exec
+    wrote for the runs removed first to make room for it; any other
+    failure of exec's own still crashes it."""
+    from exec import main as entry
 
-    def full(*args: object) -> None:
-        raise OSError(errno.ENOSPC, "No space left on device")
+    raised = OSError(errno.ENOSPC, "No space left on device")
 
-    monkeypatch.setattr(python, "write_zip_application", full)
-    folder = make_folder(tmp_path / "folder", {"main.py": "print(1)\n"})
-    sources = prepare.prepare(folder, tmp_path / "copy", "python", None)
-    (tmp_path / "out").mkdir()
-    tool = build.take_program(
-        build.Tool(0, ""),
-        sources,
-        tmp_path / "copy",
-        "python",
-        tmp_path / "out",
-        tmp_path / "program",
-    )
-    assert tool == build.Tool(1, shared.TOO_LARGE)
+    def failed(root: Path, items: object) -> None:
+        raise raised
+
+    monkeypatch.setattr(entry, "read_inputs", lambda root: [])
+    monkeypatch.setattr(entry, "run_batch", failed)
+    (tmp_path / "out/1").mkdir(parents=True)
+    (tmp_path / "out/1/output").write_text("a run's output")
+    (tmp_path / "compile-left").mkdir()
+    (tmp_path / "in").mkdir()
+    (tmp_path / "in/kept").write_text("the harness's")
+    assert main(["exec", str(tmp_path)]) == 0
+    assert json.loads((tmp_path / "outputs.json").read_text()) == {
+        "schema_version": SCHEMA_VERSION,
+        "error": "the step's disk is full: No space left on device",
+    }
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "in",
+        "out",
+        "outputs.json",
+    ]
+    assert list((tmp_path / "out").iterdir()) == []
+    raised = OSError(errno.EIO, "Input/output error")
+    with pytest.raises(OSError, match="Input/output error"):
+        main(["exec", str(tmp_path)])
 
 
 def test_a_source_over_32_mb_is_refused_before_it_is_read(

@@ -69,13 +69,18 @@ COPY src/exec/ /usr/local/lib/unicon-exec/exec/
 RUN python3 -m compileall -q /usr/local/lib/unicon-exec
 COPY --chmod=0755 src/command.py /usr/local/bin/exec
 
-# The toolchain line, part of every compiled program's key in the machine's
-# cache: the installed packages and their versions, the interpreter, and
-# exec's own files, so two images that would compile differently never share
-# a program.
+# The toolchain line, part of every compiled program's key and every
+# environment's folder name in the machine's cache: the installed packages
+# and their versions, the interpreter, and every file under
+# /usr/local/lib/unicon-exec, exec's own, rattler's and uv's, so two images
+# that would compile or assemble differently never share a program or an
+# environment. The bytecode compileall wrote holds the time it was written,
+# and the line's own file is made as the line is written, so both are left
+# out.
 RUN { dpkg-query -W; python3 -VV; \
-      find /usr/local/lib/unicon-exec/exec -name '*.py' -type f | sort \
-        | xargs sha256sum; } \
+      find /usr/local/lib/unicon-exec -type f ! -path '*/__pycache__/*' \
+        ! -path /usr/local/lib/unicon-exec/toolchain -print0 \
+        | LC_ALL=C sort -z | xargs -0 sha256sum; } \
     | sha256sum | cut -d' ' -f1 > /usr/local/lib/unicon-exec/toolchain
 
 # exec runs as root: it sets up the step's cgroup, mounts each box's tmpfs and

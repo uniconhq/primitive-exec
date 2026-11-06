@@ -309,13 +309,18 @@ compiled programs beside the step wrapper's task files:
 /cache/programs/<key>/program      the compiled program, mode 0444
 /cache/programs/<key>/result.json  {outcome, log, program_sha256, created}
 /cache/locks/programs-<key>.lock   held while a step looks up, compiles or stores it
-/cache/envs/<F>/ready.json         complete folder's fingerprint, /env prefix and the toolchain line of the image that assembled it
-/cache/locks/envs-<F>.lock         shared while used, exclusive while assembled
+/cache/envs/<F>-<T>/ready.json     complete folder's fingerprint F, /env prefix, the toolchain line T of the image that assembled it, and the store entries it links
+/cache/locks/envs-<F>-<T>.lock     shared while used, exclusive while assembled
+/cache/store/conda/<package>/      a conda package unpacked once, rattler's cache
+/cache/store/uv/archive-v0/<id>/   a wheel unpacked once, uv's cache
+/cache/store/wheels/<sha256>/<file name>  a locked wheel's copy, written once and never touched
+/cache/locks/store.lock            shared while a folder is assembled
 ```
 
 The key is the SHA-256 of the image's toolchain line, written when the
-image is built from its installed packages, its Python and exec's own
-files, then the language, its environment fingerprint, the entry, the sources
+image is built from its installed packages, its Python and every file
+under `/usr/local/lib/unicon-exec`, exec's own and the installers', but
+the bytecode compiled there, then the language, its environment fingerprint, the entry, the sources
 given the compiler, Java's
 main class and each file of the prepared copy by path and SHA-256. So two
 folders that prepare alike share a compile, and two images whose compilers
@@ -330,13 +335,31 @@ that does not hold what it says is removed and compiled again. A second
 step with the same source waits on the lock and then hits. No box sees the
 cache. Every exec step needs the machine's cache.
 
-Each conda archive is verified, linked under its file name inside the step's
-own item and installed offline with the target prefix `/env`, link scripts
-off and a scratch package cache removed afterwards. Wheels go into the
-locked Python's site-packages. Completed folders contain no second hard
-links, so eviction cannot damage objects. A second step reuses the folder
-and its compiled program; a folder an image of another toolchain line
-assembled is assembled again, the old one moved aside whole first. The
+A folder is made of hard links into the machine's store, where each
+package is unpacked once, so folders that lock the same packages share
+their files. Each conda archive is verified, linked under its file name
+inside the step's own item and installed offline by rattler, from its
+cache in `store/conda`, with link scripts off. Each verified wheel is
+copied once to `store/wheels` and never touched after, not even its
+mode, since uv keys a wheel it has unpacked by its path and its inode's
+change time, and installed by uv, offline, with no dependencies and no configuration read,
+from its cache in `store/uv`. Both install through `/env`, made for the
+build a link in exec's own container to the folder being assembled, so
+each writes `/env` where it names its prefix; where `/env` cannot be made,
+both install at the folder's own path, rattler told to write `/env`, and
+the launchers uv writes are pointed at `/env/bin/python3` after. A file
+with the prefix written into it, a conda record and what uv writes itself
+are the folder's own; any other file with one link was copied, as from a
+store on another filesystem or mount, and the folder is refused, naming
+it. Only the folder's own files are made read-only, since a linked file's
+mode is the store's, for every folder; a box sees `/env` read-only. The
+folder's `ready.json` lists the store entries it links, which the wrapper
+frees once no folder lists them, and the store's lock is held shared
+while a folder is assembled, since an entry just unpacked is listed in no
+folder yet. A second step reuses the folder
+and its compiled program. A folder is named by the lock's fingerprint and
+the image's toolchain line together, so an image of another line assembles
+a folder of its own and never waits on another's. The
 compile key takes the fingerprint from the lock, and a folder is assembled
 only for a compile the cache does not hold or a program that runs on it:
 Python and Java run with read-only `/env`; static C and C++ programs run
@@ -476,8 +499,10 @@ runs (see "Where it runs"): the container has root Docker's identity map,
 exec is not root, `UNICON_BOX_USERS` is missing or out of bounds,
 `UNICON_STEP_MEMORY_MB` is missing or not a whole number, the
 container's hard limit on the stack or on open files is too low for
-isolate, or the step could not be set up for its boxes; or isolate could
-not make, run or clean up a box. The harness turns an error into a
+isolate, or the step could not be set up for its boxes; isolate could
+not make, run or clean up a box; or the step's disk had no room for a
+write of exec's own (`ENOSPC`), wherever it failed, even copying or
+packing the entrant's folder. The harness turns an error into a
 `system_error`, so no entrant is graded by a broken step. A native program
 the kernel refuses to run as built is the entrant's program failing, a
 `runtime_error`.

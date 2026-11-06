@@ -111,6 +111,10 @@ def attach(work: Path, inputs: dict[str, Any]) -> None:
 
 
 def folder_for(language: str) -> Path:
+    """The folder the image under test assembled `language`'s toolchain in,
+    named by the lock's fingerprint and the image's toolchain line."""
     template = Path(os.environ["UNICON_TEST_LOCK"])
     lock = json.loads(template.read_bytes())
-    return Path("/cache/envs") / str(lock["languages"][language]["fingerprint"])
+    fingerprint = str(lock["languages"][language]["fingerprint"])
+    tools = Path("/usr/local/lib/unicon-exec/toolchain").read_text().strip()
+    return Path("/cache/envs") / f"{fingerprint}-{tools}"

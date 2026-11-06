@@ -1,12 +1,15 @@
 """What the tests share: the declaration, the sandbox flags and test inputs."""
 
 import ast
+import base64
+import hashlib
 import inspect
 import json
 import math
 import os
 import subprocess
 import textwrap
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cache
@@ -39,6 +42,29 @@ Check = Callable[..., None]
 
 SCORE = {"reports": {"score": {"better": "higher", "at_least": 0, "at_most": 1}}}
 """A manifest as the diff script's: a score between 0 and 1, higher better."""
+
+
+def a_wheel(folder: Path, name: str, files: dict[str, str]) -> Path:
+    """A wheel of `name` 1.0 in `folder`, for any Python, holding `files`
+    and its `dist-info`, each file's hash in its `RECORD`, as an installer
+    reads one."""
+    dist = f"{name}-1.0.dist-info"
+    content = files | {
+        f"{dist}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n",
+        f"{dist}/WHEEL": "Wheel-Version: 1.0\nGenerator: tests\n"
+        "Root-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    rows = []
+    for path, text in content.items():
+        digest = hashlib.sha256(text.encode()).digest()
+        encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        rows.append(f"{path},sha256={encoded},{len(text.encode())}")
+    wheel = folder / f"{name}-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for path, text in content.items():
+            archive.writestr(path, text)
+        archive.writestr(f"{dist}/RECORD", "\n".join([*rows, f"{dist}/RECORD,,"]))
+    return wheel
 
 
 def declaration(form: str = "one") -> dict[str, Any]:

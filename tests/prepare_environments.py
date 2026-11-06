@@ -22,13 +22,8 @@ def main() -> None:
     file = root / "environment.json"
     file.write_text(json.dumps(lock))
     for language in lock["languages"]:
-        with assembled(root, read_lock(file, language)) as ready:
-            files = [
-                path
-                for path in ready.folder.rglob("*")
-                if path.is_file() and not path.is_symlink()
-            ]
-            assert all(path.stat().st_nlink == 1 for path in files)
+        with assembled(root, read_lock(file, language)):
+            pass
     (cache.CACHE / "test-lock.json").write_text(file.read_text())
 
 

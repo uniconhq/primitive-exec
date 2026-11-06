@@ -28,6 +28,7 @@ from exec.compile.shared import (
     code_only,
     read_text,
 )
+from exec.shared import no_room
 
 MAIN_DESCRIPTIONS = {
     "c": ("defines main", "define main"),
@@ -78,6 +79,8 @@ def prepare(
         code = notebook_code(read_notebook(notebook, sources.entry), sources.entry)
         notebook.write_text(code, encoding="utf-8")
     except OSError as error:
+        if full := no_room(error):
+            raise full from error
         raise CompileError(
             f"the notebook could not be read to compile it: {error.strerror}"
         ) from None
@@ -260,11 +263,14 @@ def source_name(source: Path, suffix: str) -> str:
 
 
 def copy_file(origin: Path, target: Path) -> None:
-    """Copy one file of the source folder, a failure being a compile error."""
+    """Copy one file of the source folder, a failure being a compile error
+    but for a full disk, the step's error."""
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(origin, target)
     except OSError as error:
+        if full := no_room(error):
+            raise full from error
         raise CompileError(
             f"the source folder could not be copied to compile it: {error.strerror}"
         ) from None
