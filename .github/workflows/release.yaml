@@ -13,9 +13,9 @@ permissions: {}
 # it needs.
 jobs:
   release:
-    uses: uniconhq/runner/.github/workflows/primitive-release.yaml@v0.12.0 # zizmor: ignore[unpinned-uses] our own repo, pinned by release tag
+    uses: uniconhq/runner/.github/workflows/primitive-release.yaml@v0.13.0 # zizmor: ignore[unpinned-uses] our own repo, pinned by release tag
     permissions:
       contents: write
       packages: write
     with:
-      runner-ref: v0.12.0
+      runner-ref: v0.13.0
