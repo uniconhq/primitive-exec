@@ -11,7 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from exec.compile.shared import LANGUAGES
+from exec.compile.recipes import LANGUAGES
 from exec.shared import FILE_NAME, SCHEMA_VERSION, PrimitiveError
 
 RUN_ID = re.compile(r"[A-Za-z0-9_-]+")

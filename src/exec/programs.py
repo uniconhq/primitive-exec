@@ -13,7 +13,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import IO, BinaryIO
@@ -40,7 +39,8 @@ from exec.box import (
     step_memory_kb,
 )
 from exec.compile.build import Built, build, check_room
-from exec.compile.environment import Toolchain, jdk_home, read_lock, tool
+from exec.compile.environment import Toolchain, read_lock
+from exec.compile.recipes import Launch, recipe, start_of, unpack, unpacked_kb
 from exec.inputs import FORM_NAMES, WALL_CLOCK, Entry, Item, Link, Source, pipe_names
 from exec.report import TEXTS, ReportError, judge, read_report, reported, write_json
 from exec.shared import OUTPUT_LIMIT, PrimitiveError
@@ -49,7 +49,6 @@ REFUSED_ARGUMENTS = frozenset({errno.E2BIG})
 """What the kernel answers when the command line is too long for it, which
 only `args` can make it: the contestant's input, not the step, failed.
 """
-ELF_MAGIC = b"\x7fELF"
 BOX = 0
 """The box every item of the one-program form runs in, one after another,
 made afresh each time."""
@@ -57,55 +56,34 @@ made afresh each time."""
 
 @dataclass(frozen=True)
 class Compiled:
-    """A source's program as exec holds it: its format, its file, which
-    each run's box gets a copy of, and its locked toolchain."""
+    """A source's program as exec holds it: its language, its file, which
+    each run's box gets a copy of, its locked toolchain, and what it
+    starts from, read from it in its language's format."""
 
-    kind: str
+    language: str
     path: Path
     toolchain: Toolchain
+    start: str | None
 
+    @property
+    def uses_folder(self) -> bool:
+        """Whether its runs see the locked toolchain at `/env`."""
+        return recipe(self.language).uses_folder(self.toolchain.lock)
 
-@dataclass(frozen=True)
-class Program:
-    """A program ready to run: its format, the file the command starts,
-    as the box sees it, and its locked toolchain."""
-
-    kind: str
-    path: Path
-    toolchain: Toolchain
-
-    def java_home(self) -> str | None:
-        """`JAVA_HOME` for a Java program, its locked JDK's home."""
-        return jdk_home(self.toolchain.folder()) if self.kind == "java" else None
+    def box_kb(self) -> int:
+        """What the program takes in a box's tmpfs, in kilobytes: its file
+        to whole 4 KB pages, or the files it unpacks to."""
+        if recipe(self.language).format.unpacked:
+            return unpacked_kb(self.path)
+        return 4 * -(-self.path.stat().st_size // 4096)
 
     def command(self, entry: Entry) -> list[str]:
-        """The command line that runs this program, the entry's arguments
-        last. The interpreters are the image's own, which every box sees
-        under `/usr`; Python's is started by its real path, outside any
-        virtual environment exec runs in.
-        """
-        if self.kind == "native":
-            return [str(self.path), *entry.args]
-        if self.kind == "python":
-            return [
-                tool(self.toolchain.folder(), "python3"),
-                "-I",
-                "-B",
-                str(self.path),
-                *entry.args,
-            ]
-        return [
-            tool(self.toolchain.folder(), "java"),
-            f"-Xmx{max(16, int(entry.memory_limit))}m",
-            "-Xss64m",
-            "-XX:+UseSerialGC",
-            "-XX:-UsePerfData",
-            "-XX:+ExitOnOutOfMemoryError",
-            "-Djava.io.tmpdir=.",
-            "-jar",
-            str(self.path),
-            *entry.args,
-        ]
+        """The command line that runs this program, by its recipe, the
+        entry's arguments last. A runtime is the locked one, started by its
+        path under `/env`."""
+        folder = self.toolchain.folder() if self.uses_folder else None
+        launch = Launch(folder, self.start, int(entry.memory_limit))
+        return [*recipe(self.language).run(launch), *entry.args]
 
 
 def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
@@ -140,7 +118,8 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
             f"{len(users)} box users, one for each"
         )
     memory_kb = step_memory_kb()
-    check_room(memory_kb)
+    languages = {source.language for item in items for source in item.sources}
+    check_room(memory_kb, max(recipe(each).compile_memory_kb for each in languages))
     set_up_step(users, memory_kb)
     scratch = Path(tempfile.mkdtemp(prefix="exec-"))
     work = Path(tempfile.mkdtemp(prefix="compile-", dir=root))
@@ -171,7 +150,12 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
                         toolchain=toolchains[source],
                     )
         compiled = {
-            source: Compiled(detect(each.program), each.program, toolchains[source])
+            source: Compiled(
+                source.language,
+                each.program,
+                toolchains[source],
+                start_of(source.language, each.program),
+            )
             for source, each in built.items()
             if each.program is not None
         }
@@ -180,14 +164,19 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
                 {"run": item.run, "outputs": not_compiled(item, built)}
                 for item in items
             ]
-        # A Python or Java program runs on its toolchain at /env, which a
-        # compile the cache held did not assemble; a native one needs none.
+        # A program that runs on its toolchain at /env needs it assembled,
+        # which a compile the cache held did not do; one linked whole needs
+        # none.
         for each in compiled.values():
-            if each.kind != "native":
+            if each.uses_folder:
                 each.toolchain.folder()
         for item in items:
             needed = sum(
-                box_size_kb(entry, compiled[entry.source].path)
+                box_size_kb(
+                    entry,
+                    compiled[entry.source].box_kb(),
+                    recipe(entry.source.language),
+                )
                 for entry in item.programs
             )
             check_memory(needed, memory_kb, item.run)
@@ -224,27 +213,6 @@ def not_compiled(item: Item, built: dict[Source, Built]) -> dict[str, object]:
     return logs(item, built) | {"outcome": "compile_error" if failed else "accepted"}
 
 
-def detect(program: Path) -> str:
-    """Tell which of the three program formats a file is.
-
-    `native` is an ELF executable, `python` a zip application with a
-    `__main__.py`, `java` a jar with a manifest.
-    """
-    with program.open("rb") as stream:
-        if stream.read(4) == ELF_MAGIC:
-            return "native"
-    if zipfile.is_zipfile(program):
-        with zipfile.ZipFile(program) as archive:
-            names = set(archive.namelist())
-        if "__main__.py" in names:
-            return "python"
-        if "META-INF/MANIFEST.MF" in names:
-            return "java"
-    raise PrimitiveError(
-        "the program is not a native executable, a Python zip application or a Java jar"
-    )
-
-
 def run_item(
     root: Path,
     item: Item,
@@ -271,8 +239,8 @@ def run_item(
     own = compiled[entry.source]
     out = root / "out" / str(item.number)
     out.mkdir(parents=True, exist_ok=True)
-    with fresh_box(BOX, box_size_kb(entry, own.path)) as box:
-        program = prepare(item, entry, own, box)
+    with fresh_box(BOX, box_size_kb(entry, own.box_kb(), recipe(own.language))) as box:
+        prepare(item, entry, own, box)
         place_files(box / "run", entry.files | entry.loads, entry.cached)
         for name in BOX_FOLDERS:
             (box / name).mkdir()
@@ -282,9 +250,9 @@ def run_item(
             report = box / "report"
             report.mkdir()
         reports = report is not None
-        run = execute(item.run, entry, program, reports, out / "output", scratch, users)
+        run = execute(item.run, entry, own, reports, out / "output", scratch, users)
         run = replace(run, no_inodes=os.statvfs(box).f_ffree == 0)
-        outcome = judge(run, own.kind)
+        outcome = judge(run, recipe(own.language).out_of_memory)
         time_ms = round(run.cpu_seconds * 1000)
         if outcome == "time_limit":
             time_ms = max(time_ms, entry.time_limit_ms)
@@ -299,29 +267,35 @@ def run_item(
     return outputs
 
 
-def prepare(item: Item, entry: Entry, own: Compiled, box: Path) -> Program:
-    """Copy a program of the item, compiled as `own`, into its box, before
-    its clock starts, executable for a native executable, since the file
-    under `in/` may not be, and readable for the others.
+def prepare(item: Item, entry: Entry, own: Compiled, box: Path) -> None:
+    """Copy a program of the item, compiled as `own`, into its box at
+    `/box/program`, before its clock starts: a folder program unpacked, with
+    its recipe's links beside its files, and one file executable for a
+    native executable, since the file under `in/` may not be, and readable
+    for the others.
 
     The program is the copy's owner while it runs, so it may change its
     mode, times or attributes; the copy goes with the box.
     """
+    own_recipe = recipe(own.language)
+    copy = box / "program"
     try:
-        shutil.copyfile(own.path, box / "program")
+        if own_recipe.format.unpacked:
+            unpack(own.path, copy, own_recipe.links)
+        else:
+            shutil.copyfile(own.path, copy)
+            copy.chmod(0o755 if own_recipe.format.executable else 0o644)
     except OSError as error:
         which = entry.name if item.form == "programs" else f"of run {item.run}"
         raise PrimitiveError(
             f"the program {which} could not be copied: {error.strerror}"
         ) from error
-    (box / "program").chmod(0o755 if own.kind == "native" else 0o644)
-    return Program(own.kind, Path("/box/program"), own.toolchain)
 
 
 def execute(
     run: str,
     entry: Entry,
-    program: Program,
+    program: Compiled,
     reports: bool,
     output: Path,
     scratch: Path,
@@ -372,7 +346,7 @@ def execute(
         reports,
         more,
         program.command(entry),
-        program.java_home(),
+        recipe(program.language),
     )
     if entry.stdin is None:
         descriptor = os.open(os.devnull, os.O_RDONLY)
@@ -467,7 +441,7 @@ class Running:
 
     entry: Entry
     number: int
-    kind: str
+    out_of_memory: int | None
     box: Path
     meta: Path
     errors: Path
@@ -508,19 +482,24 @@ def run_programs(
     named = pipe_names(item)
     with contextlib.ExitStack() as stack:
         running: list[Running] = []
-        programs: list[Program] = []
+        programs: list[Compiled] = []
         for number, entry in enumerate(item.programs):
             own = compiled[entry.source]
-            box = stack.enter_context(fresh_box(number, box_size_kb(entry, own.path)))
+            box = stack.enter_context(
+                fresh_box(
+                    number, box_size_kb(entry, own.box_kb(), recipe(own.language))
+                )
+            )
             each = Running(
                 entry=entry,
                 number=number,
-                kind=own.kind,
+                out_of_memory=recipe(own.language).out_of_memory,
                 box=box,
                 meta=scratch / f"meta-{number}",
                 errors=scratch / f"errors-{number}",
             )
-            programs.append(prepare(item, entry, own, box))
+            prepare(item, entry, own, box)
+            programs.append(own)
             place_files(box / "run", entry.files, entry.cached)
             for name in named[entry.name]:
                 (box / "run" / name).symlink_to(f"{PIPES}/{name}")
@@ -650,7 +629,7 @@ def close_quietly(descriptor: int) -> None:
 
 
 def start(
-    each: Running, program: Program, pipes: Path, stack: contextlib.ExitStack
+    each: Running, program: Compiled, pipes: Path, stack: contextlib.ExitStack
 ) -> subprocess.Popen[bytes] | None:
     """Start one program in its box, already made and filled, and return
     the isolate that keeps it, or None when it could not start.
@@ -689,7 +668,7 @@ def start(
             "--special-files",
         ],
         program.command(entry),
-        program.java_home(),
+        recipe(program.language),
     )
     if any("\0" in argument for argument in entry.args):
         return None
@@ -825,7 +804,7 @@ def stops(each: Running) -> bool:
     assert each.run is not None
     if each.run.interrupted:
         return False
-    over = judge(each.run, each.kind) in OVER_LIMIT
+    over = judge(each.run, each.out_of_memory) in OVER_LIMIT
     return over or each.entry.stops_others
 
 
@@ -898,7 +877,7 @@ def program_facts(each: Running, item: Item) -> dict[str, object]:
     """
     assert each.run is not None and each.ended_at is not None
     run, entry = each.run, each.entry
-    outcome = judge(run, each.kind)
+    outcome = judge(run, each.out_of_memory)
     time_ms = round(run.cpu_seconds * 1000)
     if outcome == "time_limit":
         time_ms = max(time_ms, entry.time_limit_ms)
@@ -944,7 +923,9 @@ def signal_name(number: int) -> str:
         return f"signal {number}"
 
 
-def environment_binding(program: Program) -> list[str]:
-    if program.kind == "native":
+def environment_binding(program: Compiled) -> list[str]:
+    """isolate's option binding the program's locked toolchain at `/env`,
+    read-only, or none for a program that runs without it."""
+    if not program.uses_folder:
         return []
     return [f"--dir=env={program.toolchain.folder()}"]

@@ -1,6 +1,6 @@
 # primitive-exec
 
-The `unicon/exec` primitive, at the forge `unicon/exec@v3`: it compiles
+The `unicon/exec` primitive, at the forge `unicon/exec@v4`: it compiles
 programs and runs them under limits. Every program is given as its source,
 a folder and a language, and exec compiles each source of the batch once,
 in an isolate box of its own, before any run, keeping the compiled program
@@ -13,10 +13,10 @@ memory it used, the compile log, and an outcome. A batch item that gives
 under limits of its own, linked by pipes, and reports how each ended. A
 batch item that gives only the source compiles it and runs nothing, the
 `build` form. It is what compiles and runs code in the simpler core's
-workflows: an entrant's program in `unicon/classic@v5`, an organiser's
+workflows: an entrant's program in `unicon/classic@v6`, an organiser's
 checker or the diff script after it, and the entrant and judge of
-`unicon/interactive@v3`. Earlier exec versions, compile and sandbox-run
-are retired; version 3 is the active exec contract.
+`unicon/interactive@v4`. Earlier exec versions, compile and sandbox-run
+are retired; version 4 is the active exec contract.
 
 This repo holds the image, `ghcr.io/uniconhq/primitive-exec`, built from the
 `Dockerfile`, with [isolate](https://github.com/ioi/isolate) 2.7 built into
@@ -131,7 +131,7 @@ Desktop, the step and item folders' names random.
 spaces at either end separate nothing. There is no quoting, so no argument
 holds a space. Absent or empty, the program gets no arguments. The arguments
 come after the program on the command line: `program <args>`, `python3 -I -B
-program <args>`, `java ... -jar program <args>`. An argument no command line
+program <args>`, `java ... -cp program:... <main class> <args>`. An argument no command line
 can carry, one holding a NUL character or longer than the kernel takes, is
 the run failing to start, a `runtime_error`.
 
@@ -165,8 +165,8 @@ printed and ends with a line saying how much more was left out.
 the entry. It is compiled under its own file name when that name is plain
 (letters, digits, `.`, `_` and `-`, starting with a letter or digit, with
 the language's usual extension), so the log names the entrant's file;
-anything else is compiled as `main.c`, `main.cpp` or `main.py`, and Java as
-below. This is how a single uploaded file is compiled.
+anything else is compiled as `main` and the language's first extension
+below, such as `main.c` or `main.py`, and Java as below. This is how a single uploaded file is compiled.
 
 **A larger folder** is copied with its layout. Its sources are its files
 with the language's extensions; every other file, such as a header or a
@@ -177,8 +177,18 @@ data file, is copied beside them.
 | `c` | `.c` |
 | `cpp` | `.cpp`, `.cc`, `.cxx` |
 | `java` | `.java` |
+| `kotlin` | `.kt` |
 | `python` | `.py` |
 | `ipynb` | `.ipynb` |
+| `javascript` | `.js`, `.mjs`, `.cjs` |
+| `typescript` | `.ts`, `.mts`, `.cts` |
+| `csharp` | `.cs` |
+| `rust` | `.rs` |
+| `r` | `.R`, `.r` |
+| `ruby` | `.rb` |
+
+A JavaScript or TypeScript folder holding a `node_modules` of its own is a
+`compile_error`: its programs have the locked one beside them.
 
 The entry is the file `entry` names, by its path from the top of the
 folder, `/` between folders; a leading `./` is allowed and `..` is not. It
@@ -192,12 +202,15 @@ source that holds main:
 |---|---|
 | `c`, `cpp` | Defines a function named `main`: `main(...)` followed by a body. A member such as `Game::main` or a call such as `game.main()` does not count |
 | `java` | Declares a `static void main` method |
+| `kotlin` | Declares a function `fun main(` |
 | `python` | Has a top-level line `if __name__ == "__main__":`, either quotes, either side first |
-| `ipynb` | Never: a folder of two notebooks names the one to run |
+| `csharp` | Declares a `static` `Main` returning `void`, `int`, `Task` or `Task<int>` |
+| `rust` | Defines a function `fn main(` |
+| `ipynb`, `javascript`, `typescript`, `r`, `ruby` | Never: a folder of two names the one to run |
 
 Comments and string and character literals (and Java's text blocks) are
-ignored for C, C++ and Java, each source read in one pass, in time linear
-in its size. When no source holds main, or more than one does, the outcome
+ignored for C, C++, Java, Kotlin, C# and Rust, each source read in one
+pass, in time linear in its size. When no source holds main, or more than one does, the outcome
 is `compile_error` and the log asks for the entry:
 
 ```
@@ -215,6 +228,23 @@ What the entry decides, per language:
   a one-file folder is named after its public top-level type, or
   `Main.java`, as javac requires. When the class did not come out of the
   compile, the outcome is `compile_error` and the log names it.
+- **Kotlin.** Every source is compiled together into one jar, and the jar
+  runs the class of the entry's top-level functions, as kotlinc names it:
+  the one its `@file:JvmName` names, or else its file's name with each
+  character no letter or digit made `_`, a first ASCII letter capital and
+  `Kt` after it, with its package, so `solution.kt` runs `SolutionKt`.
+  exec writes the jar's manifest itself, since kotlinc names a class only
+  when one file holds main; when the class did not come out of the
+  compile, the outcome is `compile_error` and the log names it.
+- **C#.** Every source is compiled into one assembly, `main.dll`, started
+  from the type whose `static Main` the entry declares, with its
+  namespaces and the types it is in (`-main:`), so a folder may hold a
+  second `Main`, such as a test driver's.
+- **Rust.** The entry is the crate's root; it names its other files as
+  modules.
+- **JavaScript, TypeScript, R and Ruby.** The program is the folder, laid
+  out as given, run from the entry; TypeScript's is tsc's JavaScript in
+  place of each `.ts` file.
 - **Python.** Every source is checked with `py_compile`, so a file with a
   syntax error fails the compile even when nothing imports it. The program
   holds every file of the folder and runs the entry as the main module,
@@ -238,6 +268,44 @@ What the entry decides, per language:
 | `java` | conda-forge `openjdk` | `javac -encoding UTF-8 -proc:none -Xlint:none -XDsuppressNotes -d /box/out/classes <sources>`, then exec packs the classes into a jar |
 | `python` | conda-forge `python` | `python3 -I -X pycache_prefix=/tmp/pycache -m py_compile <sources>`, then exec packs the folder into a zip application |
 | `ipynb` | the Python lock | exec joins the notebook's code cells, then as `python` |
+| `kotlin` | conda-forge `kotlin`, `openjdk` | `kotlinc -J-XX:ActiveProcessorCount=2 -J-XX:+UseSerialGC -nowarn [-cp <jars>] -d /box/out/main.jar <sources>` |
+| `javascript` | conda-forge `nodejs` | `node --check` on each source |
+| `typescript` | conda-forge `nodejs`, `typescript` | `tsc [--types <locked @types>] --outDir /box/out/js --rootDir . --module nodenext --pretty false <sources>` |
+| `csharp` | conda-forge `dotnet` | `dotnet exec <sdk>/Roslyn/bincore/csc.dll -nologo -noconfig -optimize+ -target:exe -out:/box/out/main.dll [-main:<the entry's type>] -r:<each reference assembly> <sources>`, then exec writes `main.runtimeconfig.json` naming the locked runtime |
+| `rust` | conda-forge `rust`, with `gcc` its linker | `rustc --edition 2024 -O -o /box/out/program <entry>` |
+| `r` | conda-forge `r-base` and `r-*` | none: the program is the folder |
+| `ruby` | conda-forge `ruby` | `ruby -c` on each source |
+
+**A task's own packages.** A C or C++ lock that lists conda packages of
+the task's own (`gtest`, `eigen`) links against them in `/env` instead of
+statically: gcc gets `-I/env/include -L/env/lib -Wl,-rpath,/env/lib` and,
+run in the box, `pkg-config --cflags --libs` for every `.pc` file those
+packages install, read from their `conda-meta` records, header-only ones
+too, and the program's runs see `/env`. A package with no `.pc` file gets
+the include path alone. Maven jars of a Java or Kotlin lock are placed in
+`/env/lib/java/`, on javac's, kotlinc's and every run's class path; npm
+packages of a JavaScript or TypeScript lock are placed at their places in
+the lock under `/env/lib/node_modules/`, and a `node_modules` link to it is
+put beside the program, in the compile's copy and in each run's box. Each
+is unpacked once into the machine's store, `store/files/<sha256>/`, and
+linked into the folder from there (see "The machine's cache"); an npm
+tarball is unpacked as npm does, its first folder dropped and every link,
+device, pipe, absolute path and `..` passed over, and no install script is
+run.
+
+Jest has to run in band, `--runInBand` on its command line or `runInBand:
+true` to `runCLI`: by default it starts a worker for each CPU it sees, and
+a test file run so took 132 processes and threads, over the box's 128, so
+the run fails as `runtime_error`.
+
+What the recipes set that conda's activation scripts would, since exec
+runs none: `CONDA_PREFIX=/env` for the `kotlinc` and `tsc` wrappers,
+`JAVA_HOME=/env/lib/jvm` for Java and Kotlin, `DOTNET_ROOT=/env/lib/dotnet`
+with that folder first on `PATH`, dotnet's telemetry and first-run steps
+off and `HOME` at the box's `/tmp`; and `OPENBLAS_NUM_THREADS=1` and
+`OMP_NUM_THREADS=1` for Python and R, whose BLAS would start a thread for
+each CPU. R's box also binds `/etc/alternatives` read-only, where the
+image's `/usr/bin/which` points.
 
 Each file is named by its path from the top of the folder, and one that
 does not start with a letter, a digit or `_` is written with `./` in
@@ -268,7 +336,7 @@ limits, held by isolate as a run's are:
 | Limit | Value |
 |---|---|
 | CPU and wall-clock time | 30 seconds each |
-| Memory | 1024 MB, the box's cgroup, without swap |
+| Memory | 1024 MB, the box's cgroup, without swap; Kotlin's 1536 MB, as `kotlinc` reached 793 MB |
 | Processes and threads | 128 |
 | Any one file it writes | 32 MB (`--fsize`) |
 | The box's tmpfs | 64 MB: the program at its cap, and as much again for the compiler's own files |
@@ -281,23 +349,23 @@ once before rollout.
 
 The box sees exec's copy of the folder at `/source`, read-only and not
 executable, which is its working directory; it writes the program, or
-Java's classes, to `/box/out`, and its own files to its `/tmp`. Its
+Java's classes, to `/box/out`, and its own files to its `/tmp`. A
+JavaScript or TypeScript copy also has the `node_modules` link. Its
 environment holds `PATH`, `HOME` and `TMPDIR`, both `/tmp`, and
 `LANG=C.UTF-8`, and standard output and error go together into the log.
 It also sees its language's folder read-only at `/env`, with tools started
-as `/env/bin/gcc`, `/env/bin/g++`, `/env/bin/javac` or `/env/bin/python3`.
-`PATH` begins with `/env/bin`; Java gets `JAVA_HOME` as the folder above
-its locked `java`'s own file, `/env/lib/jvm` for conda-forge's OpenJDK, in
-the compile box and each run's box alike.
+from it, such as `/env/bin/gcc` or `/env/bin/javac`, and each recipe's
+environment (above). `PATH` begins with `/env/bin`.
 Like a run's box, it sees the image's `/usr`, `/bin` and `/lib`, no `/etc`
 configuration, and nothing of `/work`, the machine's cache or another box, so `#include "/etc/passwd"` finds nothing. exec takes back
 only plain files, never through a link, writes the zip application or jar
 itself, and checks the program against 32 MB. A compile that goes over a
 limit is `compile_error`, the log saying which.
 
-The step must hold the compile box beside what it needs for itself, 1024
-MB and 112 MB, so `primitive.yaml` gives every form at least 1136 MB, and a
-step given less is an error before anything compiles.
+The step must hold the compile box beside what it needs for itself, up to
+1536 MB for Kotlin and 112 MB, so `primitive.yaml` gives every form at least
+1648 MB, and a step given less than its batch's languages need is an error
+before anything compiles.
 
 ### The machine's cache
 
@@ -314,6 +382,7 @@ compiled programs beside the step wrapper's task files:
 /cache/store/conda/<package>/      a conda package unpacked once, rattler's cache
 /cache/store/uv/archive-v0/<id>/   a wheel unpacked once, uv's cache
 /cache/store/wheels/<sha256>/<file name>  a locked wheel's copy, written once and never touched
+/cache/store/files/<sha256>/       a locked jar, as file.jar, or npm package's files, placed once, read-only
 /cache/locks/store.lock            shared while a folder is assembled
 ```
 
@@ -362,9 +431,10 @@ the image's toolchain line together, so an image of another line assembles
 a folder of its own and never waits on another's. The
 compile key takes the fingerprint from the lock, and a folder is assembled
 only for a compile the cache does not hold or a program that runs on it:
-Python and Java run with read-only `/env`; static C and C++ programs run
-with no `/env` bind, so a C or C++ compile the cache holds assembles
-nothing. The wrapper sweeps incomplete
+every language but C and C++ runs with read-only `/env`, and C and C++
+with one only when their lock lists packages of the task's own; static C
+and C++ programs run with no `/env` bind, so such a compile the cache
+holds assembles nothing. The wrapper sweeps incomplete
 folders and evicts whole unheld folders by last use.
 
 ## A program that reports
@@ -494,7 +564,8 @@ name is in both `files` and `loads`; a manifest is not one, or
 a manifest did not judge, unless it is `self_reported` (see "A program that
 reports"); an item's run is not a run id, or two items are for the same
 run; the program is in none of the three formats; the interpreter a Python
-or Java program needs could not be started; exec could not start where it
+Java, Kotlin, JavaScript, TypeScript, C#, R or Ruby program needs could
+not be started; exec could not start where it
 runs (see "Where it runs"): the container has root Docker's identity map,
 exec is not root, `UNICON_BOX_USERS` is missing or out of bounds,
 `UNICON_STEP_MEMORY_MB` is missing or not a whole number, the
@@ -524,7 +595,8 @@ For each item, in order:
    and network namespaces of the box's own, under its limits (below),
    through the box launcher (see "The box launcher"). The
    box sees `/box`, the image's `/usr`, `/bin` and `/lib` directories and,
-   its locked `/env` for Python and Java, all read-only but `/box`,
+   its locked `/env` for every language but static C and C++, all
+   read-only but `/box`,
    its own `/proc`, a `/tmp` and a `/dev/shm` bound from the empty
    `/box/tmp` and `/box/shm` on the box's tmpfs, and a `/dev` of four
    devices. The environment holds only
@@ -559,7 +631,7 @@ isolate holds every limit but the output's, on the box as a whole.
 |---|---|
 | CPU time: `time_limit` seconds | `--time`: the CPU time of every process in the box, added up by its cgroup, and the box killed once over. The time reported is that total, so work hidden in a child that is never waited for still counts |
 | Wall-clock time: twice `time_limit` plus one second | `--wall-time`. It stops a run that sleeps or waits without using the CPU; the margin keeps a busy machine from turning a fast run into a time limit |
-| Memory: `memory_limit` megabytes | `--cg-mem`: the box's own memory cgroup, with no swap, which the kernel holds on every page it charges there and kills the run at. The memory reported is the cgroup's peak. Java also gets `-Xmx` at the limit |
+| Memory: `memory_limit` megabytes | `--cg-mem`: the box's own memory cgroup, with no swap, which the kernel holds on every page it charges there and kills the run at. The cgroup is given the limit and room over it for its runtime's own: 40 MB for Java and Kotlin, 64 MB for JavaScript and TypeScript, 72 MB for R, 32 MB for C# and 16 MB for Ruby. The memory reported is the cgroup's peak. Java and Kotlin get `-Xmx` at the limit, and Node its heap at the limit too: with its heap past the limit, Node collected too late and a program dropping old garbage was killed as `memory_limit` |
 | Files: the box's tmpfs | As large as the memory limit plus the copies, and 60,000 files and folders, its `/tmp` and `/dev/shm` among them, since both are folders on it. Every page a run writes there is charged to its memory, so writing past the memory limit is `memory_limit`. A run that makes files past the cap gets `ENOSPC`, and exec, finding the tmpfs with none left after the run, gives `memory_limit` too |
 | Output: 32 MB | exec reads the pipe up to 32 MB and one byte more, then closes it, so output costs the box no memory. A run that prints on dies of `SIGPIPE`; the output kept is cut to 32 MB |
 | Processes: 128 | `--processes`, `RLIMIT_NPROC` for the box's user: every process and thread of the run, a fork bomb's among them |
@@ -570,8 +642,11 @@ the run for its box's memory, which isolate also reads as a signal, or the
 run left its tmpfs no file or folder to give; `time_limit` if the CPU time
 or the wall-clock time went over; `output_limit` if the output went over,
 before the signal, since a run that printed on died of `SIGPIPE` when exec
-stopped reading; `memory_limit` if a Java program exited with code 3, which
-is how `-XX:+ExitOnOutOfMemoryError` ends a JVM that ran out of heap; then
+stopped reading; `memory_limit` if a Java or Kotlin program exited with code 3, which
+is how `-XX:+ExitOnOutOfMemoryError` ends a JVM that ran out of heap, or a
+JavaScript or TypeScript program ended by `SIGABRT`, which is how V8 ends
+a Node whose heap reached its limit, as `process.abort()` alone would
+otherwise; then
 `runtime_error` for any other non-zero exit or signal, or a program that
 could not start; otherwise `accepted`.
 
@@ -795,7 +870,7 @@ call.
 
 ## The container's limits
 
-`limits` in `primitive.yaml` are per run: 2 s of time and CPU, 1136 MB of
+`limits` in `primitive.yaml` are per run: 2 s of time and CPU, 1648 MB of
 memory, for the compile box (see "Compiling"), 160 processes, 64 MB of output and no GPUs, with no network
 (`network: false`). The 160 processes are the box's 128 and room for exec
 and isolate. `limits_from` raises them from each run's own limits, so the
@@ -817,7 +892,7 @@ all come from the cache compiles nothing. A batch of several programs of
 different sources compiles each, so it may need more; the forge does not
 yet add it per source.
 
-Memory goes to `memory_limit + 256` MB, never under the 1136 MB the
+Memory goes to `memory_limit + 256` MB, never under the 1648 MB the
 compile box needs: room for the step wrapper, exec and isolate beside the
 box. The copies of the program and the named files
 in the box's tmpfs are charged to exec, not the box, and the forge's
@@ -835,16 +910,20 @@ is the one that stops a run.
 
 ## The program format
 
-A compiled program is one file, in one of three formats. exec writes
+A compiled program is one file, in one of four formats. exec writes
 them from the compile, and tells them apart by their content: an ELF
 header, or a zip holding a `__main__.py` at its root, or a zip holding a
-jar manifest.
+jar manifest, or a zip whose comment names one of its files.
 
 | Language | The program | How exec runs it |
 |---|---|---|
 | `c`, `cpp` | A statically linked ELF executable | Its copy marked executable and run directly |
 | `python`, `ipynb` | A Python zip application behind the line `#!/usr/bin/env python3`: the source folder under `source/` with its layout, a notebook entry as its Python, and a `__main__.py` at the root that runs the entry | `/env/bin/python3 -I -B program` on its copy |
-| `java` | A runnable jar: the compiled classes and a manifest naming the main class | `java -Xmx<memory_limit>m -Xss64m -XX:+UseSerialGC -XX:-UsePerfData -XX:+ExitOnOutOfMemoryError -Djava.io.tmpdir=. -jar program`, using `/env/bin/java` from its lock |
+| `java` | A runnable jar: the compiled classes and a manifest naming the main class | `java -Xmx<memory_limit>m -Xss64m -XX:+UseSerialGC -XX:-UsePerfData -XX:+ExitOnOutOfMemoryError -XX:ActiveProcessorCount=2 -Djava.io.tmpdir=. -cp program:/env/lib/java/* <main class>`, using `/env/bin/java` from its lock |
+| `kotlin` | A jar as Java's, its manifest naming the class with main | As Java's, with the Kotlin library on the class path |
+| `rust` | An ELF executable | As C's |
+| `csharp` | A folder, stored: `main.dll` and its `main.runtimeconfig.json` | Unpacked into the box as `/box/program`, then `/env/lib/dotnet/dotnet /box/program/main.dll` |
+| `javascript`, `typescript`, `r`, `ruby` | A folder, stored: the sources as laid out, TypeScript's compiled, the comment naming the entry | Unpacked into the box as `/box/program`, with the `node_modules` link beside it, then `node --max-old-space-size=<memory_limit>`, `Rscript` or `ruby` on the entry |
 
 The Python program's `__main__.py` puts the entry's folder inside the
 archive first on `sys.path` and runs the entry's code as a fresh
@@ -936,7 +1015,7 @@ docker build -t primitive-exec:test-container --build-arg IMAGE=primitive-exec:t
   -f tests/Dockerfile .
 docker run --rm --privileged --ulimit=nofile=1024:1048576 \
   --ulimit=stack=8388608:-1 --env=UNICON_BOX_USERS=60000-60009 \
-  --env=UNICON_STEP_MEMORY_MB=1136 -v "$PWD:/src:ro" \
+  --env=UNICON_STEP_MEMORY_MB=1648 -v "$PWD:/src:ro" \
   primitive-exec:test-container python3 tests/userns.py pytest -p no:cacheprovider \
   tests/test_exec.py tests/test_compile.py
 ```
@@ -960,16 +1039,17 @@ two `uses:` lines and `runner-ref` together.
 
 ## Releasing
 
-Version 2 is retired. Version 3 requires a task lock and the machine cache,
-and the image no longer supplies task toolchains. Build on runner 0.12.0’s
-primitive-base after that release is available.
+Versions 2 and 3 are retired. Version 4 reads only version 3 of a task's
+lock, with its Maven and npm packages, and adds Kotlin, JavaScript,
+TypeScript, C#, Rust, R and Ruby. Build on the runner release that counts
+`store/files` among a folder's store entries.
 
-Push a tag `v3.0.0` on `main`. The tag's major is the version at the forge:
-`v3.0.0` is a release of `unicon/exec@v3`, so a change to the ports is a new
+Push a tag `v4.0.0` on `main`. The tag's major is the version at the forge:
+`v4.0.0` is a release of `unicon/exec@v4`, so a change to the ports is a new
 major. The shared release workflow refuses a tag whose commit is not
 on `main` and a tag that differs from the version in `pyproject.toml`. It
 runs the same checks as CI, pushes the image as
-`ghcr.io/uniconhq/primitive-exec:v3.0.0`, and creates a GitHub release
+`ghcr.io/uniconhq/primitive-exec:v4.0.0`, and creates a GitHub release
 with `images.json`, which names the image by digest in the same shape as the
 runner's, and `primitive.yaml` attached, and the digest in the notes.
 `deploy/images.json` pins that digest, and bootstrap writes it into the

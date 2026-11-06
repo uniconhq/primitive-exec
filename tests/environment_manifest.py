@@ -15,7 +15,7 @@ import stat
 from pathlib import Path
 
 CACHE = Path("/cache")
-ENTRIES = ("conda", "uv/archive-v0", "wheels")
+ENTRIES = ("conda", "uv/archive-v0", "wheels", "files")
 
 
 def main() -> None:

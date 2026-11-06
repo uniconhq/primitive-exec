@@ -76,12 +76,14 @@ def key(
     sources: Sources,
     source: Path,
     environment: str,
+    packages: list[str],
 ) -> str:
     """The key of a compile: the SHA-256 of a canonical JSON of the
     toolchain line, the language, the fingerprint of the locked
-    `environment` it compiles in, what was given the compiler, and each
-    file of the prepared copy at `source`, its path and its SHA-256, by
-    path."""
+    `environment` it compiles in, the conda `packages` the task asked for
+    by name, which a C or C++ program is linked against and the
+    fingerprint does not hold, what was given the compiler, and each file
+    of the prepared copy at `source`, its path and its SHA-256, by path."""
     files = [[path, file_sha256(source / path)] for path in sources.files]
     document = {
         "toolchain": tools,
@@ -91,6 +93,7 @@ def key(
         "main_class": sources.main_class,
         "files": sorted(files),
         "environment": environment,
+        "packages": sorted(packages),
     }
     text = json.dumps(document, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()

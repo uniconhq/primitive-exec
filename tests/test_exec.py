@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from exec import box, inputs, programs, report, shared
+from exec.compile import recipes
 from exec.compile.build import Built
 from exec.compile.environment import Toolchain
 from exec.main import main
@@ -98,37 +99,42 @@ def test_the_time_limit_in_milliseconds_is_rounded_up(limit: float, ms: int) -> 
 
 
 OVER = shared.OUTPUT_LIMIT + 1
-JUDGED: list[tuple[dict[str, Any], str, str]] = [
-    ({}, "native", "accepted"),
+JUDGED: list[tuple[dict[str, Any], int | None, str]] = [
+    ({}, None, "accepted"),
     (
         {"status": "SG", "returncode": -9, "out_of_memory": True},
-        "native",
+        None,
         "memory_limit",
     ),
-    ({"status": "RE", "returncode": 1, "no_inodes": True}, "native", "memory_limit"),
-    ({"no_inodes": True}, "native", "memory_limit"),
-    ({"status": "TO", "returncode": -9}, "native", "time_limit"),
+    ({"status": "RE", "returncode": 1, "no_inodes": True}, None, "memory_limit"),
+    ({"no_inodes": True}, None, "memory_limit"),
+    ({"status": "TO", "returncode": -9}, None, "time_limit"),
     (
         {"status": "SG", "returncode": -13, "output_bytes": OVER},
-        "python",
+        None,
         "output_limit",
     ),
-    ({"output_bytes": OVER}, "native", "output_limit"),
-    ({"status": "RE", "returncode": 3}, "java", "memory_limit"),
-    ({"status": "RE", "returncode": 3}, "native", "runtime_error"),
-    ({"status": "SG", "returncode": -11}, "native", "runtime_error"),
-    ({"status": "RE", "returncode": 127}, "native", "runtime_error"),
-    ({"status": "TO", "out_of_memory": True}, "native", "memory_limit"),
-    ({"status": "TO", "output_bytes": OVER}, "native", "time_limit"),
+    ({"output_bytes": OVER}, None, "output_limit"),
+    ({"status": "RE", "returncode": 3}, 3, "memory_limit"),
+    ({"status": "RE", "returncode": 3}, None, "runtime_error"),
+    ({"status": "SG", "returncode": -6}, -6, "memory_limit"),
+    ({"status": "SG", "returncode": -6}, None, "runtime_error"),
+    ({"status": "SG", "returncode": -11}, None, "runtime_error"),
+    ({"status": "RE", "returncode": 127}, None, "runtime_error"),
+    ({"status": "TO", "out_of_memory": True}, None, "memory_limit"),
+    ({"status": "TO", "output_bytes": OVER}, None, "time_limit"),
 ]
 """Runs and how `judge` ends each, one of every way it decides, and the order
 between them."""
 
 
-@pytest.mark.parametrize(("changes", "kind", "outcome"), JUDGED)
-def test_judge(changes: dict[str, Any], kind: str, outcome: str) -> None:
-    """Memory first, then time, then output, then how the program ended."""
-    assert report.judge(make_run(**changes), kind) == outcome
+@pytest.mark.parametrize(("changes", "out_of_memory", "outcome"), JUDGED)
+def test_judge(
+    changes: dict[str, Any], out_of_memory: int | None, outcome: str
+) -> None:
+    """Memory first, then time, then output, then how the program ended, a
+    runtime's own out-of-memory exit code among them."""
+    assert report.judge(make_run(**changes), out_of_memory) == outcome
 
 
 def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
@@ -137,7 +143,7 @@ def test_the_declaration_says_what_each_outcome_it_reports_means() -> None:
     when, for the workflow editor's drawer.
     """
     reported = {
-        report.judge(make_run(**changes), kind) for changes, kind, _ in JUDGED
+        report.judge(make_run(**changes), code) for changes, code, _ in JUDGED
     } | {
         report.verdict_outcome(verdict) for verdict in ("0", "1", *report.VERDICT_WORDS)
     }
@@ -170,8 +176,10 @@ def test_the_declaration_says_every_outcome_judge_can_give() -> None:
     assert set(outcomes) == found | returned_outcomes(report.reported)
 
 
-def test_detect(tmp_path: Path) -> None:
-    """The three formats are told apart by content, and anything else is an error."""
+def test_a_program_is_checked_against_its_languages_format(tmp_path: Path) -> None:
+    """Each format is told by content, and a program the cache gave back
+    that is not in its language's format is an error; the start a jar or a
+    folder program names is read from it."""
     native = tmp_path / "native"
     native.write_bytes(b"\x7fELF" + bytes(60))
     python = tmp_path / "python"
@@ -179,14 +187,21 @@ def test_detect(tmp_path: Path) -> None:
         archive.writestr("__main__.py", "print(1)\n")
     java = tmp_path / "java"
     with zipfile.ZipFile(java, "w") as archive:
-        archive.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n")
+        archive.writestr("META-INF/MANIFEST.MF", "Main-Class: app.Main\r\n")
+    folder = tmp_path / "folder"
+    with zipfile.ZipFile(folder, "w") as archive:
+        archive.comment = b"lib/main.rb"
+        archive.writestr("lib/main.rb", "puts 1\n")
     other = tmp_path / "other"
     other.write_text("#!/bin/sh\necho hi\n")
-    assert programs.detect(native) == "native"
-    assert programs.detect(python) == "python"
-    assert programs.detect(java) == "java"
+    assert recipes.start_of("rust", native) is None
+    assert recipes.start_of("python", python) is None
+    assert recipes.start_of("kotlin", java) == "app.Main"
+    assert recipes.start_of("ruby", folder) == "lib/main.rb"
     with pytest.raises(shared.PrimitiveError, match="not a native executable"):
-        programs.detect(other)
+        recipes.start_of("c", other)
+    with pytest.raises(shared.PrimitiveError, match="not a folder of files"):
+        recipes.start_of("javascript", java)
 
 
 @pytest.mark.parametrize(
@@ -199,7 +214,7 @@ def test_detect(tmp_path: Path) -> None:
         ({"source": {"folder": "in/.."}}, "source of run main-1 is outside"),
         ({"source": {"file": "in/1/source"}}, "source of run main-1 is not a folder"),
         ({"source": {"folder": "in/none"}}, "source of run main-1 is not in the"),
-        ({"language": "rust"}, "language of run main-1 is not one of c, cpp,"),
+        ({"language": "go"}, "language of run main-1 is not one of c, cpp,"),
         ({"entry": 3}, "the input named entry of run main-1 is not text"),
         ({"stdin": {"file": "in/none"}}, "stdin of run main-1 is not in the working"),
         ({"stdin": "in/2/input"}, "stdin of run main-1 is not a file"),
@@ -582,7 +597,7 @@ def test_a_program_in_no_known_format_is_an_error(
 ) -> None:
     """A program exec cannot run is the step failing, not the contestant."""
     built_as(monkeypatch, b"#!/bin/sh\n")
-    batch_inputs(tmp_path, "", [("main-1", "")])
+    batch_inputs(tmp_path, "", [("main-1", "")], language="c")
     main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert "not a native executable" in result["error"]
@@ -861,7 +876,7 @@ def test_a_native_binary_the_kernel_will_not_run_is_a_runtime_error(
     boxes: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     built_as(monkeypatch, b"\x7fELF" + bytes(60))
-    batch_inputs(tmp_path, "", [("main-1", "")])
+    batch_inputs(tmp_path, "", [("main-1", "")], language="c")
     main(["exec", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     outputs = by_run(result)["main-1"]
@@ -1245,9 +1260,9 @@ def test_two_steps_at_once_share_a_process_count_only_on_the_same_users(
             (cgroup / inner).rmdir()
         cgroup.rmdir()
     if apart:
-        assert min(forked) >= box.PROCESS_LIMIT - 8, forked
+        assert min(forked) >= recipes.PROCESSES - 8, forked
     else:
-        assert sum(forked) <= box.PROCESS_LIMIT + 8, forked
+        assert sum(forked) <= recipes.PROCESSES + 8, forked
 
 
 def test_a_box_a_dead_step_left_mounted_does_not_stop_the_next(
@@ -1926,9 +1941,11 @@ def test_a_cached_file_is_read_through_the_steps_cache_link(tmp_path: Path) -> N
     found = (tmp_path / "cache" / "items" / "step-k2" / "Wq81").resolve()
     assert item.files == {"train.csv": found / "train.csv"}
     assert item.cached == found
-    program = tmp_path / "program"
-    program.write_bytes(b"x" * 5000)
-    assert box.box_size_kb(item, program) == item.memory_limit_kb + 8
+    assert box.box_size_kb(item, 8, recipes.recipe("c")) == item.memory_limit_kb + 8
+    assert (
+        box.box_size_kb(item, 8, recipes.recipe("r"))
+        == item.memory_limit_kb + 72 * 1024 + 8
+    )
     assert box.cache_binding(item.cached) == [f"--dir=cache={found}:noexec"]
     assert box.cache_binding(None) == []
 

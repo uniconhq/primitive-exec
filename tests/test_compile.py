@@ -9,6 +9,7 @@ skipped elsewhere and run in the privileged test container
 """
 
 import contextlib
+import dataclasses
 import errno
 import json
 import os
@@ -27,11 +28,14 @@ from exec import box
 from exec.compile import (
     build,
     cache,
+    dotnet,
     environment,
     java,
+    native,
     notebook,
     prepare,
     python,
+    recipes,
     shared,
 )
 from exec.compile.environment import Lock, Toolchain
@@ -195,19 +199,112 @@ def test_java_declarations(
 
 
 @pytest.mark.parametrize(
-    ("name", "suffix", "used"),
+    ("text", "name", "found"),
     [
-        ("main.cpp", ".cpp", "main.cpp"),
-        ("solution_2.c", ".c", "solution_2.c"),
-        ("-o.c", ".c", "main.c"),
-        ("my file.py", ".py", "main.py"),
-        ("prog.c", ".cpp", "main.cpp"),
-        (".hidden.py", ".py", "main.py"),
+        ("fun main() {}\n", "solution.kt", "SolutionKt"),
+        ("package a.b\nfun main() {}\n", "src/my-sol.kt", "a.b.My_solKt"),
+        ('@file:JvmName("Run")\npackage a\nfun main() {}\n', "x.kt", "a.Run"),
+        ('// @file:JvmName("Run")\nfun main() {}\n', "x.kt", "XKt"),
+        ("fun main() {}\n", "1st.kt", "1stKt"),
     ],
 )
-def test_source_name(name: str, suffix: str, used: str) -> None:
-    """The contestant's file name is kept when it cannot be read as an option."""
-    assert prepare.source_name(Path("in") / name, suffix) == used
+def test_the_class_a_kotlin_entry_runs_is_its_files(
+    text: str, name: str, found: str
+) -> None:
+    """As kotlinc names a file's class: by its `@file:JvmName`, never one in
+    a comment, or else by its file's name, with its package."""
+    assert java.kotlin_class(text, name) == found
+
+
+@pytest.mark.parametrize(
+    ("code", "found"),
+    [
+        ("class P { static void Main() {} }", "P"),
+        (
+            "namespace A.B { class Outer { class P { static int Main() => 0; } } }",
+            "A.B.Outer.P",
+        ),
+        (
+            "namespace A;\nrecord struct R(int X);\n"
+            "static class P { static void Main() {} }",
+            "A.P",
+        ),
+        (
+            "class Q { void M() { } }\nclass P { public static async Task Main() {} }",
+            "P",
+        ),
+        ('System.Console.WriteLine("top-level");', None),
+    ],
+)
+def test_the_type_a_csharp_entry_runs_holds_its_main(
+    code: str, found: str | None
+) -> None:
+    """The first type the entry declares `static Main` in, with its
+    namespaces and the types around it, file-scoped namespaces too."""
+    assert dotnet.main_type(shared.code_only(code, "java")) == found
+
+
+def test_a_c_program_links_the_tasks_own_conda_packages_through_pkg_config(
+    tmp_path: Path,
+) -> None:
+    """A C or C++ program is linked statically, but one beside conda
+    packages the task asked for, which is linked against them in `/env`
+    with pkg-config's flags for each `.pc` file they install, a header-only
+    one too, read in the box; a package with none adds nothing."""
+    folder = tmp_path / "env"
+    (folder / "bin").mkdir(parents=True)
+    (folder / "bin/g++").write_text("")
+    (folder / "conda-meta").mkdir()
+    installed = {
+        "gtest": [
+            "lib/libgtest.so",
+            "lib/pkgconfig/gtest.pc",
+            "lib/pkgconfig/gtest_main.pc",
+        ],
+        "eigen": ["include/eigen3/Eigen/Core", "share/pkgconfig/eigen3.pc"],
+        "libboost-headers": ["include/boost/version.hpp"],
+        "pkg-config": ["bin/pkg-config", "lib/pkgconfig/other.pc"],
+    }
+    for name, files in installed.items():
+        record = {"name": name, "files": files}
+        (folder / "conda-meta" / f"{name}-1-0.json").write_text(json.dumps(record))
+    sources = shared.Sources(["main.cpp"], ["main.cpp"], "main.cpp")
+    alone = Lock("a" * 64, "linux-64", {}, [])
+    line = native.command(sources, "cpp", "/box/out/program", folder, alone)
+    assert line[0] == "/env/bin/g++" and "-static" in line
+    beside = Lock("a" * 64, "linux-64", {}, [], packages=["gtest", "eigen"])
+    shell = native.command(sources, "cpp", "/box/out/program", folder, beside)
+    assert shell[:2] == ["/bin/sh", "-c"]
+    assert "pkg-config --cflags --libs eigen3 gtest gtest_main)" in shell[2]
+    compiler = shell[4:]
+    assert compiler[0] == "/env/bin/g++" and "-static" not in compiler
+    assert ["-I/env/include", "-L/env/lib", "-Wl,-rpath,/env/lib"] == [
+        flag for flag in compiler if flag.startswith(("-I/", "-L", "-Wl"))
+    ]
+    headers = Lock("a" * 64, "linux-64", {}, [], packages=["libboost-headers"])
+    plain = native.command(sources, "cpp", "/box/out/program", folder, headers)
+    assert plain[0] == "/env/bin/g++" and "-I/env/include" in plain
+
+
+@pytest.mark.parametrize(
+    ("name", "language", "used"),
+    [
+        ("main.cpp", "cpp", "main.cpp"),
+        ("solution.cc", "cpp", "solution.cc"),
+        ("solution_2.c", "c", "solution_2.c"),
+        ("-o.c", "c", "main.c"),
+        ("my file.py", "python", "main.py"),
+        ("prog.c", "cpp", "main.cpp"),
+        (".hidden.py", "python", "main.py"),
+        ("app.mjs", "javascript", "app.mjs"),
+        ("app.txt", "r", "main.R"),
+    ],
+)
+def test_source_name(name: str, language: str, used: str) -> None:
+    """The contestant's file name is kept when it is of one of the
+    language's extensions and cannot be read as an option."""
+    extensions = recipes.recipe(language).extensions
+    assert prepare.source_name(Path("in") / name, extensions) == used
 
 
 @pytest.mark.parametrize(
@@ -254,13 +351,26 @@ def test_argument(path: str, used: str) -> None:
         ("python", "if '__main__' == __name__:\n    main()\n", True),
         ("python", "def main():\n    pass\nmain()\n", False),
         ("python", '    if __name__ == "__main__":\n        pass\n', False),
+        ("kotlin", "fun main() {\n    println(1)\n}\n", True),
+        ("kotlin", "fun main(args: Array<String>) = Unit\n", True),
+        ("kotlin", 'val s = "fun main("\nfun helper() {}\n', False),
+        ("kotlin", "x.fun main(\n", False),
+        ("rust", "fn main() {\n}\n", True),
+        ("rust", "// fn main() {}\nfn helper() {}\n", False),
+        ("csharp", "class P { static void Main() {} }\n", True),
+        (
+            "csharp",
+            "class P { public static async Task<int> Main(string[] a) {} }\n",
+            True,
+        ),
+        ("csharp", "class P { void Main() {} }\n", False),
     ],
 )
 def test_holds_main(tmp_path: Path, language: str, text: str, holds: bool) -> None:
     """A file holds main by the language's own sign of a program's start."""
     path = tmp_path / "source"
     path.write_text(text)
-    assert prepare.holds_main(path, language) is holds
+    assert prepare.holds_main(path, recipes.recipe(language)) is holds
 
 
 @pytest.mark.parametrize(
@@ -306,7 +416,7 @@ def test_reading_a_source_takes_linear_time(
     path = tmp_path / "source"
     path.write_text(text)
     started = time.monotonic()
-    prepare.holds_main(path, language)
+    prepare.holds_main(path, recipes.recipe(language))
     if language == "java":
         java.java_declarations(text)
     assert time.monotonic() - started < 1
@@ -337,7 +447,7 @@ def test_a_folder_that_cannot_be_prepared_compiles_nothing(tmp_path: Path) -> No
         tmp_path / "work",
         toolchain=Toolchain(
             tmp_path,
-            Lock("a" * 64, "linux-64", {}, [], []),
+            Lock("a" * 64, "linux-64", {}, []),
             contextlib.ExitStack(),
         ),
     )
@@ -406,8 +516,9 @@ def test_find_entry(
 ) -> None:
     """With no entry named, the one source, or else the one holding main."""
     folder = make_folder(tmp_path / "f", files)
-    sources = [name for name in files if name.endswith(shared.EXTENSIONS[language])]
-    assert prepare.find_entry(folder, sorted(sources), language) == entry
+    own = recipes.recipe(language)
+    sources = [name for name in files if name.endswith(own.extensions)]
+    assert prepare.find_entry(folder, sorted(sources), own) == entry
 
 
 @pytest.mark.parametrize(
@@ -424,6 +535,11 @@ def test_find_entry(
             "a.c, b.c each define main",
         ),
         ({"notes.txt": "", "data.txt": ""}, "java", "holds no Java source file"),
+        (
+            {"a.rb": "puts 1", "b.rb": "puts 2"},
+            "ruby",
+            "holds 2 Ruby sources; name the one to run",
+        ),
     ],
 )
 def test_an_entry_that_is_not_clear_is_a_compile_error(
@@ -431,9 +547,10 @@ def test_an_entry_that_is_not_clear_is_a_compile_error(
 ) -> None:
     """None or several candidates ask for the entry to be named."""
     folder = make_folder(tmp_path / "f", files)
-    sources = [name for name in files if name.endswith(shared.EXTENSIONS[language])]
+    own = recipes.recipe(language)
+    sources = [name for name in files if name.endswith(own.extensions)]
     with pytest.raises(shared.CompileError, match=message):
-        prepare.find_entry(folder, sorted(sources), language)
+        prepare.find_entry(folder, sorted(sources), own)
 
 
 @pytest.mark.parametrize(
@@ -778,19 +895,23 @@ def test_a_cell_that_is_not_an_object_is_passed_over() -> None:
 def test_the_cache_key_is_the_compile_and_nothing_else(tmp_path: Path) -> None:
     """Two folders that prepare to the same copy share a key, as one file
     whose name could be an option and one already named `main.py`; a
-    change to a file's bytes, its path, the entry, the toolchain or the
-    locked environment's fingerprint does not."""
+    change to a file's bytes, its path, the entry, the toolchain, the
+    locked environment's fingerprint or the packages the task asked for by
+    name does not, though their order does not count."""
 
     def key_of(
         files: dict[str, str],
         tools: str = "t",
         entry: str | None = None,
         fingerprint: str = "a" * 64,
+        packages: tuple[str, ...] = (),
     ) -> str:
         root = tmp_path / str(len(list(tmp_path.iterdir())))
         folder = make_folder(root / "folder", files)
         sources = prepare.prepare(folder, root / "copy", "python", entry)
-        return cache.key(tools, "python", sources, root / "copy", fingerprint)
+        return cache.key(
+            tools, "python", sources, root / "copy", fingerprint, list(packages)
+        )
 
     files = {"a.py": 'if __name__ == "__main__": pass\n', "b.py": "x = 1\n"}
     first = key_of(files)
@@ -800,6 +921,10 @@ def test_the_cache_key_is_the_compile_and_nothing_else(tmp_path: Path) -> None:
     assert key_of(files, entry="b.py") != first
     assert key_of(files, tools="u") != first
     assert key_of(files, fingerprint="b" * 64) != first
+    gmock = key_of(files, packages=("gmock",))
+    both = key_of(files, packages=("gtest", "gmock"))
+    assert len({first, gmock, both}) == 3
+    assert key_of(files, packages=("gmock", "gtest")) == both
 
 
 def test_a_compile_the_cache_holds_assembles_no_toolchain(
@@ -820,10 +945,10 @@ def test_a_compile_the_cache_holds_assembles_no_toolchain(
     monkeypatch.setattr(environment, "assembled", unassembled)
     folder = make_folder(tmp_path / "folder", {"main.cpp": "int main() {}\n"})
     sources = prepare.prepare(folder, tmp_path / "copy", "cpp", None)
-    key = cache.key("tools", "cpp", sources, tmp_path / "copy", "a" * 64)
+    key = cache.key("tools", "cpp", sources, tmp_path / "copy", "a" * 64, [])
     cache.store(key, "compile_error", "cached log\n", None)
     toolchain = Toolchain(
-        tmp_path, Lock("a" * 64, "linux-64", {}, [], []), contextlib.ExitStack()
+        tmp_path, Lock("a" * 64, "linux-64", {}, []), contextlib.ExitStack()
     )
     built = build.build(folder, "cpp", None, tmp_path / "work", toolchain=toolchain)
     assert built == build.Built("cached log\n", None)
@@ -834,7 +959,9 @@ def test_a_changed_fingerprint_of_the_same_language_compiles_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The same source, its language's lock changed, is a miss: it is
-    compiled again in the new toolchain and stored beside the first."""
+    compiled again in the new toolchain and stored beside the first. So is
+    a lock of the same fingerprint asking for other packages by name,
+    which link the program with other flags."""
     machine = tmp_path / "cache"
     for name in ("programs", "locks"):
         (machine / name).mkdir(parents=True)
@@ -851,8 +978,13 @@ def test_a_changed_fingerprint_of_the_same_language_compiles_again(
     compiled_in: list[Path] = []
 
     def compiled(
-        sources: shared.Sources, copy: Path, language: str, work: Path, env: Path
+        sources: shared.Sources,
+        copy: Path,
+        language: str,
+        work: Path,
+        toolchain: Toolchain,
     ) -> build.Built:
+        env = toolchain.folder()
         compiled_in.append(env)
         return build.Built(f"compiled in {env.name}\n", None)
 
@@ -860,16 +992,19 @@ def test_a_changed_fingerprint_of_the_same_language_compiles_again(
     monkeypatch.setattr(build, "compile_sources", compiled)
     folder = make_folder(tmp_path / "folder", {"main.cpp": "int main() {}\n"})
 
-    def built(fingerprint: str, work: str) -> build.Built:
-        lock = environment.Lock(fingerprint, "linux-64", {}, [], [])
+    def built(
+        fingerprint: str, work: str, packages: tuple[str, ...] = ()
+    ) -> build.Built:
+        lock = environment.Lock(fingerprint, "linux-64", {}, [], packages=[*packages])
         toolchain = Toolchain(tmp_path, lock, contextlib.ExitStack())
         return build.build(folder, "cpp", None, tmp_path / work, toolchain=toolchain)
 
     assert built("a" * 64, "first").log == f"compiled in {'a' * 64}\n"
     assert built("a" * 64, "again").log == f"compiled in {'a' * 64}\n"
     assert built("b" * 64, "changed").log == f"compiled in {'b' * 64}\n"
-    assert compiled_in == [tmp_path / ("a" * 64), tmp_path / ("b" * 64)]
-    assert len(list((machine / "programs").iterdir())) == 2
+    assert built("a" * 64, "gtest", ("gtest",)).log == f"compiled in {'a' * 64}\n"
+    assert compiled_in == [tmp_path / name for name in ("a" * 64, "b" * 64, "a" * 64)]
+    assert len(list((machine / "programs").iterdir())) == 3
 
 
 @pytest.fixture
@@ -938,14 +1073,15 @@ def compile_step(
 
 PYTHON = os.path.realpath(sys.executable)
 """The image's interpreter, which the box sees under `/usr`."""
+PLAIN = recipes.recipe("python")
+"""A recipe of the compile limits every language but Kotlin has, and no
+compile environment of its own."""
 
 
 def test_the_log_is_cut_at_its_limit(compile_box: Path, tmp_path: Path) -> None:
     """A compiler that prints without end leaves a log of bounded size."""
     command = [PYTHON, "-c", "import sys; sys.stdout.write('e' * 300000)"]
-    tool = build.run_tool(
-        command, compile_box, tmp_path, environment=folder_for("python")
-    )
+    tool = build.run_tool(command, compile_box, tmp_path, folder_for("python"), PLAIN)
     assert tool.ok
     assert tool.log.startswith("e" * shared.LOG_LIMIT + "\n[compile log cut at")
     assert f"{300000 - shared.LOG_LIMIT} more bytes left out" in tool.log
@@ -961,9 +1097,7 @@ def test_a_compiler_that_runs_too_long_is_stopped(
         "-c",
         "import time; print('started', flush=True); time.sleep(30)",
     ]
-    tool = build.run_tool(
-        command, compile_box, tmp_path, environment=folder_for("python")
-    )
+    tool = build.run_tool(command, compile_box, tmp_path, folder_for("python"), PLAIN)
     assert not tool.ok
     assert (
         tool.log == "started\n\ncompiling took longer than 1 seconds and was stopped\n"
@@ -971,13 +1105,12 @@ def test_a_compiler_that_runs_too_long_is_stopped(
 
 
 def test_a_compiler_over_its_memory_is_stopped(
-    compile_box: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    compile_box: Path, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(build, "COMPILE_MEMORY_KB", 64 * 1024)
+    """A compile is held to its recipe's compile memory."""
+    small = dataclasses.replace(PLAIN, compile_memory_kb=64 * 1024)
     command = [PYTHON, "-c", "x = bytearray(256 << 20)"]
-    tool = build.run_tool(
-        command, compile_box, tmp_path, environment=folder_for("python")
-    )
+    tool = build.run_tool(command, compile_box, tmp_path, folder_for("python"), small)
     assert not tool.ok
     assert tool.log.endswith(
         "\ncompiling took more than 64 MB of memory and was stopped\n"
@@ -994,9 +1127,7 @@ def test_a_compiler_writing_a_file_over_the_limit_is_stopped(
         "import signal; signal.signal(signal.SIGXFSZ, signal.SIG_DFL);"
         " open('/tmp/big', 'wb').write(bytes(2 << 20))",
     ]
-    tool = build.run_tool(
-        command, compile_box, tmp_path, environment=folder_for("python")
-    )
+    tool = build.run_tool(command, compile_box, tmp_path, folder_for("python"), PLAIN)
     assert not tool.ok
     assert tool.log.endswith(shared.TOO_LARGE)
 
@@ -1006,9 +1137,7 @@ def test_a_command_line_too_long_to_start_is_a_compile_error(
 ) -> None:
     """Paths the contestant chose can make a command too long for the system."""
     command = [PYTHON, "-c", "pass", "x" * (256 * 1024)]
-    tool = build.run_tool(
-        command, compile_box, tmp_path, environment=folder_for("python")
-    )
+    tool = build.run_tool(command, compile_box, tmp_path, folder_for("python"), PLAIN)
     assert not tool.ok
     assert tool.log == "the source folder's paths are too long to compile\n"
 
@@ -1027,9 +1156,7 @@ def test_the_compiler_reads_the_source_and_cannot_change_it(
         "import os; print(os.getcwd(), open('main.c').read().strip(), flush=True);"
         " open('main.c', 'a')",
     ]
-    tool = build.run_tool(
-        command, compile_box, tmp_path, environment=folder_for("python")
-    )
+    tool = build.run_tool(command, compile_box, tmp_path, folder_for("python"), PLAIN)
     assert not tool.ok
     assert tool.log.startswith("/source int main(void) { return 0; }\n")
     assert "Read-only file system" in tool.log
@@ -1256,7 +1383,8 @@ def test_a_compile_stopped_at_a_limit_is_not_cached(
 ) -> None:
     """A busy machine can stop a compile another would finish, so the next
     step compiles again rather than read the stop from the cache."""
-    monkeypatch.setattr(build, "COMPILE_MEMORY_KB", 8 * 1024)
+    limited = dataclasses.replace(recipes.recipe("cpp"), compile_memory_kb=8 * 1024)
+    monkeypatch.setitem(recipes.RECIPES, "cpp", limited)
     name, text = SOURCES["cpp"]
     outputs = compile_step(tmp_path / "first", {name: text}, "cpp")
     assert outputs["main-1"]["log"].endswith("MB of memory and was stopped\n")
@@ -1289,8 +1417,10 @@ def test_a_program_left_as_a_link_is_no_program(
     out = box.BOX_ROOT / str(build.COMPILE_BOX) / "box" / "out"
     (out / "program").symlink_to("/etc/passwd")
     sources = shared.Sources(["main.c"], ["main.c"], "main.c")
+    lock = Lock("a" * 64, "linux-64", {}, [])
+    this = recipes.Compile(sources, compile_box, out, tmp_path, lock)
     tool = build.take_program(
-        build.Tool(0, ""), sources, compile_box, "c", out, tmp_path / "program"
+        build.Tool(0, ""), recipes.recipe("c"), this, tmp_path / "program"
     )
     assert tool == build.Tool(1, "the compiler wrote no program\n")
     assert not (tmp_path / "program").exists()
@@ -1309,21 +1439,19 @@ def test_a_program_that_cannot_be_written_is_a_compile_error_but_on_a_full_disk(
         raise raised
 
     monkeypatch.setattr(python, "write_zip_application", failed)
-    monkeypatch.setattr(build, "copy_plain", failed)
+    monkeypatch.setattr(recipes, "copy_plain", failed)
     name = "main.py" if language == "python" else "main.c"
     folder = make_folder(tmp_path / "folder", {name: "int main() {}\n"})
     sources = prepare.prepare(folder, tmp_path / "copy", language, None)
     (tmp_path / "out").mkdir()
     (tmp_path / "out/program").write_bytes(b"program")
 
+    lock = Lock("a" * 64, "linux-64", {}, [])
+    this = recipes.Compile(sources, tmp_path / "copy", tmp_path / "out", tmp_path, lock)
+
     def taken() -> build.Tool:
         return build.take_program(
-            build.Tool(0, ""),
-            sources,
-            tmp_path / "copy",
-            language,
-            tmp_path / "out",
-            tmp_path / "program",
+            build.Tool(0, ""), recipes.recipe(language), this, tmp_path / "program"
         )
 
     log = (

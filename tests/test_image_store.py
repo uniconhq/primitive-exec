@@ -1,7 +1,8 @@
-"""The image assembling the fixture lock into a cache of its own, as a
-machine's cache is: each folder made of hard links into the store, offline,
-file for file what exec 3.0.0 assembled but for what uv adds, and a second
-folder adding only its own files."""
+"""The image assembling the fixture lock of exec 3's languages into a cache
+of its own, as a machine's cache is: each folder made of hard links into
+the store, offline, file for file what exec 3.0.0 assembled but for what
+uv adds and the Maven jars it placed, and a second folder adding only its
+own files."""
 
 import hashlib
 import json
@@ -23,7 +24,7 @@ from support import (
     base_build_args,
     batch_inputs,
 )
-from toolchains import document, downloaded
+from toolchains import FIXTURE, document, downloaded
 
 pytestmark = pytest.mark.image
 
@@ -50,8 +51,8 @@ class Cache:
         self.image = image
         self.root = root
         self.platform = {"arm64": "linux-aarch64", "amd64": "linux-64"}[architecture]
-        self.lock = document(self.platform)
-        self.archives = downloaded(self.platform)
+        self.lock = document(self.platform, [FIXTURE])
+        self.archives = downloaded(self.platform, [FIXTURE])
         self.volume = "primitive-exec-store-" + secrets.token_hex(4)
         docker("volume", "create", self.volume)
 
@@ -202,12 +203,27 @@ def test_each_folder_matches_exec_3s_file_for_file_but_for_uvs_additions(
     """For the fixture lock, each folder holds what exec 3.0.0 assembled,
     path for path, each file's bytes, shebangs among them, and executable
     bit, and each link's target, but for what 6.7 names: uv's launchers in
-    `bin/`, each `dist-info`'s files uv writes, and the conda records. The
-    launchers name `/env`'s Python."""
+    `bin/`, each `dist-info`'s files uv writes, and the conda records; and
+    the Maven jars in `lib/java/`, which exec 3 had no lock to place. The
+    launchers name `/env`'s Python. exec 3.0.0 is given its own lock
+    version, 2, of the same conda packages and wheels."""
+    languages = store_cache.lock["languages"]
+    reference_lock = store_cache.lock | {
+        "version": 2,
+        "languages": {
+            name: {key: value for key, value in entry.items() if key != "maven"}
+            for name, entry in languages.items()
+        },
+    }
+    jars = {
+        f"lib/java/{jar['file_name']}"
+        for entry in languages.values()
+        for jar in entry.get("maven", [])
+    }
     volume = "primitive-exec-reference-" + secrets.token_hex(4)
     docker("volume", "create", volume)
     try:
-        store_cache.assemble(store_cache.lock, image=reference_image, volume=volume)
+        store_cache.assemble(reference_lock, image=reference_image, volume=volume)
         reference = store_cache.manifest(volume)["folders"]
     finally:
         docker("volume", "rm", "--force", volume)
@@ -226,6 +242,9 @@ def test_each_folder_matches_exec_3s_file_for_file_but_for_uvs_additions(
         after = {path: shape(found) for path, found in new["paths"].items()}
         for path in set(before) | set(after):
             if own(path):
+                continue
+            if path in jars or path == "lib/java":
+                assert path not in before
                 continue
             if path not in before:
                 assert path in new["launchers"], f"{path} is new in the folder"

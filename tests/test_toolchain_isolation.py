@@ -1,4 +1,4 @@
-"""A Python package change does not invalidate a locked C++ compile."""
+"""A Python package change does not invalidate a locked C compile."""
 
 import hashlib
 import json
@@ -12,16 +12,16 @@ from support import RunImage, batch_inputs, by_run, printed
 pytestmark = pytest.mark.image
 
 
-def test_a_python_package_change_reuses_the_cpp_program_without_its_toolchain(
+def test_a_python_package_change_reuses_the_c_program_without_its_toolchain(
     tmp_path: Path, run_image: RunImage, capfd: pytest.CaptureFixture[str]
 ) -> None:
     work = tmp_path / "work"
-    source = '#include <iostream>\nint main() { std::cout << 731 << "\\n"; }\n'
-    batch_inputs(work, source, [("isolation", "")], language="cpp", memory_limit=128)
+    source = '#include <stdio.h>\nint main(void) { printf("731\\n"); }\n'
+    batch_inputs(work, source, [("isolation", "")], language="c", memory_limit=128)
     first = by_run(run_image(work))
     assert first["isolation"]["outcome"] == "accepted"
     assert printed(work, first["isolation"]) == "731\n"
-    assert "compiled the cpp source" in capfd.readouterr().err
+    assert "compiled the c source" in capfd.readouterr().err
 
     wheel = work / "in/extra.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -50,5 +50,5 @@ def test_a_python_package_change_reuses_the_cpp_program_without_its_toolchain(
     assert second["isolation"]["outcome"] == "accepted"
     assert printed(work, second["isolation"]) == "731\n"
     log = capfd.readouterr().err
-    assert "took the compiled program" in log and "compiled the cpp source" not in log
+    assert "took the compiled program" in log and "compiled the c source" not in log
     assert "reused environment" not in log and "assembled environment" not in log

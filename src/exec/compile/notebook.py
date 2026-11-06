@@ -7,12 +7,31 @@ import json
 import tokenize
 from pathlib import Path
 
-from exec.compile.shared import BINARY_LIMIT, CompileError
+from exec.compile.shared import BINARY_LIMIT, CompileError, Sources
+from exec.shared import no_room
 
 NOTEBOOK_FORMAT = 4
 MAGIC_STARTS = ("%", "!")
 """What starts a line IPython reads as a magic or a shell command, which no
 Python runs: there is no IPython when a notebook's program runs."""
+
+
+def joined(sources: Sources, copy: Path) -> Sources:
+    """The sources once the entry, a notebook, is replaced in the copy at
+    `copy` by its code cells, joined into one Python file under the
+    notebook's name, and checked with the folder's Python files."""
+    notebook = copy / sources.entry
+    try:
+        code = notebook_code(read_notebook(notebook, sources.entry), sources.entry)
+        notebook.write_text(code, encoding="utf-8")
+    except OSError as error:
+        if full := no_room(error):
+            raise full from error
+        raise CompileError(
+            f"the notebook could not be read to compile it: {error.strerror}"
+        ) from None
+    modules = [path for path in sources.files if path.endswith(".py")]
+    return Sources(sources.files, [sources.entry, *modules], sources.entry)
 
 
 def read_notebook(path: Path, name: str) -> str:

@@ -1,39 +1,26 @@
-"""What every part of compiling shares: the languages, the caps on the log
-and the program, the error a source that cannot compile raises, the
-sources as prepared, reading a source's code without its comments and
-literals, and copying a plain file out of a box or the cache.
+"""What every part of compiling shares: the caps on the log and the
+program, the error a source that cannot compile raises, the sources as
+prepared, reading a source's code without its comments and literals,
+copying a plain file out of a box or the cache, reading the plain files a
+box wrote, and writing a folder program.
 """
 
 import hashlib
 import os
 import re
 import stat
+import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-LANGUAGES = ("c", "cpp", "java", "python", "ipynb")
-LANGUAGE_NAMES = {
-    "c": "C",
-    "cpp": "C++",
-    "java": "Java",
-    "python": "Python",
-    "ipynb": "notebook",
-}
-EXTENSIONS = {
-    "c": (".c",),
-    "cpp": (".cpp", ".cc", ".cxx"),
-    "java": (".java",),
-    "python": (".py",),
-    "ipynb": (".ipynb",),
-}
-"""The files of a folder that are compiled as the language's sources."""
 LOG_LIMIT = 64 * 1024
 BINARY_LIMIT = 32 * 1024 * 1024
 TOO_LARGE = "the program would be larger than 32 MB\n"
-"""What the log ends with when the program is over `BINARY_LIMIT`: the zip
-application and the jar are written by exec, which the compiler's
-file-size limit does not hold, so their size is checked once they are
-written, and a write that fails is taken as one over it."""
+"""What the log ends with when the program is over `BINARY_LIMIT`: a zip
+application, a jar or a folder program is written by exec, which the
+compiler's file-size limit does not hold, so its size is checked once it
+is written, and a write that fails is taken as one over it."""
 PLAIN_START = re.compile(r"[A-Za-z0-9_]")
 C_LITERAL = (
     r'"[^"\\\n]*+(?:\\.[^"\\\n]*+)*+"?'
@@ -141,3 +128,44 @@ def copy_plain(origin: Path, target: Path) -> str:
                 if copy.tell() > BINARY_LIMIT:
                     raise ValueError(f"{origin.name} grew past 32 MB")
     return digest.hexdigest()
+
+
+def plain_folder(path: Path) -> bool:
+    """Whether `path` is a folder and not a link to one."""
+    try:
+        return stat.S_ISDIR(path.lstat().st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def plain_files(folder: Path) -> list[tuple[str, Path]]:
+    """Every plain file under `folder`, by its path relative to it, in
+    order; links and folders reached through links are passed over. No
+    process of the box is left to change the tree as it is read."""
+    found: list[tuple[str, Path]] = []
+    if not plain_folder(folder):
+        return found
+    for directory, _, names in folder.walk():
+        for name in names:
+            path = directory / name
+            if stat.S_ISREG(path.lstat().st_mode):
+                found.append((path.relative_to(folder).as_posix(), path))
+    return sorted(found)
+
+
+def write_folder(
+    files: list[tuple[str, Path]],
+    target: Path,
+    start: str,
+    written: Mapping[str, bytes] | None = None,
+) -> None:
+    """Write a folder program to `target`: each file, `(its path in the
+    folder, where it is)`, and each of `written`, by its path, stored as
+    they are, so the folder's size in a box is what they hold, and the
+    file the run starts from as the archive's comment."""
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_STORED) as archive:
+        archive.comment = start.encode("utf-8")
+        for name, path in files:
+            archive.write(path, name)
+        for name, content in (written or {}).items():
+            archive.writestr(name, content)

@@ -8,7 +8,7 @@ forms:
   one:
     description: Compiles a program once, runs it under limits and records its output, time and memory.
     outputs_from: manifest
-    limits: {time_ms: 2000, cpu_ms: 2000, memory_mb: 1136, pids: 160, output_mb: 64, gpus: 0, once_time_ms: 40000}
+    limits: {time_ms: 2000, cpu_ms: 2000, memory_mb: 1648, pids: 160, output_mb: 64, gpus: 0, once_time_ms: 40000}
     limits_from:
       time_ms: {input: time_limit, scale: 2000, add: 3000}
       cpu_ms: {input: time_limit, scale: 2000, add: 3000}
@@ -24,7 +24,7 @@ forms:
         description: The program's source files, with their layout.
       language:
         type: enum
-        options: [c, cpp, java, python, ipynb]
+        options: [c, cpp, java, kotlin, python, ipynb, javascript, typescript, csharp, rust, r, ruby]
         description: The language the source is written in; ipynb is a Jupyter notebook.
       entry:
         type: text
@@ -113,11 +113,11 @@ forms:
   programs:
     description: Compiles programs once, runs them side by side, linked by pipes, each under its own limits, and records how each one ended.
     outputs_from: programs
-    limits: {time_ms: 4000, cpu_ms: 4000, memory_mb: 1136, pids: 1056, output_mb: 64, gpus: 0, once_time_ms: 40000}
+    limits: {time_ms: 4000, cpu_ms: 4000, memory_mb: 1648, pids: 1056, output_mb: 64, gpus: 0, once_time_ms: 40000}
     limits_from:
       time_ms: {max: programs.time_limit, scale: 4000, add: 6000}
       cpu_ms: {max: programs.time_limit, scale: 4000, add: 6000}
-      memory_mb: {sum: programs.memory_limit, add: 512}
+      memory_mb: {sum: programs.memory_limit, add: 1024}
     inputs:
       environment:
         type: file
@@ -133,7 +133,7 @@ forms:
             description: The program's source files, with their layout.
           language:
             type: enum
-            options: [c, cpp, java, python, ipynb]
+            options: [c, cpp, java, kotlin, python, ipynb, javascript, typescript, csharp, rust, r, ruby]
             description: The language the source is written in; ipynb is a Jupyter notebook.
           entry:
             type: text
@@ -211,7 +211,7 @@ forms:
           compile_error: a program's source does not compile, so nothing runs
   build:
     description: Compiles a program and runs nothing, so saving a task can check that its programs compile.
-    limits: {time_ms: 1000, cpu_ms: 1000, memory_mb: 1136, pids: 160, output_mb: 64, gpus: 0, once_time_ms: 40000}
+    limits: {time_ms: 1000, cpu_ms: 1000, memory_mb: 1648, pids: 160, output_mb: 64, gpus: 0, once_time_ms: 40000}
     inputs:
       environment:
         type: file
@@ -223,7 +223,7 @@ forms:
         description: The program's source files, with their layout.
       language:
         type: enum
-        options: [c, cpp, java, python, ipynb]
+        options: [c, cpp, java, kotlin, python, ipynb, javascript, typescript, csharp, rust, r, ruby]
         description: The language the source is written in; ipynb is a Jupyter notebook.
       entry:
         type: text
