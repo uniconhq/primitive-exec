@@ -28,6 +28,7 @@ from support import (
     STEP_MEMORY_MB,
     Check,
     RunImage,
+    a_wheel,
     batch_inputs,
     by_run,
     container_limits,
@@ -1074,7 +1075,6 @@ def test_a_locked_wheel_is_importable_by_the_box_user_from_read_only_env(
 ) -> None:
     import hashlib
     import secrets
-    import zipfile
 
     from conftest import docker
 
@@ -1088,8 +1088,9 @@ print('42')
     batch_inputs(work, source, [("main-wheel", "")], memory_limit=128)
     piece = work / "cache/pieces/wheel"
     piece.parent.mkdir(parents=True)
-    with zipfile.ZipFile(piece, "w") as archive:
-        archive.writestr("example/__init__.py", "answer = 42\n")
+    a_wheel(piece.parent, "example", {"example/__init__.py": "answer = 42\n"}).rename(
+        piece
+    )
     digest = hashlib.sha256(piece.read_bytes()).hexdigest()
     import shutil
 
@@ -1102,7 +1103,13 @@ print('42')
     entry["fingerprint"] = hashlib.sha256(
         (entry["fingerprint"] + digest).encode()
     ).hexdigest()
-    entry["pypi"].append({"sha256": digest, "size": piece.stat().st_size})
+    entry["pypi"].append(
+        {
+            "sha256": digest,
+            "file_name": "example-1.0-py3-none-any.whl",
+            "size": piece.stat().st_size,
+        }
+    )
     archives = downloaded(platform)
     pieces = {digest: "cache/pieces/wheel"}
     for record in entry["conda"] + entry["pypi"][:-1]:
@@ -1192,3 +1199,97 @@ def test_a_missing_toolchain_archive_is_a_step_fault(
     path.write_text(json.dumps(lock))
     answer = run_image(work)
     assert answer["error"] == "the environment is missing a safe conda piece"
+
+
+def test_a_step_whose_disk_fills_ends_with_its_error_and_room_for_it(
+    tmp_path: Path, image: str, rootless: bool, environment_cache: str
+) -> None:
+    """A step whose `/work` is full, here a small tmpfs a run's output
+    under `out/` filled, ends with the full disk as its error, which the
+    harness takes as a `system_error` (#287): exec removes what it wrote
+    for the runs to make room for `outputs.json`, and writes it."""
+    from conftest import docker
+    from support import USERNS, declaration, step_flags
+
+    work = tmp_path / "work"
+    batch_inputs(work, "print(42)\n", [("full", "")])
+    start = (
+        "/usr/local/bin/exec" if rootless else "python3 /userns.py /usr/local/bin/exec"
+    )
+    script = (
+        "cp -a /in/. /work/ && mkdir -p /work/out/1 && "
+        "{ dd if=/dev/zero of=/work/out/1/output bs=64k 2>/dev/null || true; } && "
+        f"{start}; echo outputs:; cat /work/outputs.json; echo; echo left:; "
+        "ls -A /work/out"
+    )
+    printed = docker(
+        "run",
+        "--rm",
+        *step_flags(declaration()["limits"]),
+        "--network",
+        "none",
+        "--tmpfs",
+        "/work:rw,size=2m,mode=755",
+        "--volume",
+        f"{environment_cache}:/cache",
+        "--volume",
+        f"{work}:/in:ro",
+        "--volume",
+        f"{USERNS}:/userns.py:ro",
+        "--entrypoint",
+        "sh",
+        image,
+        "-c",
+        script,
+    )
+    written, _, left = printed.partition("outputs:\n")[2].partition("left:\n")
+    assert json.loads(written or "null") == {
+        "schema_version": 6,
+        "error": "the step's disk is full: No space left on device",
+    }
+    assert left.split() == [], "exec left what it wrote for the runs under out/"
+
+
+def toolchain_command() -> str:
+    """The shell command the Dockerfile writes the toolchain line with."""
+    lines = (ROOT / "Dockerfile").read_text().splitlines()
+    start = next(
+        number
+        for number, line in enumerate(lines)
+        if line.startswith("RUN { dpkg-query -W;")
+    )
+    command = []
+    for line in lines[start:]:
+        command.append(line.removeprefix("RUN ").rstrip("\\").strip())
+        if not line.endswith("\\"):
+            break
+    return " ".join(command)
+
+
+def test_the_toolchain_line_hashes_every_file_exec_assembles_with(image: str) -> None:
+    """The line changes with any file under /usr/local/lib/unicon-exec,
+    rattler's and uv's among them, and not with the bytecode compileall wrote, which
+    holds the time it was written (#571)."""
+    folder = "/usr/local/lib/unicon-exec"
+
+    def line(change: str) -> str:
+        script = f"{change}{toolchain_command()} && cat {folder}/toolchain"
+        done = subprocess.run(
+            ["docker", "run", "--rm", "--entrypoint", "sh", image, "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return done.stdout.strip()
+
+    built = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "cat", image, f"{folder}/toolchain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert len(built) == 64 and line("") == built
+    assert line(f"echo >> {folder}/rattler/__init__.py && ") != built
+    assert line(f"echo >> {folder}/bin/uv && ") != built
+    bytecode = f"for f in $(find {folder} -name '*.pyc'); do echo >> $f; done && "
+    assert line(bytecode) == built

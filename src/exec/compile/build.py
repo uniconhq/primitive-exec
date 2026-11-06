@@ -42,7 +42,7 @@ from exec.compile.shared import (
     Sources,
     copy_plain,
 )
-from exec.shared import RUN_PATH, PrimitiveError
+from exec.shared import RUN_PATH, PrimitiveError, no_room
 
 COMPILE_BOX = 0
 COMPILE_SECONDS = 30
@@ -210,13 +210,15 @@ def take_program(
     result: `tool`, or a failure when there is no program or it is over
     `BINARY_LIMIT`. The zip application and the jar fail to be written as
     a program over the limit does, as compile's did, since the folder is
-    the entrant's."""
+    the entrant's; a full disk is the step's error."""
     if not plain_folder(out):
         return Tool(1, tool.log + "the compiler's folder is not a folder\n")
     if language not in ("python", "ipynb", "java"):
         try:
             copy_plain(out / "program", program)
-        except OSError, ValueError:
+        except (OSError, ValueError) as error:
+            if isinstance(error, OSError) and (full := no_room(error)):
+                raise full from error
             return Tool(1, tool.log + "the compiler wrote no program\n")
         return tool
     try:
@@ -229,7 +231,9 @@ def take_program(
             java.write_jar(classes, program, main_class)
         else:
             python.write_zip_application(copy, sources, program)
-    except OSError:
+    except OSError as error:
+        if full := no_room(error):
+            raise full from error
         return Tool(1, tool.log + TOO_LARGE)
     if program.stat().st_size > BINARY_LIMIT:
         return Tool(1, tool.log + TOO_LARGE)

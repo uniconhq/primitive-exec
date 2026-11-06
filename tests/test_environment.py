@@ -1,14 +1,19 @@
-"""Environment assembly copies checked wheel files and never follows archive links."""
+"""Environment assembly links each file from the machine's store, lists
+the entries it links, and refuses a file it copied."""
 
 import asyncio
 import contextlib
+import fcntl
 import hashlib
 import json
+import os
+import shutil
 import stat
 import threading
 import time
 import zipfile
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +24,37 @@ from exec.compile import cache, environment
 from exec.compile.environment import Toolchain
 from exec.shared import PrimitiveError
 
+TOOLS = hashlib.sha256(b"tools").hexdigest()
+"""The toolchain line the tests' exec has."""
+NEWER = hashlib.sha256(b"newer tools").hexdigest()
+"""The toolchain line of another exec on the same machine."""
+WHEEL = "example-1.0-py3-none-any.whl"
+PACKAGE = "python-3.14-0"
+"""The conda package the tests' installer links, by its store entry."""
+ARCHIVE = "Archive0"
+"""The uv cache entry the tests' installer links the wheel from."""
+SITE = "lib/python3.14/site-packages"
+
+
+@dataclass
+class Installs:
+    """What the tests' installers were handed and how they install: each
+    prefix rattler and uv installed into, the wheels uv was handed, and
+    whether a file is copied rather than linked, as across two
+    filesystems."""
+
+    conda: list[Path] = field(default_factory=list)
+    wheels: list[tuple[Path, list[Path]]] = field(default_factory=list)
+    copy: bool = False
+
 
 def setup_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path, Path, Installs]:
+    """A work folder with a lock of one conda package and one wheel, the
+    machine's cache, and installers that stand in for rattler and uv: each
+    links its files from an entry it makes in the store, writes the files
+    the real one writes itself, and records what it was handed."""
     root = tmp_path / "work"
     root.mkdir()
     machine = tmp_path / "cache"
@@ -30,8 +62,17 @@ def setup_environment(
         (machine / name).mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(cache, "CACHE", machine)
     toolchain = tmp_path / "toolchain"
-    toolchain.write_text("tools\n")
+    toolchain.write_text(TOOLS + "\n")
     monkeypatch.setattr(cache, "TOOLCHAIN", toolchain)
+    monkeypatch.setattr(environment, "ENV", tmp_path / "env")
+    installs = Installs()
+
+    def place(source: Path, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if installs.copy:
+            shutil.copyfile(source, target)
+        else:
+            os.link(source, target)
 
     async def installed(
         root: Path,
@@ -40,13 +81,55 @@ def setup_environment(
         target: Path,
         platform: str,
     ) -> None:
-        (target / "lib/python3.14/site-packages").mkdir(parents=True)
+        installs.conda.append(target)
+        entry = machine / "store" / "conda" / PACKAGE
+        if not entry.exists():
+            (entry / "bin").mkdir(parents=True)
+            (entry / "bin/python3").write_text("python")
+            (entry / "etc").mkdir()
+            (entry / "etc/python.cfg").write_text("prefix=PLACEHOLDER\n")
+        place(entry / "bin/python3", target / "bin/python3")
+        (target / "etc").mkdir()
+        (target / "etc/python.cfg").write_text("prefix=/env\n")
+        (target / SITE).mkdir(parents=True)
+        (target / "conda-meta").mkdir()
+        paths = [
+            {"_path": "bin/python3", "path_type": "hardlink"},
+            {
+                "_path": "etc/python.cfg",
+                "path_type": "hardlink",
+                "prefix_placeholder": "PLACEHOLDER",
+            },
+        ]
+        (target / "conda-meta" / f"{PACKAGE}.json").write_text(
+            json.dumps(
+                {"extracted_package_dir": str(entry), "paths_data": {"paths": paths}}
+            )
+        )
+        (target / "CACHEDIR.TAG").write_text("Signature\n")
+
+    def wheels_installed(prefix: Path, wheels: list[Path]) -> None:
+        installs.wheels.append((prefix, wheels))
+        archive = machine / "store" / "uv" / "archive-v0" / ARCHIVE
+        if not archive.exists():
+            (archive / "example").mkdir(parents=True)
+            (archive / "example/__init__.py").write_text("answer = 42\n")
+            (archive / "example-1.0.dist-info").mkdir()
+            (archive / "example-1.0.dist-info/METADATA").write_text("Name: example\n")
+        site = prefix / SITE
+        for name in ("example/__init__.py", "example-1.0.dist-info/METADATA"):
+            place(archive / name, site / name)
+        dist = site / "example-1.0.dist-info"
+        (dist / "INSTALLER").write_text("uv\n")
+        (dist / "REQUESTED").write_text("")
+        (dist / "RECORD").write_text("example/__init__.py,,\n../../../bin/example,,\n")
+        (prefix / "bin/example").write_text(f"#!{prefix}/bin/python3\nimport example\n")
 
     monkeypatch.setattr(environment, "install_conda", installed)
-    wheel = root / "package.whl"
+    monkeypatch.setattr(environment, "install_wheels", wheels_installed)
+    wheel = root / "piece"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr("example/__init__.py", "answer = 42\n")
-        archive.writestr("example-1.data/purelib/helper.py", "value = 7\n")
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     lock = root / "environment.json"
     lock.write_text(
@@ -67,13 +150,19 @@ def setup_environment(
                                 "record": {"name": "python", "version": "3.14"},
                             }
                         ],
-                        "pypi": [{"sha256": digest, "size": wheel.stat().st_size}],
+                        "pypi": [
+                            {
+                                "sha256": digest,
+                                "file_name": WHEEL,
+                                "size": wheel.stat().st_size,
+                            }
+                        ],
                     }
                 },
             }
         )
     )
-    return root, lock, wheel
+    return root, lock, wheel, installs
 
 
 def assembled(
@@ -82,48 +171,306 @@ def assembled(
     return environment.assembled(root, environment.read_lock(lock, language))
 
 
-def test_wheels_are_copied_once_and_the_folder_is_reused(
+def test_a_folder_links_its_files_from_the_store_lists_its_entries_and_is_reused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    root, lock, wheel = setup_environment(tmp_path, monkeypatch)
+    """The folder links each file from the store, and its `ready.json`
+    lists the entries it links; a file of its own is read-only, a linked
+    one keeps the store's mode, and the wheel is handed to uv from its copy
+    in the store, which a second assembly leaves untouched, since uv keys
+    its unpacked copy by the file's inode change time. A second step reuses
+    the folder, its pieces gone."""
+    root, lock, wheel, installs = setup_environment(tmp_path, monkeypatch)
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    store = cache.CACHE / "store"
     with assembled(root, lock, "python") as first:
-        assert first is not None
-        assert stat.S_IMODE(first.folder.stat().st_mode) == 0o755
-        module = first.folder / "lib/python3.14/site-packages/example/__init__.py"
-        assert module.read_text() == "answer = 42\n"
-        assert (
-            first.folder / "lib/python3.14/site-packages/helper.py"
-        ).read_text() == "value = 7\n"
-        assert module.stat().st_nlink == 1
-        assert module.stat().st_ino != wheel.stat().st_ino
-        inode = module.stat().st_ino
+        folder = first.folder
+        assert stat.S_IMODE(folder.stat().st_mode) == 0o755
+        listed = json.loads((folder / "ready.json").read_text())
+        entries = [f"conda/{PACKAGE}", f"uv/archive-v0/{ARCHIVE}", f"wheels/{digest}"]
+        assert listed == environment.marker("a" * 64, TOOLS) | {"store": entries}
+        module = folder / SITE / "example/__init__.py"
+        unpacked = store / "uv/archive-v0" / ARCHIVE / "example/__init__.py"
+        assert module.samefile(unpacked)
+        python = store / "conda" / PACKAGE / "bin/python3"
+        assert (folder / "bin/python3").samefile(python)
+        assert stat.S_IMODE(module.stat().st_mode) & 0o200
+        assert not stat.S_IMODE((folder / "etc/python.cfg").stat().st_mode) & 0o222
+        assert stat.S_IMODE((folder / "etc").stat().st_mode) == 0o555
+    stored = store / "wheels" / digest / WHEEL
+    assert stored.read_bytes() == wheel.read_bytes()
+    assert not stat.S_IMODE(stored.stat().st_mode) & 0o222
+    assert [path.name for path in stored.parent.iterdir()] == [WHEEL]
+    assert [wheels for _, wheels in installs.wheels] == [[stored]]
     wheel.unlink()
     with assembled(root, lock, "ipynb") as second:
-        assert second == first and module.stat().st_ino == inode
+        assert second == first
+    assert len(installs.wheels) == 1
+    changed = stored.stat().st_ctime_ns
+    cache.TOOLCHAIN.write_text(NEWER + "\n")
+    with assembled(root, lock, "python"):
+        assert stored.stat().st_ctime_ns == changed
+    assert len(installs.wheels) == 2
 
 
-def test_a_folder_an_older_exec_assembled_is_assembled_again(
+def test_a_stored_wheel_that_is_not_the_wheel_its_name_says_is_copied_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    root, lock, _ = setup_environment(tmp_path, monkeypatch)
+    root, lock, wheel, _ = setup_environment(tmp_path, monkeypatch)
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    stored = cache.CACHE / "store" / "wheels" / digest / WHEEL
+    stored.parent.mkdir(parents=True)
+    stored.write_bytes(b"not the wheel")
+    with assembled(root, lock, "python"):
+        assert stored.read_bytes() == wheel.read_bytes()
+    assert [path.name for path in stored.parent.parent.iterdir()] == [digest]
+
+
+def stored_together(
+    root: Path,
+    lock: environment.Lock,
+    monkeypatch: pytest.MonkeyPatch,
+    copy: Any,
+) -> list[object]:
+    """What two steps storing `lock`'s wheels at once each got, the wheels
+    or what was raised, each step's copy written only once both copy."""
+    together = threading.Barrier(2)
+
+    def copied(source: Path, target: Path) -> Path:
+        together.wait(timeout=5)
+        return Path(copy(source, target))
+
+    monkeypatch.setattr(shutil, "copyfile", copied)
+    found: list[object] = []
+
+    def store() -> None:
+        try:
+            found.append(environment.stored_wheels(root, lock))
+        except Exception as error:
+            found.append(error)
+
+    threads = [threading.Thread(target=store) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    return found
+
+
+def test_two_steps_storing_one_wheel_at_once_both_take_one_whole_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store's lock is only shared, so two steps, as of two exec lines
+    or two slots, may store one wheel at once: both take it, from the one
+    copy linked first, and neither fails or removes the other's."""
+    root, lock, wheel, _ = setup_environment(tmp_path, monkeypatch)
+    read = environment.read_lock(lock, "python")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    stored = cache.CACHE / "store" / "wheels" / digest / WHEEL
+    copy = shutil.copyfile
+    for _ in range(20):
+        environment.remove(stored.parent)
+        found = stored_together(root, read, monkeypatch, copy)
+        assert found == [[stored], [stored]]
+        assert stored.read_bytes() == wheel.read_bytes()
+        assert [path.name for path in stored.parent.iterdir()] == [WHEEL]
+
+
+def test_two_packages_installing_one_file_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The package installed last would win the file, and the other's
+    record still claim it, so a lock where two packages, a wheel and a
+    conda package here, install the same file is refused, naming it."""
+    root, lock, _, _ = setup_environment(tmp_path, monkeypatch)
+    install = environment.install_wheels
+
+    def clashing(prefix: Path, wheels: list[Path]) -> None:
+        install(prefix, wheels)
+        dist = prefix / SITE / "example-1.0.dist-info"
+        with (dist / "RECORD").open("a") as record:
+            record.write("../../../bin/python3,,\n")
+
+    monkeypatch.setattr(environment, "install_wheels", clashing)
+    with pytest.raises(
+        PrimitiveError,
+        match=f"{PACKAGE} and example-1.0.dist-info, install the same file bin/python3",
+    ):
+        with assembled(root, lock, "python"):
+            pytest.fail("a folder two packages claim a file of is not assembled")
+
+
+def test_the_store_lock_is_held_shared_while_a_folder_is_assembled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wrapper frees no store entry while `locks/store.lock` is held,
+    and an entry unpacked for a folder is listed nowhere until the folder
+    is whole, so the lock is held shared while the folder is assembled and
+    released once it is."""
+    root, lock, _, installs = setup_environment(tmp_path, monkeypatch)
+    path = cache.CACHE / "locks" / "store.lock"
+    seen: list[str] = []
+    install = environment.install_wheels
+
+    def tried(prefix: Path, wheels: list[Path]) -> None:
+        install(prefix, wheels)
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            seen.append("shared")
+        finally:
+            os.close(descriptor)
+
+    monkeypatch.setattr(environment, "install_wheels", tried)
+    with assembled(root, lock, "python"):
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(descriptor)
+    assert seen == ["shared"] and len(installs.wheels) == 1
+
+
+def test_a_file_copied_rather_than_linked_fails_the_assembly_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store on another filesystem than the folder makes both tools copy,
+    rattler without a word, and the folder is refused rather than made of
+    copies, nothing of it left under its name."""
+    root, lock, _, installs = setup_environment(tmp_path, monkeypatch)
+    installs.copy = True
+    with pytest.raises(PrimitiveError, match="bin/python3 was copied rather than"):
+        with assembled(root, lock, "python"):
+            pytest.fail("a folder of copies is not assembled")
+    assert list((cache.CACHE / "envs").iterdir()) == []
+
+
+def test_the_build_goes_through_env_and_where_it_cannot_the_launchers_are_pointed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both installers write into the folder through `/env`, a link removed
+    after, so each writes `/env` where it names its prefix. Where `/env`
+    cannot be made, they install at the folder's own path, rattler told to
+    write `/env`, and uv's launchers are pointed at `/env` after."""
+    root, lock, _, installs = setup_environment(tmp_path, monkeypatch)
+    with assembled(root, lock, "python"):
+        pass
+    link = environment.ENV
+    assert [prefix for prefix, _ in installs.wheels] == [link] == installs.conda
+    assert not link.exists() and not link.is_symlink()
+    monkeypatch.setattr(environment, "ENV", tmp_path / "missing" / "env")
+    cache.TOOLCHAIN.write_text(NEWER + "\n")
+    with assembled(root, lock, "python") as other:
+        ((prefix, _),) = installs.wheels[1:]
+        assert prefix.parent == other.folder.parent and prefix != other.folder
+        launcher = (other.folder / "bin/example").read_text()
+        assert launcher == "#!/env/bin/python3\nimport example\n"
+
+
+def test_the_launchers_uv_writes_at_a_folders_own_path_are_pointed_at_env(
+    tmp_path: Path,
+) -> None:
+    """uv writes a launcher's first line naming the Python, or, for a path
+    too long for one, shell lines that do; a file linked from the store, or
+    any other script, is left as it is."""
+    folder = tmp_path / "folder"
+    (folder / "bin").mkdir(parents=True)
+    python = f"{folder}/bin/python3"
+    (folder / "bin/short").write_text(f"#!{python}\nimport a\n")
+    (folder / "bin/long").write_text(
+        f"#!/bin/sh\n'''exec' '{python}' \"$0\" \"$@\"\n' '''\nimport b\n"
+    )
+    (folder / "bin/other").write_text("#!/bin/sh\necho\n")
+    (tmp_path / "stored").write_text(f"#!{python}\n")
+    os.link(tmp_path / "stored", folder / "bin/linked")
+    environment.point_launchers(folder)
+    assert (folder / "bin/short").read_text() == "#!/env/bin/python3\nimport a\n"
+    assert (folder / "bin/long").read_text() == "#!/env/bin/python3\nimport b\n"
+    assert (folder / "bin/other").read_text() == "#!/bin/sh\necho\n"
+    assert (folder / "bin/linked").read_text() == f"#!{python}\n"
+
+
+def test_an_installed_link_out_of_the_folder_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, lock, _, _ = setup_environment(tmp_path, monkeypatch)
+    install = environment.install_wheels
+
+    def escaping(prefix: Path, wheels: list[Path]) -> None:
+        install(prefix, wheels)
+        (prefix / SITE / "escape").symlink_to(tmp_path)
+
+    monkeypatch.setattr(environment, "install_wheels", escaping)
+    with pytest.raises(PrimitiveError, match="links outside its environment"):
+        with assembled(root, lock, "python"):
+            pytest.fail("a folder that links out is not assembled")
+
+
+def test_a_folder_is_ready_only_with_its_fingerprint_prefix_and_toolchain_line(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "ready.json").write_text(
+        json.dumps(environment.marker("a" * 64, TOOLS) | {"store": ["conda/x"]})
+    )
+    assert environment.ready(tmp_path, "a" * 64, TOOLS)
+    assert not environment.ready(tmp_path, "a" * 64, NEWER)
+    assert not environment.ready(tmp_path, "c" * 64, TOOLS)
+    (tmp_path / "ready.json").write_text("[]")
+    assert not environment.ready(tmp_path, "a" * 64, TOOLS)
+
+
+def test_two_toolchain_lines_give_two_folders_and_neither_waits_on_the_other(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A folder is named by the lock's fingerprint and the toolchain line,
+    so an exec of another line assembles a folder of its own while the
+    first's is held or being assembled, and each keeps its own (#572)."""
+    root, lock, _, _ = setup_environment(tmp_path, monkeypatch)
     with assembled(root, lock, "python") as first:
+        assert first.folder.name == f"{'a' * 64}-{TOOLS}"
         marker = json.loads((first.folder / "ready.json").read_text())
-        assert marker == environment.marker("a" * 64, "tools")
+        assert marker.items() >= environment.marker("a" * 64, TOOLS).items()
         inode = first.folder.stat().st_ino
-    cache.TOOLCHAIN.write_text("newer tools\n")
-    with assembled(root, lock, "python") as second:
-        assert second.folder.stat().st_ino != inode
-        marker = json.loads((second.folder / "ready.json").read_text())
-        assert marker == environment.marker("a" * 64, "newer tools")
-        assert list(second.folder.parent.iterdir()) == [second.folder]
-    with assembled(root, lock, "python") as third:
-        assert third.folder.stat().st_ino == second.folder.stat().st_ino
+    cache.TOOLCHAIN.write_text(NEWER + "\n")
+    found: list[Path] = []
+
+    def other() -> None:
+        with assembled(root, lock, "python") as second:
+            found.append(second.folder)
+
+    with cache.locked(first.folder.name, kind="envs"):
+        waiting = threading.Thread(target=other, daemon=True)
+        waiting.start()
+        waiting.join(timeout=5)
+        assert not waiting.is_alive(), "the other line waited on the first's lock"
+    (second,) = found
+    assert second.name == f"{'a' * 64}-{NEWER}"
+    marker = json.loads((second / "ready.json").read_text())
+    assert marker.items() >= environment.marker("a" * 64, NEWER).items()
+    assert first.folder.stat().st_ino == inode
+    assert sorted(path.name for path in (cache.CACHE / "envs").iterdir()) == sorted(
+        [first.folder.name, second.name]
+    )
+
+
+def test_a_toolchain_line_that_is_not_a_sha256_is_a_named_step_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wrapper discards a folder whose name is not two SHA-256s, so an
+    image whose line is not one assembles none."""
+    root, lock, _, _ = setup_environment(tmp_path, monkeypatch)
+    cache.TOOLCHAIN.write_text("tools\n")
+    with pytest.raises(PrimitiveError, match="is not a SHA-256"):
+        with assembled(root, lock, "python"):
+            pytest.fail("a folder cannot be named by this line")
 
 
 def test_a_missing_piece_is_a_primitive_fault(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    root, lock, wheel = setup_environment(tmp_path, monkeypatch)
+    root, lock, wheel, _ = setup_environment(tmp_path, monkeypatch)
     wheel.unlink()
     with pytest.raises(PrimitiveError, match="does not match"):
         with assembled(root, lock, "python"):
@@ -137,7 +484,7 @@ def test_a_step_that_finds_the_folder_unready_never_queues_behind_its_readers(
     shared lock, does not wait for the exclusive lock, where the steps that
     take the shared lock after it would go first, but looks again and takes
     the folder once it is ready."""
-    root, lock, _ = setup_environment(tmp_path, monkeypatch)
+    root, lock, _, _ = setup_environment(tmp_path, monkeypatch)
     monkeypatch.setattr(environment, "RETRY_SECONDS", 0.01)
 
     def refused(*_: object) -> None:
@@ -145,21 +492,21 @@ def test_a_step_that_finds_the_folder_unready_never_queues_behind_its_readers(
 
     monkeypatch.setattr(environment, "construct", refused)
     fingerprint = "a" * 64
-    folder = cache.CACHE / "envs" / fingerprint
+    folder = cache.CACHE / "envs" / f"{fingerprint}-{TOOLS}"
     taken: list[Path] = []
 
     def assemble() -> None:
         with assembled(root, lock, "python") as found:
             taken.append(found.folder)
 
-    with cache.locked(fingerprint, kind="envs", shared=True):
+    with cache.locked(folder.name, kind="envs", shared=True):
         waiting = threading.Thread(target=assemble, daemon=True)
         waiting.start()
         time.sleep(0.1)
         assert waiting.is_alive()
         folder.mkdir()
         (folder / "ready.json").write_text(
-            json.dumps(environment.marker(fingerprint, "tools"))
+            json.dumps(environment.marker(fingerprint, TOOLS))
         )
         waiting.join(timeout=5)
         assert not waiting.is_alive(), "the step waited behind the shared lock"
@@ -185,7 +532,7 @@ def test_a_step_that_finds_the_folder_unready_never_queues_behind_its_readers(
 def test_a_lock_of_the_wrong_shape_is_a_named_step_fault(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spoil: Any
 ) -> None:
-    root, lock, _ = setup_environment(tmp_path, monkeypatch)
+    root, lock, _, _ = setup_environment(tmp_path, monkeypatch)
     document = json.loads(lock.read_text())
     spoil(document)
     lock.write_text(json.dumps(document))
@@ -198,7 +545,7 @@ def test_a_lock_of_the_wrong_shape_is_a_named_step_fault(
 def test_a_platform_conda_does_not_know_is_a_named_step_fault(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: object
 ) -> None:
-    _, lock, _ = setup_environment(tmp_path, monkeypatch)
+    _, lock, _, _ = setup_environment(tmp_path, monkeypatch)
     document = json.loads(lock.read_text())
     document["platform"] = platform
     lock.write_text(json.dumps(document))
@@ -274,22 +621,13 @@ def test_java_home_is_the_folder_above_the_locked_javas_own_file(
         environment.jdk_home(folder)
 
 
-@pytest.mark.parametrize("path", ["../outside", "/outside", "pkg/../../outside"])
-def test_wheel_paths_cannot_leave_the_environment(tmp_path: Path, path: str) -> None:
-    wheel = tmp_path / "bad.whl"
-    with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr(path, "bad")
-    with pytest.raises(PrimitiveError, match="unsafe"):
-        environment.unpack_wheel(wheel, tmp_path / "env")
-
-
 def test_two_programs_share_one_held_environment_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from exec import inputs, programs
     from exec.compile.build import Built
 
-    root, lock, _ = setup_environment(tmp_path, monkeypatch)
+    root, lock, _, _ = setup_environment(tmp_path, monkeypatch)
     monkeypatch.setattr(programs, "box_users", lambda: [60000, 60001])
     monkeypatch.setattr(programs, "step_memory_kb", lambda: 1024 * 1024)
     monkeypatch.setattr(programs, "check_room", lambda _: None)
@@ -351,7 +689,7 @@ def test_a_cached_compile_assembles_the_toolchain_only_for_a_box_that_needs_it(
     from exec import inputs, programs
     from exec.compile.build import Built
 
-    root, lock, _ = setup_environment(tmp_path, monkeypatch)
+    root, lock, _, _ = setup_environment(tmp_path, monkeypatch)
     document = json.loads(lock.read_text())
     document["languages"]["cpp"] = document["languages"]["python"] | {
         "fingerprint": "c" * 64,
@@ -401,7 +739,7 @@ def test_a_cached_compile_assembles_the_toolchain_only_for_a_box_that_needs_it(
     (found,) = folders
     assert (found is not None) == assembles
     assert [path.name for path in (cache.CACHE / "envs").iterdir()] == (
-        ["a" * 64] if assembles else []
+        [f"{'a' * 64}-{TOOLS}"] if assembles else []
     )
 
 
@@ -425,24 +763,6 @@ def test_a_missing_or_wrong_conda_piece_is_a_step_fault(tmp_path: Path) -> None:
                 "linux-aarch64",
             )
         )
-
-
-def test_a_wheel_cannot_write_through_a_conda_packages_external_directory_link(
-    tmp_path: Path,
-) -> None:
-    target, outside = tmp_path / "env", tmp_path / "outside"
-    site = target / "lib/python3.14/site-packages"
-    site.mkdir(parents=True)
-    outside.mkdir()
-    (site / "linked").symlink_to(outside, target_is_directory=True)
-    wheel = tmp_path / "package.whl"
-    with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr("linked/escaped.py", "unexpected = True\n")
-    with pytest.raises(PrimitiveError, match="outside"):
-        environment.unpack_wheel(
-            wheel, target, site_packages="lib/python3.14/site-packages"
-        )
-    assert list(outside.iterdir()) == []
 
 
 def test_an_invalid_program_entry_remains_a_named_input_fault(tmp_path: Path) -> None:

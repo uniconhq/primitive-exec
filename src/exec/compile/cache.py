@@ -33,8 +33,10 @@ from exec.shared import PrimitiveError
 CACHE = Path("/cache")
 TOOLCHAIN = Path("/usr/local/lib/unicon-exec/toolchain")
 """One line written when the image is built: the SHA-256 of its installed
-packages and versions, its Python's and exec's own files. Two images with
-different compilers never share a compiled program."""
+packages and versions, its Python, and every file under
+/usr/local/lib/unicon-exec, exec's own and the installers'. Two images that
+compile or assemble differently never share a compiled program or an
+environment."""
 PROGRAM_MODE = 0o444
 RESULT_LIMIT = 8 * LOG_LIMIT
 """The most of `result.json` read back: its log, each character escaped at
@@ -109,33 +111,49 @@ def locked(
 ) -> Iterator[None]:
     """Hold `locks/programs-<key>.lock` for the block: the wrapper evicts no
     folder whose lock is held, and a second step with the same source waits
-    for the first to store its compile. The lock holds only while its path
-    still names the file locked, since the wrapper's sweep removes a lock
-    no one holds; a removed one is taken again under its new file. Without
-    `wait`, a lock someone else holds raises `BlockingIOError` at once."""
-    path = CACHE / "locks" / f"{kind}-{key}.lock"
+    for the first to store its compile. Without `wait`, a lock someone else
+    holds raises `BlockingIOError` at once."""
+    with held(CACHE / "locks" / f"{kind}-{key}.lock", key, shared, wait):
+        yield
+
+
+@contextlib.contextmanager
+def store_locked() -> Iterator[None]:
+    """Hold `locks/store.lock` shared for the block, while an environment is
+    assembled: the wrapper frees no store entry while it is held, since one
+    just unpacked is listed in no folder's `ready.json` yet."""
+    with held(CACHE / "locks" / "store.lock", "the store", True, True):
+        yield
+
+
+@contextlib.contextmanager
+def held(path: Path, what: str, shared: bool, wait: bool) -> Iterator[None]:
+    """Hold the flock on `path`, shared or exclusive, for the block. The lock
+    holds only while its path still names the file locked, since the
+    wrapper's sweep removes a lock no one holds; a removed one is taken
+    again under its new file."""
     while True:
         try:
-            held = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CREAT, 0o444)
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CREAT, 0o444)
         except OSError as error:
             raise PrimitiveError(
-                f"the machine's cache lock for {key} could not be taken: "
+                f"the machine's cache lock for {what} could not be taken: "
                 f"{error.strerror}"
             ) from None
         try:
             mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
-            fcntl.flock(held, mode | (0 if wait else fcntl.LOCK_NB))
+            fcntl.flock(descriptor, mode | (0 if wait else fcntl.LOCK_NB))
             with contextlib.suppress(FileNotFoundError):
-                if os.path.samestat(os.fstat(held), os.lstat(path)):
+                if os.path.samestat(os.fstat(descriptor), os.lstat(path)):
                     break
         except BaseException:
-            os.close(held)
+            os.close(descriptor)
             raise
-        os.close(held)
+        os.close(descriptor)
     try:
         yield
     finally:
-        os.close(held)
+        os.close(descriptor)
 
 
 def look_up(key: str, program: Path) -> Cached | None:
