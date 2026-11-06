@@ -13,7 +13,6 @@ box's user, who owns everything in the box while it runs.
 import errno
 import os
 import signal
-import stat
 import subprocess
 import sys
 import time
@@ -31,33 +30,27 @@ from exec.box import (
     held_memory_kb,
     read_meta,
 )
-from exec.compile import cache, java, native, python
-from exec.compile.environment import Toolchain, jdk_home, tool
+from exec.compile import cache
+from exec.compile.environment import Toolchain, tool
 from exec.compile.prepare import PREPARE_SECONDS, prepare
+from exec.compile.recipes import Compile, Recipe, recipe
 from exec.compile.shared import (
     BINARY_LIMIT,
     LOG_LIMIT,
     TOO_LARGE,
     CompileError,
     Sources,
-    copy_plain,
+    plain_folder,
 )
 from exec.shared import RUN_PATH, PrimitiveError, no_room
 
 COMPILE_BOX = 0
 COMPILE_SECONDS = 30
 """The CPU and wall-clock seconds the compiler may take."""
-COMPILE_MEMORY_KB = 1024 * 1024
-"""The compile box's memory, as compile's own container had."""
 COMPILE_BOX_KB = 2 * BINARY_LIMIT // 1024
 """The compile box's tmpfs: the program at its cap, and as much again for
 the compiler's own files, its objects and Java's classes."""
-COMPILE_PROCESSES = 128
-"""The compile box user's processes and threads (decision 11 of the design:
-twice the most measured, and at least 128); the README has the
-measurement."""
 SOURCE = "/source"
-OUT = "/box/out"
 
 
 @dataclass(frozen=True)
@@ -92,14 +85,15 @@ class Built:
         return "compile_error" if self.program is None else "accepted"
 
 
-def check_room(memory_kb: int) -> None:
+def check_room(memory_kb: int, compile_kb: int) -> None:
     """Refuse the batch, before anything compiles, when the step's memory,
-    `memory_kb`, or the container's, holds no compile box beside
+    `memory_kb`, or the container's, holds no compile box of `compile_kb`,
+    the most any of its languages' compiles takes, beside
     `STEP_MEMORY_KB`."""
     held_kb = held_memory_kb(memory_kb)
-    if COMPILE_MEMORY_KB + STEP_MEMORY_KB > held_kb:
+    if compile_kb + STEP_MEMORY_KB > held_kb:
         raise PrimitiveError(
-            f"compiling needs {COMPILE_MEMORY_KB // 1024} MB for its box, and "
+            f"compiling needs {compile_kb // 1024} MB for its box, and "
             f"the step's {held_kb // 1024} MB leaves "
             f"{max(0, held_kb - STEP_MEMORY_KB) // 1024} MB for it"
         )
@@ -119,9 +113,10 @@ def build(
 
     The folder is prepared first (`prepare`), into `work/source`, then the
     machine's cache is asked for the compile, under the compile's key, which
-    holds the toolchain's fingerprint, and holding its lock, and on a miss
-    the toolchain is assembled and it is compiled in a box and stored. A
-    step without the cache compiles every time.
+    holds the toolchain's fingerprint and the packages the task asked for,
+    and holding its lock, and on a miss the toolchain is assembled and it
+    is compiled in a box and stored. A step without the cache compiles
+    every time.
     """
     work.mkdir()
     copy, program = work / "source", work / "program"
@@ -132,8 +127,15 @@ def build(
     except CompileError as error:
         return Built(f"{error}\n", None)
     if not cache.in_use():
-        return compile_sources(sources, copy, language, work, toolchain.folder())
-    key = cache.key(cache.toolchain(), language, sources, copy, toolchain.fingerprint)
+        return compile_sources(sources, copy, language, work, toolchain)
+    key = cache.key(
+        cache.toolchain(),
+        language,
+        sources,
+        copy,
+        toolchain.fingerprint,
+        toolchain.lock.packages,
+    )
     with cache.locked(key):
         found = cache.look_up(key, program)
         if found is not None:
@@ -141,7 +143,7 @@ def build(
                 f"exec: took the compiled program {key} from the cache", file=sys.stderr
             )
             return Built(found.log, program if found.outcome == "accepted" else None)
-        built = compile_sources(sources, copy, language, work, toolchain.folder())
+        built = compile_sources(sources, copy, language, work, toolchain)
         if built.lasting:
             cache.store(key, built.outcome, built.log, built.program)
     return built
@@ -152,36 +154,31 @@ def compile_sources(
     copy: Path,
     language: str,
     work: Path,
-    environment: Path,
+    toolchain: Toolchain,
 ) -> Built:
     """Compile the prepared copy at `copy` in a fresh compile box into
-    `work/program`, with the assembled toolchain folder `environment` at
-    `/env`."""
+    `work/program`, by the language's recipe, with the locked `toolchain`,
+    assembled now, at `/env`. A recipe with no compile runs nothing, and
+    its program is made from the copy."""
     started = time.monotonic()
     program = work / "program"
+    own = recipe(language)
+    environment = toolchain.folder()
+    for name, pointed in own.links.items():
+        (copy / name).symlink_to(pointed)
     with fresh_box(COMPILE_BOX, COMPILE_BOX_KB) as box:
-        for name in (*BOX_FOLDERS, "out"):
+        for name in (*BOX_FOLDERS, "out", *(f"out/{each}" for each in own.made)):
             (box / name).mkdir()
             (box / name).chmod(0o1777)
-        if language in ("python", "ipynb"):
-            interpreter = tool(environment, "python3")
-            command = python.command(sources, interpreter)
-        elif language == "java":
-            (box / "out" / "classes").mkdir()
-            command = java.command(sources, f"{OUT}/classes")
-        else:
-            command = native.command(sources, language, f"{OUT}/program")
-        compiler = installed(command[0], environment)
-        print(f"exec: compiler {compiler}; network off", file=sys.stderr)
-        result = run_tool(
-            [compiler, *command[1:]],
-            copy,
-            work,
-            environment=environment,
-            java_home=jdk_home(environment) if language == "java" else None,
-        )
+        this = Compile(sources, copy, box / "out", environment, toolchain.lock)
+        command = own.command(this)
+        result = Tool(0, "")
+        if command is not None:
+            compiler = installed(command[0], environment)
+            print(f"exec: compiler {compiler}; network off", file=sys.stderr)
+            result = run_tool([compiler, *command[1:]], copy, work, environment, own)
         if result.ok:
-            result = take_program(result, sources, copy, language, box / "out", program)
+            result = take_program(result, own, this, program)
     print(
         f"exec: compiled the {language} source in {time.monotonic() - started:.1f} s",
         file=sys.stderr,
@@ -193,44 +190,26 @@ def compile_sources(
 
 
 def installed(name: str, environment: Path) -> str:
-    """Find a locked tool without following a link outside its folder."""
-    return tool(environment, Path(name).name)
+    """Find a locked tool without following a link outside its folder; a
+    command the recipe gave by its full path, as a shell, is the image's
+    own, or already found."""
+    return name if name.startswith("/") else tool(environment, Path(name).name)
 
 
-def take_program(
-    tool: Tool,
-    sources: Sources,
-    copy: Path,
-    language: str,
-    out: Path,
-    program: Path,
-) -> Tool:
-    """Make the program from what the compiler wrote under `out`, the box's
-    `/box/out`, or for Python from exec's own copy, and return the compile's
-    result: `tool`, or a failure when there is no program or it is over
-    `BINARY_LIMIT`. The zip application and the jar fail to be written as
-    a program over the limit does, as compile's did, since the folder is
-    the entrant's; a full disk is the step's error."""
-    if not plain_folder(out):
+def take_program(tool: Tool, own: Recipe, this: Compile, program: Path) -> Tool:
+    """Make the program from what the compiler wrote under `this.out`, the
+    box's `OUT`, or from exec's own copy, by the recipe, and return the
+    compile's result: `tool`, or a failure when there is no program or it
+    is over `BINARY_LIMIT`. A program exec writes fails to be written as
+    one over the limit does, as compile's did, since the folder is the
+    entrant's; a full disk is the step's error."""
+    if not plain_folder(this.out):
         return Tool(1, tool.log + "the compiler's folder is not a folder\n")
-    if language not in ("python", "ipynb", "java"):
-        try:
-            copy_plain(out / "program", program)
-        except (OSError, ValueError) as error:
-            if isinstance(error, OSError) and (full := no_room(error)):
-                raise full from error
-            return Tool(1, tool.log + "the compiler wrote no program\n")
-        return tool
     try:
-        if language == "java":
-            main_class = sources.main_class or "Main"
-            classes = plain_files(out / "classes")
-            if java.class_file(main_class) not in dict(classes):
-                missing = f"no class named {main_class} to run"
-                return Tool(1, f"{tool.log}{missing}; put main in a public class\n")
-            java.write_jar(classes, program, main_class)
-        else:
-            python.write_zip_application(copy, sources, program)
+        own.program(this, program)
+    except CompileError as error:
+        program.unlink(missing_ok=True)
+        return Tool(1, f"{tool.log}{error}\n")
     except OSError as error:
         if full := no_room(error):
             raise full from error
@@ -240,58 +219,31 @@ def take_program(
     return tool
 
 
-def plain_folder(path: Path) -> bool:
-    """Whether `path` is a folder and not a link to one."""
-    try:
-        return stat.S_ISDIR(path.lstat().st_mode)
-    except FileNotFoundError:
-        return False
-
-
-def plain_files(folder: Path) -> list[tuple[str, Path]]:
-    """Every plain file under `folder`, by its path relative to it, in
-    order; links and folders reached through links are passed over. No
-    process of the box is left to change the tree as it is read."""
-    found: list[tuple[str, Path]] = []
-    if not plain_folder(folder):
-        return found
-    for directory, _, names in folder.walk():
-        for name in names:
-            path = directory / name
-            if stat.S_ISREG(path.lstat().st_mode):
-                found.append((path.relative_to(folder).as_posix(), path))
-    return sorted(found)
-
-
 def run_tool(
-    command: list[str],
-    copy: Path,
-    work: Path,
-    *,
-    environment: Path,
-    java_home: str | None = None,
+    command: list[str], copy: Path, work: Path, environment: Path, own: Recipe
 ) -> Tool:
-    """Run a compiler in the compile box, already made, with the prepared
-    copy at `copy` bound read-only at `SOURCE`, its working directory, and
-    return its exit code and its log.
+    """Run a compiler in the compile box, already made, with the assembled
+    toolchain folder `environment` at `/env` and the prepared copy at
+    `copy` bound read-only at `SOURCE`, its working directory, and return
+    its exit code and its log.
 
     isolate holds the compile's limits: `COMPILE_SECONDS` of CPU and of
-    wall-clock time, `COMPILE_MEMORY_KB` of memory in the box's cgroup,
-    `COMPILE_PROCESSES` processes, and files of at most `BINARY_LIMIT`
-    bytes. Standard output and error are read together and kept up to
-    `LOG_LIMIT` bytes; the rest is read and counted, so the compiler never
-    waits on a full pipe. The environment holds `PATH`, `HOME` and
-    `TMPDIR`, both the box's `/tmp`, and `LANG=C.UTF-8`.
+    wall-clock time, the recipe's compile memory in the box's cgroup and
+    its processes, and files of at most `BINARY_LIMIT` bytes. Standard
+    output and error are read together and kept up to `LOG_LIMIT` bytes;
+    the rest is read and counted, so the compiler never waits on a full
+    pipe. The environment holds `PATH`, `HOME` and `TMPDIR`, both the
+    box's `/tmp`, and `LANG=C.UTF-8`, then the recipe's compile
+    environment; the box binds what the recipe's own options bind.
     """
     meta, errors = work / "meta", work / "errors"
-    limits = Limits(
-        COMPILE_SECONDS, COMPILE_SECONDS, COMPILE_MEMORY_KB, COMPILE_PROCESSES
-    )
+    memory_kb = own.compile_memory_kb
+    limits = Limits(COMPILE_SECONDS, COMPILE_SECONDS, memory_kb, own.processes)
     env = {"PATH": RUN_PATH, "HOME": "/tmp", "TMPDIR": "/tmp", "LANG": "C.UTF-8"}
-    if java_home is not None:
-        env["JAVA_HOME"] = java_home
+    env |= own.compile_env
     options = [
         f"--dir=env={environment}",
+        *own.box,
         f"--dir={SOURCE.lstrip('/')}={copy}:noexec",
         f"--chdir={SOURCE}",
         f"--fsize={BINARY_LIMIT // 1024}",
@@ -330,7 +282,7 @@ def run_tool(
         return Tool(None, log)
     if found.get("cg-oom-killed") == "1":
         log += (
-            f"\ncompiling took more than {COMPILE_MEMORY_KB // 1024} MB of memory"
+            f"\ncompiling took more than {memory_kb // 1024} MB of memory"
             " and was stopped\n"
         )
         return Tool(None, log)

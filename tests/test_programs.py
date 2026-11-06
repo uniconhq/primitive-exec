@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from exec import box, inputs, programs, report, shared
+from exec.compile import recipes
 from exec.main import main
 from support import (
     BOX_USERS,
@@ -1066,9 +1067,9 @@ def test_a_cached_file_is_read_through_the_steps_cache_link(tmp_path: Path) -> N
     judge = next(entry for entry in programs if entry.name == "judge")
     assert judge.files == {"secret": item / "secret"}
     assert judge.cached == item
-    program = tmp_path / "program"
-    program.write_bytes(b"x" * 5000)
-    assert box.box_size_kb(judge, program) == judge.memory_limit_kb + 8
+    assert box.box_size_kb(judge, 8, recipes.recipe("python")) == (
+        judge.memory_limit_kb + 8
+    )
 
 
 def test_cached_files_of_two_items_in_one_program_are_refused(tmp_path: Path) -> None:

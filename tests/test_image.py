@@ -634,7 +634,8 @@ def test_a_cpp_program_compiles_and_runs(
     tmp_path: Path, run_image: RunImage, check: Check
 ) -> None:
     """A C++ program exec compiled runs, is measured by its own size, hits
-    limits, and gets its arguments.
+    limits, and gets its arguments. Its lock lists packages of the task's
+    own, so it is linked against them and loads libstdc++ from `/env`.
     """
     binary, language = {"main.cpp": CPP}, "cpp"
     work = tmp_path / "work"
@@ -661,7 +662,7 @@ def test_a_cpp_program_compiles_and_runs(
     }
     assert printed(work, outputs["main-ok"]) == "42\n"
     assert isinstance(outputs["main-ok"]["memory_kb"], int)
-    assert outputs["main-ok"]["memory_kb"] < 8 * 1024
+    assert outputs["main-ok"]["memory_kb"] < 16 * 1024
     assert outputs["main-spin"]["time_ms"] >= 1000
     assert printed(work, outputs["main-argv"]) == "--seed\n7\n"
 
@@ -703,6 +704,25 @@ def test_a_c_program_compiles_and_runs(tmp_path: Path, run_image: RunImage) -> N
     assert outcomes(outputs) == {"main-1": "accepted", "main-2": "accepted"}
     assert printed(work, outputs["main-1"]) == "42\n"
     assert printed(work, outputs["main-2"]) == "-8\n"
+
+
+def test_a_c_program_using_threads_compiles_and_runs(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """A C program that starts a thread links and runs."""
+    code = (
+        "#include <pthread.h>\n#include <stdio.h>\n"
+        "static void *twice(void *n) { *(int *)n *= 2; return 0; }\n"
+        'int main(void) { int n; pthread_t t; if (scanf("%d", &n) != 1) return 1;\n'
+        "  if (pthread_create(&t, 0, twice, &n)) return 2; pthread_join(t, 0);\n"
+        '  printf("%d\\n", n); return 0; }\n'
+    )
+    work = tmp_path / "work"
+    outputs = run_batch(
+        run_image, work, {"main.c": code}, [("main-1", "21\n")], language="c"
+    )
+    assert outcomes(outputs) == {"main-1": "accepted"}
+    assert printed(work, outputs["main-1"]) == "42\n"
 
 
 def test_a_java_program_compiles_and_runs(tmp_path: Path, run_image: RunImage) -> None:
@@ -1120,7 +1140,7 @@ print('42')
     (work / "in/environment.json").write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "prefix": "/env",
                 "languages": {"python": entry},
                 "pieces": pieces,
@@ -1164,13 +1184,13 @@ print('42')
             "#include <boost/version.hpp>\n#include <fstream>\n#include <iostream>\n"
             'int main() { std::cout << (BOOST_VERSION > 0) << " " '
             '<< bool(std::ifstream("/env/bin/g++")) << "\\n"; }\n',
-            "1 0\n",
+            "1 1\n",
         ),
         (
             "java",
             "class Main { public static void main(String[] a) { "
             'System.out.println(System.getProperty("java.version")'
-            '.startsWith("21.")); }}',
+            '.startsWith("25.")); }}',
             "true\n",
         ),
     ],

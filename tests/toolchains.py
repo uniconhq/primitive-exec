@@ -10,24 +10,38 @@ from pathlib import Path
 from typing import Any
 
 FIXTURE = Path(__file__).parent / "fixtures/environment.lock"
+"""The lock of the languages exec 3 ran, C, C++, Java and Python, each with
+a package of a source of its own."""
+FIXTURES = sorted(FIXTURE.parent.glob("*.lock"))
+"""Every fixture lock: `FIXTURE`, and one for each language exec 4 added."""
+SOURCES = ("conda", "pypi", "maven", "npm")
+"""A language lock's lists of pieces."""
 
 
-def document(platform: str) -> dict[str, Any]:
-    lock = json.loads(FIXTURE.read_bytes())
+def pieces(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every piece of one language's lock."""
+    return [piece for source in SOURCES for piece in entry.get(source, [])]
+
+
+def document(platform: str, fixtures: list[Path] = FIXTURES) -> dict[str, Any]:
+    """The step's lock for `platform` of every language the `fixtures` lock."""
+    languages: dict[str, Any] = {}
+    for fixture in fixtures:
+        languages |= json.loads(fixture.read_bytes())["platforms"][platform]
     return {
-        "version": 2,
+        "version": 3,
         "prefix": "/env",
         "platform": platform,
-        "languages": lock["platforms"][platform],
+        "languages": languages,
         "pieces": {
             piece["sha256"]: "pieces/" + piece["sha256"]
-            for entry in lock["platforms"][platform].values()
-            for piece in entry.get("conda", []) + entry.get("pypi", [])
+            for entry in languages.values()
+            for piece in pieces(entry)
         },
     }
 
 
-def downloaded(platform: str) -> Path:
+def downloaded(platform: str, fixtures: list[Path] = FIXTURES) -> Path:
     root = Path(
         os.environ.get(
             "UNICON_EXEC_TEST_PIECES",
@@ -35,11 +49,11 @@ def downloaded(platform: str) -> Path:
         )
     )
     root.mkdir(exist_ok=True, parents=True)
-    lock = document(platform)
+    lock = document(platform, fixtures)
     records = {
         piece["sha256"]: piece
         for entry in lock["languages"].values()
-        for piece in entry.get("conda", []) + entry.get("pypi", [])
+        for piece in pieces(entry)
     }
 
     def fetch(piece: dict[str, Any]) -> None:
@@ -96,7 +110,7 @@ def attach(work: Path, inputs: dict[str, Any]) -> None:
     value = (
         json.loads(template.read_bytes())
         if template.is_file()
-        else {"version": 2, "prefix": "/env", "languages": {}}
+        else {"version": 3, "prefix": "/env", "languages": {}}
     )
     path = work / "in/environment.json"
     path.parent.mkdir(parents=True, exist_ok=True)

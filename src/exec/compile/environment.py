@@ -10,10 +10,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -46,6 +47,25 @@ install and still link from the store, which a bind mount, a mount of its
 own, would turn into copies."""
 UV = Path("/usr/local/lib/unicon-exec/bin/uv")
 WHEEL_NAME = re.compile(r"^[A-Za-z0-9_.+!-]+\.whl$")
+JAR_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.+-]*\.jar$")
+NPM_NAME = r"(?:@[A-Za-z0-9_~-][A-Za-z0-9_.~-]*/)?[A-Za-z0-9_~-][A-Za-z0-9_.~-]*"
+NPM_PATH = re.compile(rf"^node_modules/{NPM_NAME}(?:/node_modules/{NPM_NAME})*$")
+"""Where npm's lock places a package: under `node_modules/`, or under
+another package's own `node_modules/`, a name never `.` or `..`."""
+CONDA_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+JAVA_FOLDER = PurePosixPath("lib/java")
+"""Where a folder holds the locked Maven jars, which every JVM's class path
+names."""
+JAVA_LIBRARIES = f"{PREFIX}/{JAVA_FOLDER}"
+"""Where a box sees the locked Maven jars."""
+NPM_FOLDER = PurePosixPath("lib")
+"""What a locked npm package's place in the lock, `node_modules/...`, is
+under in a folder."""
+STORED_JAR = "file.jar"
+"""A Maven jar's one file in its store entry, `files/<sha256>/`."""
+NPM_UNPACKED = 300 * 1024 * 1024
+"""The most an npm package's files may take unpacked, which a tarball of
+the lock's own size and SHA-256 could still pass."""
 UV_FILES = frozenset(
     {"INSTALLER", "REQUESTED", "direct_url.json", "uv_cache.json", "RECORD"}
 )
@@ -75,11 +95,18 @@ class Lock:
     platform: str
     pieces: dict[str, str]
     conda: list[dict[str, Any]]
-    pypi: list[dict[str, Any]]
+    pypi: list[dict[str, Any]] = field(default_factory=list)
+    maven: list[dict[str, Any]] = field(default_factory=list)
+    npm: list[dict[str, Any]] = field(default_factory=list)
+    packages: list[str] = field(default_factory=list)
+    """The conda packages the task asked for by name beside the
+    toolchain, which a C or C++ program is linked against."""
 
 
 CONDA_FIELDS = {"sha256": str, "file_name": str, "size": int, "record": dict}
 PYPI_FIELDS = {"sha256": str, "file_name": str, "size": int}
+MAVEN_FIELDS = {"sha256": str, "file_name": str, "size": int}
+NPM_FIELDS = {"sha256": str, "path": str, "size": int}
 RATTLER_ERRORS = (
     InstallerError,
     LinkError,
@@ -111,7 +138,7 @@ def read_lock(lock_file: Path, language: str) -> Lock:
         raise PrimitiveError(f"the environment does not lock {language}")
     pieces = document.get("pieces")
     if not (
-        document.get("version") == 2
+        document.get("version") == 3
         and document.get("prefix") == "/env"
         and isinstance(entry, dict)
         and isinstance(entry.get("fingerprint"), str)
@@ -120,6 +147,11 @@ def read_lock(lock_file: Path, language: str) -> Lock:
         and all(isinstance(name, str) for name in [*pieces, *pieces.values()])
         and shaped(entry.get("conda", []), CONDA_FIELDS)
         and shaped(entry.get("pypi", []), PYPI_FIELDS)
+        and shaped(entry.get("maven", []), MAVEN_FIELDS)
+        and shaped(entry.get("npm", []), NPM_FIELDS)
+        and isinstance(entry.get("asked", {}), dict)
+        and isinstance(asked := entry.get("asked", {}).get("conda", []), list)
+        and all(isinstance(name, str) for name in asked)
     ):
         raise unreadable
     platform = document.get("platform")
@@ -138,6 +170,9 @@ def read_lock(lock_file: Path, language: str) -> Lock:
         pieces,
         entry.get("conda", []),
         entry.get("pypi", []),
+        entry.get("maven", []),
+        entry.get("npm", []),
+        [found[0] for name in asked if (found := CONDA_NAME.match(name))],
     )
 
 
@@ -229,8 +264,9 @@ def assembled(root: Path, lock: Lock) -> Iterator[Environment]:
 def construct(root: Path, lock: Lock, folder: Path, tools: str) -> None:
     """Assemble `lock`'s toolchain as `folder`, out of hard links into the
     machine's store, `/cache/store`, where each package is unpacked once:
-    conda packages by rattler into its cache, `store/conda`, and wheels by
-    uv into its own, `store/uv`, from each wheel's copy in `store/wheels`.
+    conda packages by rattler into its cache, `store/conda`, wheels by uv
+    into its own, `store/uv`, from each wheel's copy in `store/wheels`, and
+    Maven jars and npm packages by exec into `store/files`.
     The folder's `ready.json` lists the store entries it links. The
     store's lock is held shared throughout, since the wrapper frees an
     entry no folder lists, and an entry unpacked here is listed nowhere
@@ -244,7 +280,8 @@ def construct(root: Path, lock: Lock, folder: Path, tools: str) -> None:
             )
             try:
                 build(root, lock, temporary)
-                entries = checked(temporary, lock)
+                placed = place_files(root, lock, temporary)
+                entries = sorted({*checked(temporary, lock), *placed})
                 seal(temporary)
                 (temporary / "ready.json").write_text(
                     json.dumps(marker(lock.fingerprint, tools) | {"store": entries})
@@ -625,20 +662,141 @@ async def install_records(
         )
 
 
-def jdk_home(folder: Path) -> str:
-    """`JAVA_HOME` for the JDK locked in `folder`, as a box sees it under
-    `/env`: the folder above its `java`'s own file."""
-    found = (folder / "bin" / "java").resolve()
-    if not found.is_relative_to(folder.resolve()) or not found.is_file():
-        raise PrimitiveError("the locked environment has no tool java")
-    return str(
-        PurePosixPath("/env") / found.parent.parent.relative_to(folder.resolve())
-    )
-
-
 def tool(folder: Path, name: str) -> str:
     found = folder / "bin" / name
     resolved = found.resolve()
     if not resolved.is_relative_to(folder.resolve()) or not resolved.is_file():
         raise PrimitiveError(f"the locked environment has no tool {name}")
     return "/env/" + str(found.relative_to(folder))
+
+
+def place_files(root: Path, lock: Lock, folder: Path) -> list[str]:
+    """Place the lock's Maven jars in `folder`'s `JAVA_FOLDER`, by their
+    file names, and its npm packages at their places in the lock under
+    `NPM_FOLDER`, each a hard link of its store entry's files, unpacked
+    once into `store/files/<sha256>/`; return those entries. A file placed
+    where a conda package or another placed one has a file already is two
+    packages installing the same file, refused."""
+    entries = []
+    for jar in lock.maven:
+        name = jar["file_name"]
+        if not JAR_NAME.fullmatch(name):
+            raise PrimitiveError(
+                f"the locked jar name {name!r} is not a plain jar name"
+            )
+        entry = stored_file(root, lock, jar, store_jar)
+        target = folder / JAVA_FOLDER
+        target.mkdir(parents=True, exist_ok=True)
+        link_into(entry / STORED_JAR, target / name, name)
+        entries.append(f"files/{jar['sha256']}")
+    for package in sorted(lock.npm, key=lambda each: each["path"]):
+        place = package["path"]
+        if not NPM_PATH.fullmatch(place) or {".", ".."} & set(place.split("/")):
+            raise PrimitiveError(
+                f"the locked npm package's place {place!r} is not safe"
+            )
+        entry = stored_file(root, lock, package, store_npm)
+        target = folder / NPM_FOLDER / place
+        for directory, _, names in entry.walk():
+            within = target / directory.relative_to(entry)
+            within.mkdir(parents=True, exist_ok=True)
+            for name in names:
+                link_into(directory / name, within / name, place)
+        entries.append(f"files/{package['sha256']}")
+    return entries
+
+
+def link_into(stored: Path, target: Path, package: str) -> None:
+    """Hard-link a store entry's file into a folder being assembled."""
+    try:
+        os.link(stored, target)
+    except FileExistsError:
+        raise PrimitiveError(
+            f"two locked packages, {package} among them, install the same file "
+            f"{target.name}"
+        ) from None
+
+
+def stored_file(
+    root: Path,
+    lock: Lock,
+    piece: dict[str, Any],
+    unpack: Callable[[Path, Path], None],
+) -> Path:
+    """The store entry of a Maven or npm `piece`, `store/files/<sha256>/`,
+    unpacked by `unpack` from its verified piece into a folder of its own
+    under a hidden name, `.<sha256>.<random>`, which the wrapper sweeps
+    once it is an hour old under the store's lock held exclusive, then
+    renamed into place, so an entry is always whole; one another step
+    renamed first is kept. Its folders and files are read-only, as every
+    folder that links them sees them."""
+    digest = piece["sha256"]
+    if not DIGEST.fullmatch(digest) or digest not in lock.pieces:
+        raise PrimitiveError("the environment is missing a file piece")
+    entry: Path = cache.CACHE / "store" / "files" / digest
+    if entry.is_dir() and not entry.is_symlink():
+        return entry
+    source = root / lock.pieces[digest]
+    if not holds(source, piece["size"], digest):
+        raise PrimitiveError("an environment piece does not match its SHA-256 and size")
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{digest}.", dir=entry.parent))
+    try:
+        unpack(source, temporary)
+        for directory, _, names in temporary.walk(top_down=False):
+            for name in names:
+                path = directory / name
+                path.chmod(0o555 if path.stat().st_mode & 0o111 else 0o444)
+            directory.chmod(0o555)
+        try:
+            temporary.rename(entry)
+        except OSError as error:
+            if not entry.is_dir():
+                raise error from None
+    finally:
+        if temporary.exists():
+            remove(temporary)
+    return entry
+
+
+def store_jar(source: Path, entry: Path) -> None:
+    """A jar's store entry: a copy of it, `STORED_JAR`."""
+    shutil.copyfile(source, entry / STORED_JAR)
+
+
+def store_npm(source: Path, entry: Path) -> None:
+    """An npm package's store entry: its tarball unpacked as npm unpacks
+    one, its first folder dropped and every entry npm would not write
+    passed over: a link, a device or a pipe, and a path that is absolute
+    or climbs out with `..`. A tarball that is not one, or whose files
+    would take more than `NPM_UNPACKED`, is refused."""
+    total = 0
+    try:
+        with tarfile.open(source, "r:gz") as archive:
+            for member in archive:
+                parts = PurePosixPath(member.name).parts[1:]
+                if (
+                    not parts
+                    or member.name.startswith("/")
+                    or ".." in parts
+                    or not (member.isfile() or member.isdir())
+                ):
+                    continue
+                target = entry.joinpath(*parts)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                total += member.size
+                if total > NPM_UNPACKED:
+                    raise PrimitiveError("an npm package unpacks to more than 300 MB")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                extracted = archive.extractfile(member)
+                assert extracted is not None
+                target.unlink(missing_ok=True)
+                with extracted, target.open("xb") as copy:
+                    shutil.copyfileobj(extracted, copy)
+                target.chmod(0o755 if member.mode & 0o111 else 0o644)
+    except (tarfile.TarError, EOFError, OSError) as error:
+        if isinstance(error, OSError) and error.errno is not None:
+            raise
+        raise PrimitiveError("a locked npm package is not a tarball") from error

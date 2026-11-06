@@ -16,7 +16,6 @@ from exec.box import Run
 from exec.inputs import Declared, Entry, Item
 from exec.shared import FILE_NAME, OUTPUT_LIMIT, PrimitiveError
 
-JAVA_OUT_OF_MEMORY = 3
 TEXTS = ("label", "message", "staff_message")
 """The text files a report may hold besides its reports, each an output of
 its name: a finer name for the outcome, a message for the entrant, and one for
@@ -259,7 +258,7 @@ def shown_bytes(content: bytes) -> str:
     return repr(text + "...") if len(content) > 24 else repr(text)
 
 
-def judge(run: Run, kind: str) -> str:
+def judge(run: Run, out_of_memory: int | None) -> str:
     """Give a run its outcome, from what isolate and the box's tmpfs say, in
     this order.
 
@@ -269,9 +268,10 @@ def judge(run: Run, kind: str) -> str:
     one of them takes memory. Then `TO`, isolate's for the CPU time and the
     wall clock both, is `time_limit`. Then output over `OUTPUT_LIMIT` is
     `output_limit`, before the signal, since a run that printed on died of
-    `SIGPIPE` when exec stopped reading. A jar that ran out of Java heap
-    exits with code 3, `memory_limit`. Any other signal or failure is a
-    runtime error.
+    `SIGPIPE` when exec stopped reading. A runtime that ends with its
+    language's `out_of_memory` return code ran out of its heap,
+    `memory_limit`, as a jar does with code 3 and Node by `SIGABRT`. Any
+    other signal or failure is a runtime error.
     """
     if run.out_of_memory or run.no_inodes:
         return "memory_limit"
@@ -279,7 +279,7 @@ def judge(run: Run, kind: str) -> str:
         return "time_limit"
     if run.output_bytes > OUTPUT_LIMIT:
         return "output_limit"
-    if kind == "java" and run.returncode == JAVA_OUT_OF_MEMORY:
+    if out_of_memory is not None and run.returncode == out_of_memory:
         return "memory_limit"
     if run.status in ("RE", "SG") or run.returncode != 0:
         return "runtime_error"

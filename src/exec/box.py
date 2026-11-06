@@ -18,13 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from stat import S_IMODE
 
+from exec.compile.recipes import Recipe
 from exec.inputs import Entry
 from exec.shared import RUN_PATH, PrimitiveError
 
-PROCESS_LIMIT = 128
-"""The most processes and threads a run's box user may have at once
-(`RLIMIT_NPROC`), below the container's own pids limit in `primitive.yaml`,
-so a fork bomb stops at the box's limit and leaves exec and isolate room."""
 NAMED_FILE_MODE = 0o444
 ISOLATE = "/usr/local/bin/isolate"
 LAUNCHER = "/usr/local/bin/box-launch"
@@ -152,17 +149,21 @@ def cache_binding(folder: Path | None) -> list[str]:
     return [f"--dir={CACHE_MOUNT.lstrip('/')}={folder}:noexec"]
 
 
-def box_size_kb(entry: Entry, program: Path) -> int:
-    """The size of a program's box tmpfs, in kilobytes: its memory limit,
-    which holds what the program writes there before the size does, as every
-    page it writes is charged to the box's memory, plus the program, compiled
-    to `program`, and the named files exec copies in, which are charged to
-    exec's, each to whole 4 KB pages. A cached named file is not copied but
-    bound in."""
+def box_size_kb(entry: Entry, program_kb: int, own: Recipe) -> int:
+    """The size of a program's box tmpfs, in kilobytes: its box's memory,
+    the memory limit and the recipe's headroom beside it, which holds what
+    the program writes there before the size does, as every page it writes
+    is charged to the box's memory, plus the program, `program_kb` in the
+    box, and the named files exec copies in, which are charged to exec's,
+    each to whole 4 KB pages. A cached named file is not copied but bound
+    in."""
     named = [*entry.files.values(), *entry.loads.values()]
-    copied = [program, *(path for path in named if path.parent != entry.cached)]
-    return entry.memory_limit_kb + sum(
-        4 * -(-path.stat().st_size // 4096) for path in copied
+    copied = [path for path in named if path.parent != entry.cached]
+    return (
+        entry.memory_limit_kb
+        + own.headroom_kb
+        + program_kb
+        + sum(4 * -(-path.stat().st_size // 4096) for path in copied)
     )
 
 
@@ -231,7 +232,7 @@ class Limits:
     time: float
     wall: float
     memory_kb: int
-    processes: int = PROCESS_LIMIT
+    processes: int
 
 
 def isolate_command(
@@ -241,26 +242,28 @@ def isolate_command(
     reports: bool,
     more: list[str],
     run: list[str],
-    java_home: str | None = None,
+    own: Recipe,
 ) -> list[str]:
-    """The isolate command line that runs `run`, one program, in box
-    `number`, already made and filled, writing its meta file to `meta`
-    (`box_command`), under the entry's limits.
+    """The isolate command line that runs `run`, one program of the recipe
+    `own`, in box `number`, already made and filled, writing its meta file
+    to `meta` (`box_command`), under the entry's limits: its box's memory
+    is its memory limit and the recipe's headroom, for the runtime's own,
+    and its processes the recipe's.
 
     The environment holds only `PATH`, `HOME` and `TMPDIR`, both the working
-    directory, `LANG=C.UTF-8`, for a Java program its locked JDK's
-    `java_home` as `JAVA_HOME`, and for a program given a manifest
-    (`reports`) `UNICON_REPORT`. The options in `more` are the caller's own.
-    Standard error goes nowhere.
+    directory, `LANG=C.UTF-8`, the recipe's run environment, and for a
+    program given a manifest (`reports`) `UNICON_REPORT`. The options in
+    `more` are the caller's own, then the recipe's. Standard error goes
+    nowhere.
     """
     env = {"PATH": RUN_PATH, "HOME": "/box/run", "TMPDIR": "/box/run"}
     env["LANG"] = "C.UTF-8"
-    if java_home is not None:
-        env["JAVA_HOME"] = java_home
+    env |= own.run_env
     if reports:
         env["UNICON_REPORT"] = "/box/report"
-    limits = Limits(entry.time_limit, entry.wall_limit, entry.memory_limit_kb)
-    options = [*more, "--chdir=/box/run", "--stderr=/dev/null"]
+    memory_kb = entry.memory_limit_kb + own.headroom_kb
+    limits = Limits(entry.time_limit, entry.wall_limit, memory_kb, own.processes)
+    options = [*more, *own.box, "--chdir=/box/run", "--stderr=/dev/null"]
     return box_command(number, meta, limits, env, options, run)
 
 

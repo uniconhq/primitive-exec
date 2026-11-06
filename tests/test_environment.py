@@ -5,10 +5,12 @@ import asyncio
 import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import os
 import shutil
 import stat
+import tarfile
 import threading
 import time
 import zipfile
@@ -135,7 +137,7 @@ def setup_environment(
     lock.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "prefix": "/env",
                 "platform": "linux-aarch64",
                 "pieces": {digest: wheel.name},
@@ -211,6 +213,119 @@ def test_a_folder_links_its_files_from_the_store_lists_its_entries_and_is_reused
     with assembled(root, lock, "python"):
         assert stored.stat().st_ctime_ns == changed
     assert len(installs.wheels) == 2
+
+
+def npm_tarball(path: Path, members: list[tuple[tarfile.TarInfo, bytes]]) -> str:
+    """Write an npm tarball of `members` to `path` and return its SHA-256."""
+    with tarfile.open(path, "w:gz") as archive:
+        for member, content in members:
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def tar_member(name: str, kind: bytes = tarfile.REGTYPE, mode: int = 0o644) -> Any:
+    member = tarfile.TarInfo(name)
+    member.type, member.mode = kind, mode
+    if kind == tarfile.SYMTYPE:
+        member.linkname = "/etc/passwd"
+    return member
+
+
+def test_maven_jars_and_npm_packages_are_placed_from_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A locked jar is linked into `lib/java/` and an npm package into its
+    place under `lib/`, each from its store entry, `files/<sha256>/`,
+    unpacked once and read-only, which the folder's `ready.json` lists; an
+    npm tarball's first folder is dropped and what npm would not write, a
+    link or a path out, is passed over."""
+    root, lock, _, _ = setup_environment(tmp_path, monkeypatch)
+    jar = root / "jar-piece"
+    jar.write_bytes(b"PK jar")
+    jar_digest = hashlib.sha256(jar.read_bytes()).hexdigest()
+    tarball = root / "npm-piece"
+    npm_digest = npm_tarball(
+        tarball,
+        [
+            (tar_member("package/index.js"), b"module.exports = 1\n"),
+            (tar_member("package/bin/run", mode=0o755), b"#!/usr/bin/env node\n"),
+            (tar_member("package/../../escape"), b"out"),
+            (tar_member("package/link", tarfile.SYMTYPE), b""),
+        ],
+    )
+    document = json.loads(lock.read_text())
+    document["pieces"] |= {jar_digest: jar.name, npm_digest: tarball.name}
+    language = document["languages"]["python"]
+    language["maven"] = [
+        {"sha256": jar_digest, "file_name": "lib-1.0.jar", "size": 6},
+    ]
+    language["npm"] = [
+        {
+            "sha256": npm_digest,
+            "path": "node_modules/a/node_modules/@b/c",
+            "size": tarball.stat().st_size,
+        }
+    ]
+    lock.write_text(json.dumps(document))
+    store = cache.CACHE / "store" / "files"
+    with assembled(root, lock, "python") as found:
+        folder = found.folder
+        assert (folder / "lib/java/lib-1.0.jar").samefile(
+            store / jar_digest / environment.STORED_JAR
+        )
+        placed = folder / "lib/node_modules/a/node_modules/@b/c"
+        assert sorted(path.name for path in placed.rglob("*")) == [
+            "bin",
+            "index.js",
+            "run",
+        ]
+        assert (placed / "index.js").samefile(store / npm_digest / "index.js")
+        assert stat.S_IMODE((placed / "index.js").stat().st_mode) == 0o444
+        assert stat.S_IMODE((placed / "bin/run").stat().st_mode) == 0o555
+        assert stat.S_IMODE((store / npm_digest).stat().st_mode) == 0o555
+        listed = json.loads((folder / "ready.json").read_text())["store"]
+        assert {f"files/{jar_digest}", f"files/{npm_digest}"} <= set(listed)
+    assert not (tmp_path / "escape").exists()
+    assert sorted(path.name for path in store.iterdir()) == sorted(
+        [jar_digest, npm_digest]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("maven", {"file_name": "../x.jar"}, "is not a plain jar name"),
+        ("npm", {"path": "node_modules/../x"}, "place .* is not safe"),
+        ("npm", {"path": "lib/x"}, "place .* is not safe"),
+    ],
+)
+def test_a_jar_or_npm_package_placed_outside_its_folder_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: dict[str, str],
+    message: str,
+) -> None:
+    root, lock, _, _ = setup_environment(tmp_path, monkeypatch)
+    piece = root / "piece-2"
+    piece.write_bytes(b"x")
+    digest = hashlib.sha256(b"x").hexdigest()
+    document = json.loads(lock.read_text())
+    document["pieces"][digest] = piece.name
+    shape = {
+        "sha256": digest,
+        "size": 1,
+        "file_name": "x.jar",
+        "path": "node_modules/x",
+    }
+    document["languages"]["python"][field] = [shape | value]
+    lock.write_text(json.dumps(document))
+    with (
+        pytest.raises(PrimitiveError, match=message),
+        assembled(root, lock, "python"),
+    ):
+        pass
 
 
 def test_a_stored_wheel_that_is_not_the_wheel_its_name_says_is_copied_again(
@@ -516,7 +631,7 @@ def test_a_step_that_finds_the_folder_unready_never_queues_behind_its_readers(
 @pytest.mark.parametrize(
     "spoil",
     [
-        lambda lock: lock.update(version=3),
+        lambda lock: lock.update(version=2),
         lambda lock: lock.update(pieces=["piece"]),
         lambda lock: lock.update(pieces={"a" * 64: 7}),
         lambda lock: lock["languages"]["python"].update(fingerprint=7),
@@ -526,6 +641,10 @@ def test_a_step_that_finds_the_folder_unready_never_queues_behind_its_readers(
         lambda lock: lock["languages"]["python"]["conda"][0].update(record=[]),
         lambda lock: lock["languages"]["python"]["pypi"][0].update(size="1"),
         lambda lock: lock["languages"]["python"]["pypi"].append(None),
+        lambda lock: lock["languages"]["python"].update(maven=[{"sha256": "a"}]),
+        lambda lock: lock["languages"]["python"].update(npm=[{"path": 1}]),
+        lambda lock: lock["languages"]["python"].update(asked=[]),
+        lambda lock: lock["languages"]["python"].update(asked={"conda": [1]}),
         lambda lock: lock.update(languages=[]),
     ],
 )
@@ -596,31 +715,6 @@ def test_a_malformed_conda_record_is_a_named_step_fault(tmp_path: Path) -> None:
         )
 
 
-def test_java_home_is_the_folder_above_the_locked_javas_own_file(
-    tmp_path: Path,
-) -> None:
-    """The compile box and each run's box get the one `JAVA_HOME`, read from
-    where the lock's JDK put `java`, and a JDK whose `java` leads outside
-    its folder or is not there is a step fault."""
-    folder = tmp_path / "env"
-    (folder / "lib/jvm/bin").mkdir(parents=True)
-    (folder / "lib/jvm/bin/java").write_text("")
-    (folder / "bin").mkdir()
-    (folder / "bin/java").symlink_to("../lib/jvm/bin/java")
-    assert environment.jdk_home(folder) == "/env/lib/jvm"
-    (folder / "bin/java").unlink()
-    (folder / "bin/java").write_text("")
-    assert environment.jdk_home(folder) == "/env"
-    (folder / "bin/java").unlink()
-    (tmp_path / "java").write_text("")
-    (folder / "bin/java").symlink_to(tmp_path / "java")
-    with pytest.raises(PrimitiveError, match="no tool java"):
-        environment.jdk_home(folder)
-    (folder / "bin/java").unlink()
-    with pytest.raises(PrimitiveError, match="no tool java"):
-        environment.jdk_home(folder)
-
-
 def test_two_programs_share_one_held_environment_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -630,7 +724,7 @@ def test_two_programs_share_one_held_environment_lock(
     root, lock, _, _ = setup_environment(tmp_path, monkeypatch)
     monkeypatch.setattr(programs, "box_users", lambda: [60000, 60001])
     monkeypatch.setattr(programs, "step_memory_kb", lambda: 1024 * 1024)
-    monkeypatch.setattr(programs, "check_room", lambda _: None)
+    monkeypatch.setattr(programs, "check_room", lambda *_: None)
     monkeypatch.setattr(programs, "set_up_step", lambda *_: None)
 
     def refused(*_: object, toolchain: Toolchain) -> Built:
@@ -702,7 +796,7 @@ def test_a_cached_compile_assembles_the_toolchain_only_for_a_box_that_needs_it(
         content = (tmp_path / "program").read_bytes()
     monkeypatch.setattr(programs, "box_users", lambda: [60000])
     monkeypatch.setattr(programs, "step_memory_kb", lambda: 1024 * 1024)
-    monkeypatch.setattr(programs, "check_room", lambda _: None)
+    monkeypatch.setattr(programs, "check_room", lambda *_: None)
     monkeypatch.setattr(programs, "set_up_step", lambda *_: None)
     monkeypatch.setattr(programs, "check_memory", lambda *_: None)
     folders: list[Path] = []
