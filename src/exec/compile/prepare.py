@@ -38,13 +38,13 @@ def prepare(
     name it is compiled as. A larger folder is copied with its layout, its
     sources are its files with the language's extensions, and the entry is
     the one named, or else the one source, or else, for a language whose
-    recipe tells which source holds main, the one that does (see the
-    README). For C and C++ a source other than the entry that holds main is
-    left out; for Java the entry gives the class the jar runs. A file where
-    the recipe links something beside the program, as JavaScript's
-    `node_modules`, is refused. A notebook entry is replaced in the copy by
-    its code cells, joined into one Python file under the notebook's name,
-    and checked with the folder's Python files.
+    recipe tells which source holds main, the one that does (see
+    `holds_main`). For C and C++ a source other than the entry that holds
+    main is left out; for Java the entry gives the class the jar runs. A
+    file where the recipe links something beside the program, as
+    JavaScript's `node_modules`, is refused. A notebook entry is replaced in
+    the copy by its code cells, joined into one Python file under the
+    notebook's name, and checked with the folder's Python files.
 
     Everything here is linear in the size of the folder, so the deadline is
     a backstop, checked between files: a folder that still takes that long
@@ -200,10 +200,10 @@ def find_entry(
 
 def holds_main(path: Path, own: Recipe) -> bool:
     """Whether a source file looks like a program's start, as its recipe
-    tells (see the README): for C and C++ it defines a function `main`, for
-    Java it declares a `static void main`, for Python it has a top-level
-    `if __name__ == "__main__":`. Comments and string literals are ignored
-    but for Python."""
+    tells: for C and C++ it defines a function `main`, for Java a
+    `static void main`, for Kotlin `fun main(`, for C# a static `Main`, for
+    Rust `fn main(`, for Python a top-level `if __name__ == "__main__":`.
+    Comments and string literals are ignored but for Python."""
     assert own.holds_main is not None
     return own.holds_main(read_text(path))
 

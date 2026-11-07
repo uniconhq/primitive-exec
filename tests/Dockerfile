@@ -2,7 +2,7 @@
 # tests/test_exec.py as root with isolate, as exec runs in a step. The image
 # test `test_the_in_process_tests_pass_in_the_test_container` builds it on
 # the image and runs it privileged, the checkout mounted at /src, through
-# tests/userns.py (see "Running it locally" in the README).
+# tests/userns.py, which gives exec a user namespace on root Docker.
 ARG IMAGE=primitive-exec:test
 FROM ghcr.io/astral-sh/uv:0.12.13 AS uv
 

@@ -2,7 +2,8 @@
 # of runs: it reads /work/inputs.json and the program and inputs under
 # /work/in/, and writes /work/outputs.json and each run's output under
 # /work/out/. Each run goes in an isolate box of its own, so the container
-# runs as root and privileged (see "Where it runs" in the README).
+# runs as root and privileged. It refuses root Docker unless
+# UNICON_DEV_ROOT_DOCKER=1, which only a dev stack sets.
 
 # The image builds on the primitives' base, the runner's
 # ghcr.io/uniconhq/primitive-base: the same python:3.14-slim, with the step

@@ -28,7 +28,7 @@ PROCESSES = 128
 """A box user's processes and threads, compile or run (decision 11 of the
 design: twice the most measured, and at least 128), which isolate counts
 together; each recipe bounds the threads of a runtime that grows them with
-the CPUs it sees. The README has the measurements."""
+the CPUs it sees."""
 OUT = "/box/out"
 """Where a compiler writes, in the compile box's tmpfs."""
 PROGRAM = "/box/program"
@@ -45,7 +45,7 @@ JAVA = {"JAVA_HOME": "/env/lib/jvm"}
 JVM_HEADROOM_KB = 40 * 1024
 NODE_HEADROOM_KB = 64 * 1024
 """The memory a box gets beside the run's limit, for a runtime whose own
-start takes it (decision 11's measurements, in the README)."""
+start takes it."""
 DOTNET = {
     "DOTNET_ROOT": "/env/lib/dotnet",
     "PATH": "/env/lib/dotnet:/env/bin:/usr/local/bin:/usr/bin:/bin",
